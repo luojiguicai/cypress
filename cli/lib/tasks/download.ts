@@ -1,0 +1,469 @@
+import os from 'os'
+import assert from 'assert'
+import _ from 'lodash'
+import path from 'path'
+import Debug from 'debug'
+import request from '@cypress/request'
+import Bluebird from 'bluebird'
+import requestProgress from 'request-progress'
+import { stripIndent } from 'common-tags'
+import { getProxyForUrl } from 'proxy-from-env'
+import { throwFormErrorText, errors } from '../errors'
+import fs from 'fs-extra'
+import util from '../util'
+
+const debug = Debug('cypress:cli')
+
+const defaultBaseUrl = 'https://download.cypress.io/'
+const defaultMaxRedirects = 10
+const maxDownloadAttempts = 3
+const defaultRetryDelayMs = 1000
+// How long the connection or the transfer can go quiet, so a network that drops packets fails and is retried instead of waiting for the operating system to give up
+const defaultTimeoutMs = 60000
+
+const retryableErrorCodes = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'EAI_AGAIN',
+  'EPIPE',
+  'ESOCKETTIMEDOUT',
+])
+
+const isRetryableDownloadError = (err: any): boolean => {
+  if (err?.statusCode) {
+    return err.statusCode === 408 || err.statusCode === 429 || err.statusCode >= 500
+  }
+
+  return retryableErrorCodes.has(err?.code)
+}
+
+// Jitter keeps concurrent installs from retrying in lockstep
+const getRetryDelay = (attempt: number, baseDelayMs: number): number => {
+  const backoff = baseDelayMs * 2 ** (attempt - 1)
+
+  return Math.round(backoff * (0.5 + Math.random() / 2))
+}
+
+const getProxyForUrlWithNpmConfig = (url: string): string | null => {
+  return getProxyForUrl(url) ||
+    process.env.npm_config_https_proxy ||
+    process.env.npm_config_proxy ||
+    null
+}
+
+const getBaseUrl = (): string => {
+  if (util.getEnv('CYPRESS_DOWNLOAD_MIRROR')) {
+    let baseUrl = util.getEnv('CYPRESS_DOWNLOAD_MIRROR')
+
+    if (!baseUrl?.endsWith('/')) {
+      baseUrl += '/'
+    }
+
+    return baseUrl || defaultBaseUrl
+  }
+
+  return defaultBaseUrl
+}
+
+const getCA = async (): Promise<string | undefined> => {
+  if (process.env.npm_config_cafile) {
+    try {
+      const caFileContent = await fs.readFile(process.env.npm_config_cafile, 'utf8')
+
+      return caFileContent
+    } catch (error) {
+      debug('error reading ca file', error)
+
+      return
+    }
+  }
+
+  if (process.env.npm_config_ca) {
+    return process.env.npm_config_ca
+  }
+
+  return
+}
+
+const prepend = (arch: string, urlPath: string, version: string): string => {
+  const endpoint = new URL(urlPath, getBaseUrl()).toString()
+  const platform = os.platform()
+  const pathTemplate = util.getEnv('CYPRESS_DOWNLOAD_PATH_TEMPLATE', true)
+
+  if ((platform === 'win32') && (arch === 'arm64')) {
+    debug(`detected platform ${platform} architecture ${arch} combination`)
+    arch = 'x64'
+    debug(`overriding to download ${platform}-${arch} instead`)
+  }
+
+  return pathTemplate
+    ? (
+      pathTemplate
+      .replace(/\\?\$\{endpoint\}/g, endpoint)
+      .replace(/\\?\$\{platform\}/g, platform)
+      .replace(/\\?\$\{arch\}/g, arch)
+      .replace(/\\?\$\{version\}/g, version)
+    )
+    : `${endpoint}?platform=${platform}&arch=${arch}`
+}
+
+const getUrl = (arch: string, version?: string): string => {
+  if (_.isString(version) && version.match(/^https?:\/\/.*$/)) {
+    debug('version is already an url', version)
+
+    return version as string
+  }
+
+  const urlPath = version ? `desktop/${version}` : 'desktop'
+
+  return prepend(arch, urlPath, version || '')
+}
+
+const statusMessage = (err: any): string => {
+  return (err.statusCode
+    ? [err.statusCode, err.statusMessage].join(' - ')
+    : err.toString())
+}
+
+const prettyDownloadErr = (err: any, url: string): any => {
+  const msg = stripIndent`
+    URL: ${url}
+    ${statusMessage(err)}
+  `
+
+  debug(msg)
+
+  return throwFormErrorText(errors.failedDownload)(msg)
+}
+
+/**
+ * Checks checksum and file size for the given file. Allows both
+ * values or just one of them to be checked.
+ */
+const verifyDownloadedFile = async (filename: string, expectedSize?: number, expectedChecksum?: string): Promise<any> => {
+  if (expectedSize && expectedChecksum) {
+    debug('verifying checksum and file size')
+
+    return Bluebird.join(
+      util.getFileChecksum(filename),
+      util.getFileSize(filename),
+      (checksum: string, filesize: number) => {
+        if (checksum === expectedChecksum && filesize === expectedSize) {
+          debug('downloaded file has the expected checksum and size ✅')
+
+          return
+        }
+
+        debug('raising error: checksum or file size mismatch')
+        const text = stripIndent`
+          Corrupted download
+
+          Expected downloaded file to have checksum: ${expectedChecksum}
+          Computed checksum: ${checksum}
+
+          Expected downloaded file to have size: ${expectedSize}
+          Computed size: ${filesize}
+        `
+
+        debug(text)
+
+        throw new Error(text)
+      },
+    )
+  }
+
+  if (expectedChecksum) {
+    debug('only checking expected file checksum %d', expectedChecksum)
+
+    const checksum: string = await util.getFileChecksum(filename)
+
+    if (checksum === expectedChecksum) {
+      debug('downloaded file has the expected checksum ✅')
+
+      return
+    }
+
+    debug('raising error: file checksum mismatch')
+    const text = stripIndent`
+      Corrupted download
+
+      Expected downloaded file to have checksum: ${expectedChecksum}
+      Computed checksum: ${checksum}
+    `
+
+    throw new Error(text)
+  }
+
+  if (expectedSize) {
+    // maybe we don't have a checksum, but at least CDN returns content length
+    // which we can check against the file size
+    debug('only checking expected file size %d', expectedSize)
+
+    const filesize: number = await util.getFileSize(filename)
+
+    if (filesize === expectedSize) {
+      debug('downloaded file has the expected size ✅')
+
+      return
+    }
+
+    debug('raising error: file size mismatch')
+    const text = stripIndent`
+        Corrupted download
+
+        Expected downloaded file to have size: ${expectedSize}
+        Computed size: ${filesize}
+      `
+
+    throw new Error(text)
+  }
+
+  debug('downloaded file lacks checksum or size to verify')
+
+  return
+}
+
+// downloads from given url
+// return an object with
+// {filename: ..., downloaded: true}
+const downloadFromUrl = ({ url, downloadDestination, progress, ca, version, redirectTTL = defaultMaxRedirects, timeoutMs = defaultTimeoutMs }: any): any => {
+  if (redirectTTL <= 0) {
+    return Promise.reject(new Error(
+      stripIndent`
+          Failed downloading the Cypress binary.
+          There were too many redirects. The default allowance is ${defaultMaxRedirects}.
+          Maybe you got stuck in a redirect loop?
+        `,
+    ))
+  }
+
+  return new Bluebird((resolve: any, reject: any) => {
+    const proxy = getProxyForUrlWithNpmConfig(url)
+
+    debug('Downloading package', {
+      url,
+      proxy,
+      downloadDestination,
+    })
+
+    if (ca) {
+      debug('using custom CA details from npm config')
+    }
+
+    const reqOptions = {
+      uri: url,
+      ...(proxy ? { proxy } : {}),
+      ...(ca ? { agentOptions: { ca } } : {}),
+      method: 'GET',
+      followRedirect: false,
+      timeout: timeoutMs,
+    }
+    const req = request(reqOptions)
+
+    // closure
+    let started: Date | null = null
+    let bodyComplete = false
+    let redirected = false
+    let writeFailed = false
+    let fileStream: fs.WriteStream | undefined
+
+    // A failed attempt closes the file it was writing, so a retry does not leave it open behind it
+    const fail = (err: any) => {
+      fileStream?.destroy()
+      reject(err)
+    }
+    let expectedSize: number | undefined
+    let expectedChecksum: string | undefined
+
+    requestProgress(req, {
+      throttle: progress.throttle,
+    })
+    .on('response', (response: any) => {
+      // we have computed checksum and filesize during test runner binary build
+      // and have set it on the S3 object as user meta data, available via
+      // these custom headers "x-amz-meta-..."
+      // see https://github.com/cypress-io/cypress/pull/4092
+      expectedSize = response.headers['x-amz-meta-size'] ||
+        response.headers['content-length']
+
+      expectedChecksum = response.headers['x-amz-meta-checksum']
+
+      if (expectedChecksum) {
+        debug('expected checksum %s', expectedChecksum)
+      }
+
+      if (expectedSize) {
+        // convert from string (all Amazon custom headers are strings)
+        expectedSize = Number(expectedSize)
+        debug('expected file size %d', expectedSize)
+      }
+
+      // start counting now once we've gotten
+      // response headers
+      started = new Date()
+
+      if (/^3/.test(response.statusCode)) {
+        const redirectVersion = response.headers['x-version']
+        const redirectUrl = response.headers.location
+
+        debug('redirect version:', redirectVersion)
+        debug('redirect url:', redirectUrl)
+        redirected = true
+
+        downloadFromUrl({ url: redirectUrl, progress, ca, downloadDestination, version: redirectVersion, redirectTTL: redirectTTL - 1, timeoutMs })
+        .then(resolve).catch(reject)
+
+        // if our status code does not start with 200
+      } else if (!/^2/.test(response.statusCode)) {
+        debug('response code %d', response.statusCode)
+
+        const err: any = new Error(
+          stripIndent`
+          Failed downloading the Cypress binary.
+          Response code: ${response.statusCode}
+          Response message: ${response.statusMessage}
+        `,
+        )
+
+        err.statusCode = response.statusCode
+        err.statusMessage = response.statusMessage
+
+        fail(err)
+        // status codes here are all 2xx
+      } else {
+        const writeStream = fs.createWriteStream(downloadDestination)
+
+        fileStream = writeStream
+
+        // An unhandled 'error' event would crash the CLI. A failed write, such as on a
+        // full disk, leaves a truncated file that would keep holding that disk space.
+        writeStream.on('error', (err) => {
+          debug('failed writing %s: %s', downloadDestination, err.message)
+          writeFailed = true
+          response.destroy()
+          writeStream.once('close', () => {
+            fs.remove(downloadDestination)
+            .catch((removeErr) => debug('failed removing %s: %s', downloadDestination, removeErr.message))
+            .finally(() => reject(err))
+          })
+        })
+
+        // We only enable this pipe connection when we know we've got a successful return
+        // and handle the completion with verify and resolve
+        // there was a possible race condition between end of request and close of writeStream
+        // that is made ordered with this Promise.all
+        response.on('end', () => {
+          bodyComplete = true
+        })
+
+        Bluebird.all([new Bluebird((r: any) => {
+          return response.pipe(writeStream.on('close', r))
+        }), new Bluebird((r: any) => response.on('end', r))])
+        .then(() => {
+          // The error handler is deleting the partial file and rejects with the
+          // write error, so verifying the file here would race that deletion.
+          if (writeFailed) {
+            return
+          }
+
+          debug('downloading finished')
+          verifyDownloadedFile(downloadDestination, expectedSize,
+            expectedChecksum)
+          .then(() => debug('verified'))
+          .then(() => resolve(version))
+          .catch(reject)
+        })
+      }
+    })
+    .on('error', (e: any) => {
+      // The connection can reset after the whole file arrived. The file is complete, and
+      // verifying it decides the outcome, so downloading it all again would be wasted.
+      // A failed write stops the response itself, and the connection error that causes
+      // must not turn the write error into a retry.
+      if (bodyComplete || redirected || writeFailed) {
+        debug('ignoring error after the download completed or moved on: %s', e.message)
+
+        return
+      }
+
+      fail(e)
+    })
+    .on('progress', (state: any) => {
+      // total time we've elapsed
+      // starting on our first progress notification
+      const elapsed = +new Date() - +(started as Date)
+
+      // request-progress sends a value between 0 and 1
+      const percentage = util.convertPercentToPercentage(state.percent)
+
+      const eta = util.calculateEta(percentage, elapsed)
+
+      // send up our percent and seconds remaining
+      progress.onProgress(percentage, util.secsRemaining(eta))
+    })
+  })
+}
+
+/**
+ * Download Cypress.zip from external versionUrl to local file.
+ * @param [string] version Could be "3.3.0" or full URL
+ * @param [string] downloadDestination Local filename to save as
+ */
+const start = async (opts: any): Promise<any> => {
+  const { version, downloadDestination, redirectTTL, retryDelayMs = defaultRetryDelayMs, timeoutMs = defaultTimeoutMs } = opts
+  let { progress } = opts
+
+  if (!downloadDestination) {
+    assert.ok(_.isString(downloadDestination) && !_.isEmpty(downloadDestination), 'missing download dir')
+  }
+
+  if (!progress) {
+    progress = { onProgress: () => {
+      return {}
+    } }
+  }
+
+  const arch = await util.getRealArch()
+  const versionUrl = getUrl(arch, version)
+
+  progress.throttle = util.progressThrottleMs
+
+  debug('needed Cypress version: %s', version)
+  debug('source url %s', versionUrl)
+  debug(`downloading cypress.zip to "${downloadDestination}"`)
+
+  try {
+    // ensure download dir exists
+    await fs.ensureDir(path.dirname(downloadDestination))
+    const ca: string | undefined = await getCA()
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await downloadFromUrl({ url: versionUrl, downloadDestination, progress, ca, version,
+          timeoutMs, ...(redirectTTL ? { redirectTTL } : {}) })
+      } catch (err: any) {
+        if (attempt >= maxDownloadAttempts || !isRetryableDownloadError(err)) {
+          throw err
+        }
+
+        const delay = getRetryDelay(attempt, retryDelayMs)
+
+        debug('download attempt %d of %d failed (%s), retrying in %dms', attempt, maxDownloadAttempts, err.code || err.statusCode, delay)
+        progress.onProgress(0, 0)
+        await Bluebird.delay(delay)
+      }
+    }
+  } catch (err: any) {
+    return prettyDownloadErr(err, versionUrl)
+  }
+}
+
+const downloadModule = {
+  start,
+  getUrl,
+  getProxyForUrlWithNpmConfig,
+  getCA,
+}
+
+export default downloadModule

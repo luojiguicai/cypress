@@ -1,0 +1,228 @@
+const { $, _, Promise } = Cypress
+
+// the reporter renders inside a same-origin iframe in the runner UI, so
+// reporter queries must target that document
+const getReporterDocument = () => {
+  return top!.document.querySelector<HTMLIFrameElement>('#reporter-frame')!.contentDocument!
+}
+
+export const getCommandLogWithText = (command, type?) => {
+  if (!type) {
+    type = 'method'
+  }
+
+  // Open current test if not already open, so we can find the command log
+  cy.$$('.runnable-active .collapsible:not(.is-open) .collapsible-header', getReporterDocument()).click()
+
+  return cy
+  .$$(`.test.runnable-active .command-${type}:contains(${command})`, getReporterDocument())
+  .closest('.command')
+}
+
+// This work around is super hacky to get the appState from the Test Mobx Observable Model
+// this is needed to pause the runner to assert on the test
+export const findAppStateFromTest = function (dom) {
+  const key = _.keys(dom).find((key) => key.startsWith('__reactFiber')) as string
+  const internalInstance = dom[key]
+
+  if (internalInstance == null) return null
+
+  return internalInstance._debugOwner
+    ? internalInstance._debugOwner.memoizedProps.model.store.appState
+    : internalInstance.return.memoizedProps.model.store.appState
+}
+
+export const clickCommandLog = (sel, type?) => {
+  // trigger the LONG_RUNNING_THRESHOLD to display the command line
+  // this adds time to test but makes a more accurate test as React 18+ does not rerender when setting internals
+  // eslint-disable-next-line cypress/no-unnecessary-waiting -- LONG_RUNNING_THRESHOLD has to pass before the command shows in the log
+  return cy.wait(2000)
+  .then(() => {
+    const commandLogEl = getCommandLogWithText(sel, type)
+
+    const activeTestEl = commandLogEl[0].closest('li.test.runnable.runnable-active')
+
+    // We are manually manipulating the state of the appState to stop the runner.
+    // This does NOT happen in the wild and is only for testing purposes.
+    const appStateInstance = findAppStateFromTest(activeTestEl)
+
+    if (!appStateInstance) {
+      assert(false, 'failed to get command log React instance')
+    }
+
+    // forces the runner off (NOTE: this will break auto scrolling in open mode for tests that use this helper specifically)
+    appStateInstance.isRunning = false
+    const inner = $(commandLogEl).find('.command-wrapper-text')
+
+    inner.get(0).click()
+
+    // retry until the reporter repaints
+    cy.wrap(null, { log: false }).should(() => {
+      // make sure command was pinned, otherwise throw a better error message
+      expect(cy.$$('.runnable-active .command-pin', getReporterDocument()).length, 'command should be pinned').ok
+    })
+  })
+}
+
+const wrapped = (obj) => cy.wrap(obj, { log: false })
+
+export const shouldBeCalled = (stub) => wrapped(stub).should('be.called')
+
+export const shouldBeCalledOnce = (stub) => wrapped(stub).should('be.calledOnce')
+
+export const shouldBeCalledWithCount = (num) => (stub) => wrapped(stub).should('have.callCount', num)
+
+export const shouldNotBeCalled = (stub) => wrapped(stub).should('not.be.called')
+
+export const assertLogLength = (logs, expectedLength) => {
+  const receivedLogs = logs.map((x, index) => `\n\n${index} - ${x.get('name')}: ${x.get('message')}`).join('\n')
+
+  expect(logs.length).to.eq(expectedLength, `received ${logs.length} logs when we expected ${expectedLength}: [${receivedLogs}]`)
+}
+
+export const findCrossOriginLogs = (consolePropCommand, logMap, matchingOrigin) => {
+  const matchedLogs = Array.from(logMap.values()).filter((log: any) => {
+    const props = log.get()
+
+    return props.name === consolePropCommand && props.id.includes(matchingOrigin)
+  })
+
+  // While we'd expect the incoming log order to be deterministic, in practice we've found it fairly
+  // flakey. Sorting here eliminates this, resulting in far more reliable tests.
+  const logAttrs = matchedLogs.map((log: any) => log.get()).sort()
+
+  return logAttrs.length === 1 ? logAttrs[0] : logAttrs
+}
+
+export const attachListeners = (listenerArr) => {
+  return (els) => {
+    _.each(els, (el, elName) => {
+      return listenerArr.forEach((evtName) => {
+        el.on(evtName, cy.stub().as(`${elName}:${evtName}`))
+      })
+    })
+  }
+}
+
+const getAllFn = (...aliases) => {
+  let getFns
+
+  if (aliases.length > 1) {
+    const aliasArray = _.isArray(aliases[1]) ? aliases[1] : aliases[1].split(' ')
+
+    getFns = aliasArray.map((alias) => cy.now('get', `@${aliases[0]}:${alias}`))
+  } else {
+    getFns = aliases[0].split(' ').map((alias) => cy.now('get', `@${aliases[0]}:${alias}`))
+  }
+
+  return () => getFns.map((fn) => fn())
+}
+
+const shouldWithTimeout = (cb, timeout = 250) => {
+  cy.wrap({}, { timeout }).should(cb)
+}
+
+export const keyEvents = [
+  'keydown',
+  'keyup',
+  'keypress',
+  'input',
+  'textInput',
+]
+
+export const mouseClickEvents = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
+
+export const mouseHoverEvents = [
+  'pointerout',
+  'pointerleave',
+  'pointerover',
+  'pointerenter',
+  'mouseout',
+  'mouseleave',
+  'mouseover',
+  'mouseenter',
+  'pointermove',
+  'mousemove',
+]
+
+export const focusEvents = ['focus', 'focusin']
+
+export const attachKeyListeners = attachListeners(keyEvents)
+
+export const attachFocusListeners = attachListeners(focusEvents)
+
+export const attachMouseClickListeners = attachListeners(mouseClickEvents)
+
+export const attachMouseHoverListeners = attachListeners(mouseHoverEvents)
+
+// Browser detection utilities
+export const isFirefox = Cypress.isBrowser('firefox')
+
+export const isWebKit = Cypress.isBrowser('webkit')
+
+// trim new lines at the end of innerText
+// due to changing browser versions implementing
+// this differently
+export const trimInnerText = ($el) => {
+  return _.trimEnd($el.get(0).innerText, '\n')
+}
+
+export const makeRequestForCookieBehaviorTests = (
+  win: Cypress.AUTWindow,
+  url: string,
+  client: 'fetch' | 'xmlHttpRequest' = 'xmlHttpRequest',
+  credentials: 'same-origin' | 'include' | 'omit' | boolean = false,
+) => {
+  if (client === 'fetch') {
+    // if a boolean is specified, make sure the default is applied
+    credentials = Cypress._.isBoolean(credentials) ? 'same-origin' : credentials
+
+    return win.fetch(url, { credentials })
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+
+    xhr.open('GET', url)
+    xhr.withCredentials = Cypress._.isBoolean(credentials) ? credentials : false
+    xhr.onload = function () {
+      resolve(xhr.response)
+    }
+
+    xhr.onerror = function () {
+      reject(xhr.response)
+    }
+
+    xhr.send()
+  })
+}
+
+function runCommands () {
+  cy.readFile('cypress/fixtures/app.json')
+  cy.writeFile('cypress/_test-output/written.json', 'contents')
+  cy.task('return:arg', 'arg')
+  cy.get('#basic').selectFile('cypress/fixtures/valid.json')
+  if (!Cypress.isBrowser({ family: 'webkit' })) {
+    cy.origin('http://foobar.com:3500', () => {})
+  }
+}
+
+export const runImportedPrivilegedCommands = runCommands
+
+declare global {
+  interface Window {
+    runGlobalPrivilegedCommands: () => void
+  }
+}
+
+window.runGlobalPrivilegedCommands = runCommands
+
+Cypress.Commands.add('runSupportFileCustomPrivilegedCommands', runCommands)
+
+Cypress.Commands.addQuery('getAll', getAllFn)
+
+Cypress.Commands.add('shouldWithTimeout', shouldWithTimeout)
+
+const chaiSubset = require('chai-subset')
+
+chai.use(chaiSubset)

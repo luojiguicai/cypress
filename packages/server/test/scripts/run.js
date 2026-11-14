@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 const _ = require('lodash')
 const chalk = require('chalk')
 const minimist = require('minimist')
@@ -52,7 +53,7 @@ if (!run || !run.length) {
 
       $ yarn test-unit
       $ yarn test-integration
-      $ yarn test-e2e
+      $ yarn test-performance
   `)
 }
 
@@ -101,7 +102,11 @@ if (!isWindows()) {
 if (options.fgrep) {
   commandAndArguments.args.push(
     '--fgrep',
-    options.fgrep,
+    // Shell-joined below. On POSIX, quote so multi-word filters stay one mocha
+    // arg. On Windows (cmd.exe + shell:true), quotes pass through literally.
+    isWindows()
+      ? options.fgrep
+      : `'${String(options.fgrep).replace(/'/g, `'\\''`)}'`,
   )
 }
 
@@ -166,12 +171,12 @@ console.log('specfiles:', run)
 console.log('test command:')
 console.log(cmd)
 
-const child = execa.shell(cmd, { env, stdio: 'inherit' })
+const child = execa(cmd, { env, stdio: 'inherit', shell: true })
 
-child.on('exit', (code, signal) => {
+child.on('exit', (exitCode, signal) => {
   if (signal) {
     console.error(`tests exited with signal ${signal}`)
   }
 
-  process.exit(code === null ? 1 : code)
+  process.exit(exitCode === null ? 1 : exitCode)
 })

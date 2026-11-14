@@ -3,15 +3,16 @@ import Debug from 'debug'
 import _ from 'lodash'
 import dayjs from 'dayjs'
 import $errUtils from '../cypress/error_utils'
-import { USKeyboard } from '../cypress/UsKeyboardLayout'
+import { USKeyboard } from '@packages/types'
 import $dom from '../dom'
 import $document from '../dom/document'
-import $elements, { HTMLTextLikeInputElement } from '../dom/elements'
-// eslint-disable-next-line no-duplicate-imports
-import type { HTMLTextLikeElement } from '../dom/elements'
+import $elements from '../dom/elements'
+import type { HTMLTextLikeElement, HTMLTextLikeInputElement } from '../dom/elements'
 import $selection from '../dom/selection'
 import $utils from '../cypress/utils'
 import $window from '../dom/window'
+import type { Log } from '../cypress/log'
+import type { StateFunc } from '../cypress/state'
 
 const debug = Debug('cypress:driver:keyboard')
 
@@ -22,17 +23,6 @@ export interface KeyboardModifiers {
   shift: boolean
 }
 
-export interface KeyboardState {
-  keyboardModifiers?: KeyboardModifiers
-}
-
-export interface ProxyState<T> {
-  <K extends keyof T>(arg: K): T[K] | undefined
-  <K extends keyof T>(arg: K, arg2: T[K] | null): void
-}
-
-export type State = ProxyState<KeyboardState>
-
 interface KeyDetailsPartial extends Partial<KeyDetails> {
   key: string
 }
@@ -40,7 +30,7 @@ interface KeyDetailsPartial extends Partial<KeyDetails> {
 type SimulatedDefault = (
   el: HTMLElement,
   key: KeyDetails,
-  options: typeOptions
+  options: typeOptions,
 ) => void
 
 type KeyInfo = KeyDetails | ShortcutDetails
@@ -74,10 +64,13 @@ const dateRe = /^\d{4}-\d{2}-\d{2}/
 const monthRe = /^\d{4}-(0\d|1[0-2])/
 const weekRe = /^\d{4}-W(0[1-9]|[1-4]\d|5[0-3])/
 const timeRe = /^([0-1]\d|2[0-3]):[0-5]\d(:[0-5]\d)?(\.[0-9]{1,3})?/
-const dateTimeRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}/
+const dateTimeRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]{1,3})?/
 const numberRe = /^-?(\d+|\d+\.\d+|\.\d+)([eE][-+]?\d+)?$/i
 const charsBetweenCurlyBracesRe = /({.+?})/
-const isValidNumberInputChar = /[-+eE\d\.]/
+const isValidNumberInputChar = /[-+eE\d.]/
+// Unanchored at the end so that each arrow in a run such as
+// {upArrow}{upArrow} is accepted on its own as typing reaches it
+const arrowKeysRe = /^\{(ArrowUp|ArrowDown)\}/
 
 const INITIAL_MODIFIERS = {
   alt: false,
@@ -106,7 +99,7 @@ const modifierValueMap = {
   shift: 8,
 }
 
-export type KeyEventType =
+type KeyEventType =
   | 'keydown'
   | 'keyup'
   | 'keypress'
@@ -168,11 +161,11 @@ const joinKeyArrayToString = (keyArr: KeyInfo[]) => {
   }).join('')
 }
 
-type modifierKeyDetails = KeyDetails & {
+type KeyModifiers = {
   key: keyof typeof keyToModifierMap
 }
 
-const isModifier = (details: KeyInfo): details is modifierKeyDetails => {
+const isModifier = (details: KeyInfo): details is KeyDetails & KeyModifiers => {
   return details.type === 'key' && !!keyToModifierMap[details.key]
 }
 
@@ -310,7 +303,7 @@ const parseCharsBetweenCurlyBraces = (chars: string) => {
 
 const shouldIgnoreEvent = <
   T extends KeyEventType,
-  K extends { [key in T]?: boolean }
+  K extends { [key in T]?: boolean },
 >(
   eventName: T,
   options: K,
@@ -396,7 +389,7 @@ const validateTyping = (
   el: HTMLElement,
   keys: KeyInfo[],
   currentIndex: number,
-  onFail: Function,
+  onFail: Log | ((err: Error) => unknown),
   skipCheckUntilIndex: number | undefined,
   force: boolean,
 ) => {
@@ -404,7 +397,7 @@ const validateTyping = (
   const allChars = joinKeyArrayToString(keys)
 
   if (skipCheckUntilIndex) {
-    return { skipCheckUntilIndex: skipCheckUntilIndex-- }
+    return { skipCheckUntilIndex }
   }
 
   debug('validateTyping:', chars, el)
@@ -413,6 +406,8 @@ const validateTyping = (
   const numElements = $el.length
   const isBody = $el.is('body')
   const isTextLike = $dom.isTextLike(el)
+
+  const arrowKeyChars = arrowKeysRe.exec(chars)
 
   let dateChars
   let monthChars
@@ -490,6 +485,10 @@ const validateTyping = (
       return dayjs(date, 'YYYY-MM-DD').format('YYYY-MM-DD') === date
     }
 
+    if (_.isString(chars) && arrowKeyChars) {
+      return {}
+    }
+
     if (
       _.isString(chars) &&
       dateChars &&
@@ -510,6 +509,10 @@ const validateTyping = (
   if (isMonth) {
     monthChars = monthRe.exec(chars)
 
+    if (_.isString(chars) && arrowKeyChars) {
+      return {}
+    }
+
     if (_.isString(chars) && monthChars) {
       skipCheckUntilIndex = _getEndIndex(chars, monthChars[0])
 
@@ -524,6 +527,10 @@ const validateTyping = (
 
   if (isWeek) {
     weekChars = weekRe.exec(chars)
+
+    if (_.isString(chars) && arrowKeyChars) {
+      return {}
+    }
 
     if (_.isString(chars) && weekChars) {
       skipCheckUntilIndex = _getEndIndex(chars, weekChars[0])
@@ -540,6 +547,10 @@ const validateTyping = (
   if (isTime) {
     timeChars = timeRe.exec(chars)
 
+    if (_.isString(chars) && arrowKeyChars) {
+      return {}
+    }
+
     if (_.isString(chars) && timeChars) {
       skipCheckUntilIndex = _getEndIndex(chars, timeChars[0])
 
@@ -554,6 +565,10 @@ const validateTyping = (
 
   if (isDateTime) {
     dateTimeChars = dateTimeRe.exec(chars)
+
+    if (_.isString(chars) && arrowKeyChars) {
+      return {}
+    }
 
     if (_.isString(chars) && dateTimeChars) {
       skipCheckUntilIndex = _getEndIndex(chars, dateTimeChars[0])
@@ -582,7 +597,7 @@ const simulatedDefaultKeyMap: { [key: string]: SimulatedDefault } = {
       $selection.replaceSelectionContents(el, '\n')
     }
 
-    options.onEnterPressed && options.onEnterPressed()
+    options.onEnterPressed && options.onEnterPressed(el)
   },
   Delete: (el, key) => {
     key.events.input = $selection.deleteRightOfCursor(el)
@@ -673,30 +688,30 @@ const keyToModifierMap = {
   Shift: 'shift',
 }
 
-export interface typeOptions {
+interface typeOptions {
   id: string
   $el: JQuery
   chars: string
   force?: boolean
   simulated?: boolean
   release?: boolean
-  _log?: any
+  _log?: Log
   delay?: number
-  onError?: Function
-  onEvent?: Function
-  onBeforeEvent?: Function
-  onFocusChange?: Function
-  onBeforeType?: Function
-  onAfterType?: Function
-  onValueChange?: Function
-  onEnterPressed?: Function
-  onNoMatchingSpecialChars?: Function
-  onBeforeSpecialCharAction?: Function
+  onError?: (...args: any[]) => unknown
+  onEvent?: (id: string, key: string, event: Event, dispatched: boolean) => unknown
+  onBeforeEvent?: (...args: any[]) => unknown
+  onFocusChange?: (...args: any[]) => unknown
+  onBeforeType?: (totalKeys: number) => unknown
+  onAfterType?: () => unknown
+  onValueChange?: (originalText: string, el: HTMLElement) => unknown
+  onEnterPressed?: (el: HTMLElement) => unknown
+  onNoMatchingSpecialChars?: (chars: string, allChars: string) => unknown
+  onBeforeSpecialCharAction?: (...args: any[]) => unknown
   prevValue?: string
 }
 
 export class Keyboard {
-  constructor (private state: State) {}
+  constructor (private state: StateFunc) {}
 
   type (opts: typeOptions) {
     const options = _.defaults({}, opts, {
@@ -760,9 +775,7 @@ export class Keyboard {
           const activeEl = this.getActiveEl(options)
 
           if (key.type === 'shortcut') {
-            this.simulateShortcut(activeEl, key, options)
-
-            return null
+            return this.simulateShortcut(activeEl, key, options)
           }
 
           debug('typing key:', key.key)
@@ -828,9 +841,7 @@ export class Keyboard {
             return null
           }
 
-          this.typeSimulatedKey(activeEl, key, options)
-
-          return null
+          return this.typeSimulatedKey(activeEl, key, options)
         }
       },
     )
@@ -885,7 +896,7 @@ export class Keyboard {
     let charCode: number | undefined
     let keyCode: number | undefined
     let which: number | undefined
-    let data: Nullable<string> | undefined
+    let data: Cypress.Nullable<string> | undefined
     let location: number | undefined = keyDetails.location || 0
     let key: string | undefined
     let code: string | undefined = keyDetails.code
@@ -921,7 +932,18 @@ export class Keyboard {
         keyCode = 0
         which = 0
         location = undefined
-        data = text === '\r' ? '↵' : text
+
+        // WebKit will insert characters on a textInput event, resulting
+        // in double char entry when the default handler is executed. But values
+        // inserted by textInput aren't always correct/aren't filtered
+        // through our shouldUpdateValue logic, so we prevent textInput's
+        // default logic by removing the key data from the event.
+        if (Cypress.isBrowser('webkit')) {
+          data = ''
+        } else {
+          data = text === '\r' ? '↵' : text
+        }
+
         break
 
       case 'beforeinput':
@@ -991,7 +1013,7 @@ export class Keyboard {
     debug('event options:', eventType, eventOptions)
     if (eventConstructor === 'TextEvent' && win[eventConstructor]) {
       event = document.createEvent('TextEvent')
-      // @ts-ignore
+      // @ts-expect-error - initTextEvent is deprecated and not in the DOM lib types
       event.initTextEvent(
         eventType,
         eventOptions.bubbles,
@@ -1098,7 +1120,7 @@ export class Keyboard {
       details.text = details.shiftText
     }
 
-    // TODO: Re-think skipping text insert if non-shift modifers
+    // TODO: Re-think skipping text insert if non-shift modifiers
     // @see https://github.com/cypress-io/cypress/issues/5622
     // if (hasModifierBesidesShift(modifiers)) {
     //   details.text = ''
@@ -1107,7 +1129,7 @@ export class Keyboard {
     return details
   }
 
-  flagModifier (key: modifierKeyDetails, setTo = true) {
+  flagModifier (key: KeyModifiers, setTo = true) {
     debug('handleModifier', key.key)
     const modifier = keyToModifierMap[key.key]
 
@@ -1171,6 +1193,13 @@ export class Keyboard {
 
       if ($elements.isContentEditable(elToType)) {
         key.events.input = false
+
+        if (Cypress.isBrowser('webkit')) {
+          // WebKit will emit beforeinput itself when the text is
+          // inserted into a contenteditable input using `execCommand('insertText')`.
+          // We prevent the simulated event from firing to avoid duplicative events.
+          key.events.beforeinput = false
+        }
       } else if ($elements.isReadOnlyInputOrTextarea(elToType)) {
         key.events.textInput = false
       }
@@ -1185,7 +1214,7 @@ export class Keyboard {
         ) {
           if (
             shouldIgnoreEvent('textInput', key.events) ||
-          this.fireSimulatedEvent(elToType, 'textInput', key, options)
+            this.fireSimulatedEvent(elToType, 'textInput', key, options)
           ) {
             return this.performSimulatedDefault(elToType, key, options)
           }
@@ -1213,7 +1242,14 @@ export class Keyboard {
     this.simulatedKeydown(el, key, options)
     const elToKeyup = this.getActiveEl(options)
 
-    this.simulatedKeyup(elToKeyup, key, options)
+    // keyup is deferred to the next microtask so listeners that update state in a
+    // native microtask on input (as real browsers allow) run before keyup handlers.
+    // Use the native Promise scheduler; bluebird's Promise.resolve() does not share
+    // the same microtask queue as DOM Promise.resolve() callbacks.
+    // @see https://github.com/cypress-io/cypress/issues/14864
+    return globalThis.Promise.resolve().then(() => {
+      this.simulatedKeyup(elToKeyup, key, options)
+    })
   }
 
   simulateShortcut (el: HTMLElement, key: ShortcutDetails, options) {
@@ -1222,16 +1258,19 @@ export class Keyboard {
     })
 
     this.simulatedKeydown(el, key.key, options)
-    this.simulatedKeyup(el, key.key, options)
 
-    options.id = _.uniqueId('char')
+    return globalThis.Promise.resolve().then(() => {
+      this.simulatedKeyup(el, key.key, options)
 
-    const elToKeyup = this.getActiveEl(options)
+      const elToKeyup = this.getActiveEl(options)
 
-    key.modifiers.reverse().forEach((key) => {
-      delete key.events.keyup
       options.id = _.uniqueId('char')
-      this.simulatedKeyup(elToKeyup, key, options)
+
+      key.modifiers.reverse().forEach((key) => {
+        delete key.events.keyup
+        options.id = _.uniqueId('char')
+        this.simulatedKeyup(elToKeyup, key, options)
+      })
     })
   }
 
@@ -1326,7 +1365,7 @@ let _defaults
 
 const reset = () => {
   _defaults = {
-    keystrokeDelay: 10,
+    keystrokeDelay: null,
   }
 }
 
@@ -1365,6 +1404,24 @@ const defaults = (props: Partial<Cypress.KeyboardDefaultsOptions>) => {
   return getConfig()
 }
 
+const Keys: Record<string, Cypress.SupportedNamedKey> = {
+  DOWN: 'ArrowDown',
+  LEFT: 'ArrowLeft',
+  RIGHT: 'ArrowRight',
+  UP: 'ArrowUp',
+  END: 'End',
+  HOME: 'Home',
+  PAGEDOWN: 'PageDown',
+  PAGEUP: 'PageUp',
+  ENTER: 'Enter',
+  TAB: 'Tab',
+  BACKSPACE: 'Backspace',
+  SPACE: 'Space',
+  DELETE: 'Delete',
+  INSERT: 'Insert',
+  ESC: 'Escape',
+}
+
 export default {
   defaults,
   getConfig,
@@ -1373,4 +1430,5 @@ export default {
   reset,
   toModifiersEventOptions,
   fromModifierEventOptions,
+  Keys,
 }

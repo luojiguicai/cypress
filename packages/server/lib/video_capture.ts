@@ -5,21 +5,26 @@ import ffmpeg from 'fluent-ffmpeg'
 import stream from 'stream'
 import Bluebird from 'bluebird'
 import { path as ffmpegPath } from '@ffmpeg-installer/ffmpeg'
+import { path as ffprobePath } from '@ffprobe-installer/ffprobe'
 import BlackHoleStream from 'black-hole-stream'
 import { fs } from './util/fs'
+import type { ProcessOptions, WriteVideoFrame } from '@packages/types'
+import type { FfprobeData } from 'fluent-ffmpeg'
 
 const debug = Debug('cypress:server:video')
+const debugVerbose = Debug('cypress-verbose:server:video')
 // extra verbose logs for logging individual frames
 const debugFrames = Debug('cypress-verbose:server:video:frames')
 
 debug('using ffmpeg from %s', ffmpegPath)
 
 ffmpeg.setFfmpegPath(ffmpegPath)
+ffmpeg.setFfprobePath(ffprobePath)
 
 const deferredPromise = function () {
   let reject
   let resolve
-  const promise = new Bluebird((_resolve, _reject) => {
+  const promise = new Promise((_resolve, _reject) => {
     resolve = _resolve
     reject = _reject
   })
@@ -29,12 +34,18 @@ const deferredPromise = function () {
 
 export function generateFfmpegChaptersConfig (tests) {
   if (!tests) {
-    return null
+    return
   }
 
-  const configString = tests.map((test) => {
-    return test.attempts.map((attempt, i) => {
+  const configString = tests.flatMap((test) => {
+    return test.attempts.flatMap((attempt, i) => {
       const { videoTimestamp, wallClockDuration } = attempt
+
+      // pending tests never ran, so they have no place in the video
+      if (videoTimestamp == null || wallClockDuration == null) {
+        return []
+      }
+
       let title = test.title ? test.title.join(' ') : ''
 
       if (i > 0) {
@@ -44,11 +55,11 @@ export function generateFfmpegChaptersConfig (tests) {
       return [
         '[CHAPTER]',
         'TIMEBASE=1/1000',
-          `START=${videoTimestamp - wallClockDuration}`,
-          `END=${videoTimestamp}`,
-          `title=${title}`,
+        `START=${videoTimestamp}`,
+        `END=${videoTimestamp + wallClockDuration}`,
+        `title=${title}`,
       ].join('\n')
-    }).join('\n')
+    })
   }).join('\n')
 
   return `;FFMETADATA1\n${configString}`
@@ -58,8 +69,17 @@ export function getMsFromDuration (duration) {
   return utils.timemarkToSeconds(duration) * 1000
 }
 
-export function getCodecData (src) {
-  return new Bluebird((resolve, reject) => {
+type CodecData = {
+  format: string
+  audio: string
+  audio_details: string
+  video: string
+  video_details: string
+  duration: string
+}
+
+export function getCodecData (src): Bluebird<CodecData> {
+  return new Bluebird<CodecData>((resolve, reject) => {
     return ffmpeg()
     .on('stderr', (stderr) => {
       return debug('get codecData stderr log %o', { message: stderr })
@@ -78,8 +98,8 @@ export function getCodecData (src) {
   })
 }
 
-export function getChapters (fileName) {
-  return new Bluebird((resolve, reject) => {
+export function getChapters (fileName): Bluebird<FfprobeData> {
+  return new Bluebird<FfprobeData>((resolve, reject) => {
     ffmpeg.ffprobe(fileName, ['-show_chapters'], (err, metadata) => {
       if (err) {
         return reject(err)
@@ -90,55 +110,49 @@ export function getChapters (fileName) {
   })
 }
 
-export function copy (src, dest) {
-  debug('copying from %s to %s', src, dest)
-
-  return fs
-  .copy(src, dest, { overwrite: true })
-  .catch((err) => {
-    if (err.code === 'ENOENT') {
-      debug('caught ENOENT error on copy, ignoring %o', { src, dest, err })
-
-      return
-    }
-
-    throw err
-  })
-}
-
-type StartOptions = {
+export type StartOptions = {
+  // Path to write video to.
+  videoName: string
   // If set, expect input frames as webm chunks.
   webmInput?: boolean
-  // Callback for asynchronous errors in video processing/compression.
-  onError?: (err: Error, stdout: string, stderr: string) => void
+  // Callback for asynchronous errors in video capturing/compression.
+  onError?: (err: Error) => void
 }
 
-export function start (name, options: StartOptions = {}) {
+export function start (options: StartOptions) {
   const pt = new stream.PassThrough()
   const ended = deferredPromise()
-  let done = false
+  let doneCapturing = false
   let wantsWrite = true
-  let skippedChunksCount = 0
-  let writtenChunksCount = 0
+  let skippedFramesCount = 0
+  let writtenFramesCount = 0
+  let startedVideoCapture: Date
 
   _.defaults(options, {
     onError () {},
   })
 
-  const endVideoCapture = function (waitForMoreChunksTimeout = 3000) {
-    debugFrames('frames written:', writtenChunksCount)
+  const endVideoCapture = function (waitForMoreFrames = true) {
+    debugFrames('frames written:', writtenFramesCount)
 
     // in some cases (webm) ffmpeg will crash if fewer than 2 buffers are
     // written to the stream, so we don't end capture until we get at least 2
-    if (writtenChunksCount < 2) {
+    if (writtenFramesCount < 2 && waitForMoreFrames) {
       return new Bluebird((resolve) => {
         pt.once('data', resolve)
       })
       .then(() => endVideoCapture())
-      .timeout(waitForMoreChunksTimeout)
+      .timeout(3000)
+      .catch((err) => {
+        debug('wait for additional frames failed or timed out after 3000ms with %d frame(s) written; ending capture without waiting: %o', writtenFramesCount, err)
+
+        return endVideoCapture(false)
+      })
     }
 
-    done = true
+    debug('ending video capture with %d frame(s) written and %d frame(s) skipped', writtenFramesCount, skippedFramesCount)
+
+    doneCapturing = true
 
     pt.end()
 
@@ -149,12 +163,12 @@ export function start (name, options: StartOptions = {}) {
 
   const lengths = {}
 
-  const writeVideoFrame = function (data) {
+  const writeVideoFrame: WriteVideoFrame = function (data) {
     // make sure we haven't ended
     // our stream yet because paint
     // events can linger beyond
     // finishing the actual video
-    if (done) {
+    if (doneCapturing) {
       return
     }
 
@@ -181,27 +195,34 @@ export function start (name, options: StartOptions = {}) {
       lengths[data.length] = true
     }
 
-    writtenChunksCount++
+    writtenFramesCount++
+
+    // the video's timeline begins at the first frame, so chapter timestamps must be measured from it
+    if (writtenFramesCount === 1) {
+      startedVideoCapture = new Date
+    }
 
     debugFrames('writing video frame')
 
     if (wantsWrite) {
-      if (!(wantsWrite = pt.write(data))) {
-        return pt.once('drain', () => {
+      wantsWrite = pt.write(data)
+      if (!wantsWrite) {
+        // ffmpeg stream isn't accepting data, so drop frames until the stream is ready to accept data
+        pt.once('drain', () => {
           debugFrames('video stream drained')
 
           wantsWrite = true
         })
       }
     } else {
-      skippedChunksCount += 1
+      skippedFramesCount += 1
 
-      return debugFrames('skipping video frame %o', { skipped: skippedChunksCount })
+      return debugFrames('skipping video frame %o', { skipped: skippedFramesCount })
     }
   }
 
   const startCapturing = () => {
-    return new Bluebird((resolve) => {
+    return new Promise((resolve) => {
       const cmd = ffmpeg({
         source: pt,
         priority: 20,
@@ -211,19 +232,24 @@ export function start (name, options: StartOptions = {}) {
       .on('start', (command) => {
         debug('capture started %o', { command })
 
-        return resolve({
-          cmd,
-          startedVideoCapture: new Date,
-        })
+        startedVideoCapture = new Date
+
+        return resolve({ cmd })
       }).on('codecData', (data) => {
         return debug('capture codec data: %o', data)
       }).on('stderr', (stderr) => {
-        return debug('capture stderr log %o', { message: stderr })
+        return debugVerbose('capture stderr log %o', { message: stderr })
       }).on('error', (err, stdout, stderr) => {
         debug('capture errored: %o', { error: err.message, stdout, stderr })
 
-        // bubble errors up
-        options.onError?.(err, stdout, stderr)
+        if (err.message.includes('ffmpeg exited with code 1: pipe:0')) {
+          err.message = 'Insufficient frames captured to create video.'
+        }
+
+        // bubble errors up if occurs before endCapture is called
+        if (!doneCapturing) {
+          options.onError?.(err)
+        }
 
         // reject the ended promise
         return ended.reject(err)
@@ -254,50 +280,77 @@ export function start (name, options: StartOptions = {}) {
         .inputOptions('-use_wallclock_as_timestamps 1')
       }
 
-      return cmd.save(name)
+      return cmd.save(options.videoName)
     })
   }
 
   return startCapturing()
-  .then(({ cmd, startedVideoCapture }: any) => {
+  .then(({ cmd }: any) => {
     return {
       _pt: pt,
       cmd,
       endVideoCapture,
       writeVideoFrame,
-      startedVideoCapture,
+      get startedVideoCapture () {
+        return startedVideoCapture
+      },
+      restart: () => {
+        throw new Error('restart cannot be called on a plain ffmpeg stream')
+      },
     }
   })
 }
 
-// Progress callback called with percentage `0 <= p <= 1` of compression progress.
-type OnProgress = (p: number) => void
-
-export async function process (name, cname, videoCompression, ffmpegchaptersConfig, onProgress: OnProgress = function () {}) {
-  const metaFileName = `${name}.meta`
-
-  const maybeGenerateMetaFile = Bluebird.method(() => {
-    if (!ffmpegchaptersConfig) {
-      return false
-    }
-
-    // Writing the metadata to filesystem is necessary because fluent-ffmpeg is just a wrapper of ffmpeg command.
-    return fs.writeFile(metaFileName, ffmpegchaptersConfig).then(() => true)
-  })
-
-  const addChaptersMeta = await maybeGenerateMetaFile()
-
+export async function compress (options: ProcessOptions) {
   let total = null
 
-  return new Bluebird((resolve, reject) => {
-    debug('processing video from %s to %s video compression %o',
-      name, cname, videoCompression)
+  const metaFileName = `${options.videoName}.meta`
+  const addChaptersMeta = options.chaptersConfig && await fs.writeFile(metaFileName, options.chaptersConfig).then(() => true)
 
-    const command = ffmpeg()
+  return new Promise<void>((resolve, reject) => {
+    debug('compressing video %o', options)
+
+    const command = ffmpeg({
+      priority: 20,
+    })
+    .addOptions([
+      // These flags all serve to reduce initial buffering, especially important
+      // when dealing with very short videos (such as during component tests).
+      // See https://ffmpeg.org/ffmpeg-formats.html#Format-Options for details.
+      '-avioflags direct',
+
+      // Because we're passing in a slideshow of still frames, there's no
+      // fps metadata to be found in the video stream. This ensures that ffmpeg
+      // isn't buffering a lot of data waiting for information that's not coming.
+      '-fpsprobesize 0',
+
+      // Tells ffmpeg to read only the first 32 bytes of the stream for information
+      // (resolution, stream format, etc).
+      // Some videos can have long metadata (eg, lots of chapters) or spread out,
+      // but our streams are always predictable; No need to wait / buffer data before
+      // starting encoding
+      '-probesize 32',
+
+      // By default ffmpeg buffers the first 5 seconds of video to analyze it before
+      // it starts encoding. We're basically telling it "there is no metadata coming,
+      // start encoding as soon as we give you frames."
+      '-analyzeduration 0',
+    ])
+
+    // See https://trac.ffmpeg.org/wiki/Encode/H.264 for details about h264 options.
     const outputOptions = [
+      // Preset is a tradeoff between encoding speed and filesize. It does not determine video
+      // quality; It's just a tradeoff between CPU vs size.
       '-preset fast',
-        `-crf ${videoCompression}`,
-        '-pix_fmt yuv420p',
+      // Compression Rate Factor is essentially the quality dial; 0 would be lossless
+      // (big files), while 51 (the maximum) would lead to low quality (and small files).
+      `-crf ${options.videoCompression}`,
+
+      // Discussion of pixel formats is beyond the scope of these comments. See
+      // https://en.wikipedia.org/wiki/Chroma_subsampling if you want the gritty details.
+      // Short version: yuv420p is a standard video format supported everywhere.
+      '-pix_fmt yuv420p',
+      ...(options.outputOptions || []),
     ]
 
     if (addChaptersMeta) {
@@ -305,10 +358,13 @@ export async function process (name, cname, videoCompression, ffmpegchaptersConf
       outputOptions.push('-map_metadata 1')
     }
 
-    command.input(name)
+    let chain = command.input(options.videoName)
     .videoCodec('libx264')
     .outputOptions(outputOptions)
-    // .videoFilters("crop='floor(in_w/2)*2:floor(in_h/2)*2'")
+
+    if (options.videoFilters) chain = chain.videoFilters(options.videoFilters)
+
+    chain
     .on('start', (command) => {
       debug('compression started %o', { command })
     })
@@ -330,11 +386,10 @@ export async function process (name, cname, videoCompression, ffmpegchaptersConf
 
       const progressed = utils.timemarkToSeconds(progress.timemark)
 
-      // @ts-ignore
       const percent = progressed / total
 
       if (percent < 1) {
-        return onProgress(percent)
+        return options.onProgress?.(percent)
       }
     })
     .on('error', (err, stdout, stderr) => {
@@ -346,10 +401,10 @@ export async function process (name, cname, videoCompression, ffmpegchaptersConf
       debug('compression ended')
 
       // we are done progressing
-      onProgress(1)
+      options.onProgress?.(1)
 
       // rename and obliterate the original
-      await fs.move(cname, name, {
+      await fs.move(options.compressedVideoName, options.videoName, {
         overwrite: true,
       })
 
@@ -358,6 +413,6 @@ export async function process (name, cname, videoCompression, ffmpegchaptersConf
       }
 
       resolve()
-    }).save(cname)
+    }).save(options.compressedVideoName)
   })
 }

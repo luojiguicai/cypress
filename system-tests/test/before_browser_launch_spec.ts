@@ -15,27 +15,25 @@ describe('e2e before:browser:launch', () => {
   systemTests.it('modifies preferences on disk if DNE', {
     browser: 'chrome',
     config: {
-      video: false,
       env: {
         PATH_TO_CHROME_PROFILE,
       },
     },
     project: 'chrome-browser-preferences',
     snapshot: true,
-    spec: 'spec.js',
+    spec: 'spec.cy.js',
   })
 
   systemTests.it('can add extensions', {
-    spec: 'spec.js',
-    config: {
-      video: false,
-    },
+    // as of Chrome 137, --load-extension does not work in chrome branded. In order to test this, we need to use the chrome-for-testing browser or chromium.
+    browser: ['!webkit', '!chrome'], // TODO(webkit): fix+unskip, or skip and add a test that this fails with WebKit
+    spec: 'spec.cy.js',
     headed: true,
     project: 'browser-extensions',
     sanitizeScreenshotDimensions: true,
     snapshot: true,
     onRun: async (exec) => {
-      Fixtures.scaffoldProject('plugin-extension')
+      await Fixtures.scaffoldProject('plugin-extension')
       await exec()
     },
   })

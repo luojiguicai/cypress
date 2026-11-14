@@ -1,103 +1,104 @@
-import check from 'check-more-types'
 import Debug from 'debug'
 import EE from 'events'
 import _ from 'lodash'
 import path from 'path'
-
-import browsers from './browsers'
 import pkg from '@packages/root'
-import { allowed } from '@packages/config'
-import { ServerCt } from './server-ct'
+
+import { Automation } from './automation'
+import browsers from './browsers'
+import * as config from './config'
+import * as errors from './errors'
+import preprocessor from './plugins/preprocessor'
+import runEvents from './plugins/run_events'
+import { Reporter } from './reporter'
+import * as savedState from './saved_state'
 import { SocketCt } from './socket-ct'
 import { SocketE2E } from './socket-e2e'
-import api from './api'
-import { Automation } from './automation'
-import * as config from './config'
-import cwd from './cwd'
-import errors from './errors'
-import Reporter from './reporter'
-import runEvents from './plugins/run_events'
-import savedState from './saved_state'
-import scaffold from './scaffold'
-import { ServerE2E } from './server-e2e'
-import system from './util/system'
-import user from './user'
 import { ensureProp } from './util/class-helpers'
-import { fs } from './util/fs'
-import * as settings from './util/settings'
-import plugins from './plugins'
-import specsUtil from './util/specs'
-import Watchers from './watchers'
-import devServer from './plugins/dev-server'
-import preprocessor from './plugins/preprocessor'
-import { SpecsStore } from './specs-store'
-import { checkSupportFile, getDefaultConfigFilePath } from './project_utils'
-import type { LaunchArgs } from './open_project'
-
-// Cannot just use RuntimeConfigOptions as is because some types are not complete.
-// Instead, this is an interface of values that have been manually validated to exist
-// and are required when creating a project.
-type ReceivedCypressOptions =
-  Pick<Cypress.RuntimeConfigOptions, 'hosts' | 'projectName' | 'clientRoute' | 'devServerPublicPathRoute' | 'namespace' | 'report' | 'socketIoCookie' | 'configFile' | 'isTextTerminal' | 'isNewProject' | 'proxyUrl' | 'browsers' | 'browserUrl' | 'socketIoRoute' | 'arch' | 'platform' | 'spec' | 'specs' | 'browser' | 'version' | 'remote'>
-  & Pick<Cypress.ResolvedConfigOptions, 'chromeWebSecurity' | 'supportFolder' | 'experimentalSourceRewriting' | 'fixturesFolder' | 'reporter' | 'reporterOptions' | 'screenshotsFolder' | 'pluginsFile' | 'supportFile' | 'integrationFolder' | 'baseUrl' | 'viewportHeight' | 'viewportWidth' | 'port' | 'experimentalInteractiveRunEvents' | 'componentFolder' | 'userAgent' | 'downloadsFolder' | 'env' | 'testFiles' | 'ignoreTestFiles'> // TODO: Figure out how to type this better.
+import * as system from './util/system'
+import { cypressSessions } from './cypress-sessions'
+import type {
+  BannersState,
+  FoundBrowser,
+  FoundSpec,
+  OpenProjectLaunchOptions,
+  ProtocolManagerShape,
+  CyPromptManagerShape,
+  ReceivedCypressOptions,
+  ResolvedConfigurationOptions,
+  TestingType,
+  VideoRecording,
+  AutomationCommands,
+} from '@packages/types'
+import type { DataContext } from '@packages/data-context'
+import { getCtx } from '@packages/data-context'
+import { createHmac, randomUUID } from 'crypto'
+import { ServerBase } from './server-base'
+import type Protocol from 'devtools-protocol'
+import type { ServiceWorkerClientEvent } from '@packages/proxy/lib/http/util/service-worker-manager'
+import { StudioLifecycleManager } from './cloud/studio/StudioLifecycleManager'
+import { CyPromptLifecycleManager } from './cloud/cy-prompt/CyPromptLifecycleManager'
+import { telemetryManager } from './cloud/studio/telemetry/TelemetryManager'
+import { INITIALIZATION_MARK_NAMES, INITIALIZATION_TELEMETRY_GROUP_NAMES } from './cloud/studio/telemetry/constants/initialization'
+import { TelemetryReporter } from './cloud/studio/telemetry/TelemetryReporter'
+import type { StudioInitOptions } from './types/studio'
 
 export interface Cfg extends ReceivedCypressOptions {
+  projectId?: string
   projectRoot: string
+  blockHosts?: Cypress.ResolvedConfigOptions['blockHosts']
   proxyServer?: Cypress.RuntimeConfigOptions['proxyUrl']
+  fileServerFolder?: Cypress.ResolvedConfigOptions['fileServerFolder']
+  testingType: TestingType
+  isDefaultProtocolEnabled?: boolean
+  isInteractive?: boolean
+  hideCommandLog?: boolean
+  hideRunnerUi?: boolean
   exit?: boolean
   state?: {
-    firstOpened?: number
-    lastOpened?: number
+    firstOpened?: number | null
+    lastOpened?: number | null
+    promptsShown?: object | null
+    banners?: BannersState | null
   }
+  e2e: Partial<Cfg>
+  component: Partial<Cfg>
+  additionalIgnorePattern?: string | string[]
+  resolved: ResolvedConfigurationOptions
 }
 
-type WebSocketOptionsCallback = (...args: any[]) => any
-
-export interface OpenProjectLaunchOptions {
-  args?: LaunchArgs
-
-  configFile?: string | false
-  browsers?: Cypress.Browser[]
-
-  // Callback to reload the Desktop GUI when cypress.json is changed.
-  onSettingsChanged?: false | (() => void)
-
-  // Optional callbacks used for triggering events via the web socket
-  onReloadBrowser?: WebSocketOptionsCallback
-  onFocusTests?: WebSocketOptionsCallback
-  onSpecChanged?: WebSocketOptionsCallback
-  onSavedStateChanged?: WebSocketOptionsCallback
-  onChange?: WebSocketOptionsCallback
-
-  [key: string]: any
-}
-
-const localCwd = cwd()
+const localCwd = process.cwd()
 
 const debug = Debug('cypress:server:project')
-const debugScaffold = Debug('cypress:server:scaffold')
+const debugVerbose = Debug('cypress-verbose:server:project')
 
 type StartWebsocketOptions = Pick<Cfg, 'socketIoCookie' | 'namespace' | 'screenshotsFolder' | 'report' | 'reporter' | 'reporterOptions' | 'projectRoot'>
 
-export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
-  protected watchers: Watchers
+export class ProjectBase extends EE {
+  // id is sha256 of projectRoot
+  public id: string
+  public ctx: DataContext
+
   protected _cfg?: Cfg
-  protected _server?: TServer
+  protected _server?: ServerBase<any>
   protected _automation?: Automation
+  private _protocolManager?: ProtocolManagerShape
   private _recordTests?: any = null
   private _isServerOpen: boolean = false
+  private _isStudioInitialized: boolean = false
 
+  public videoRecording?: VideoRecording
   public browser: any
   public options: OpenProjectLaunchOptions
   public testingType: Cypress.TestingType
-  public spec: Cypress.Cypress['spec'] | null
-  private generatedProjectIdTimestamp: any
+  public spec: FoundSpec | null
+  public isOpen: boolean = false
   projectRoot: string
 
   constructor ({
     projectRoot,
     testingType,
-    options,
+    options = {},
   }: {
     projectRoot: string
     testingType: Cypress.TestingType
@@ -109,15 +110,16 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       throw new Error('Instantiating lib/project requires a projectRoot!')
     }
 
-    if (!check.unemptyString(projectRoot)) {
+    if (!_.isString(projectRoot) || _.isEmpty(projectRoot)) {
       throw new Error(`Expected project root path, not ${projectRoot}`)
     }
 
     this.testingType = testingType
     this.projectRoot = path.resolve(projectRoot)
-    this.watchers = new Watchers()
     this.spec = null
     this.browser = null
+    this.id = createHmac('sha256', 'secret-key').update(projectRoot).digest('hex')
+    this.ctx = getCtx()
 
     debug('Project created %o', {
       testingType: this.testingType,
@@ -127,9 +129,10 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
     this.options = {
       report: false,
       onFocusTests () {},
-      onError () {},
-      onWarning () {},
-      onSettingsChanged: false,
+      onError (error) {
+        errors.log(error)
+      },
+      onWarning: this.ctx.onWarning,
       ...options,
     }
   }
@@ -156,74 +159,58 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
     return this.cfg.state
   }
 
-  injectCtSpecificConfig (cfg) {
-    cfg.resolved.testingType = { value: 'component' }
-
-    // This value is normally set up in the `packages/server/lib/plugins/index.js#110`
-    // But if we don't return it in the plugins function, it never gets set
-    // Since there is no chance that it will have any other value here, we set it to "component"
-    // This allows users to not return config in the `cypress/plugins/index.js` file
-    // https://github.com/cypress-io/cypress/issues/16860
-    const rawJson = cfg.rawJson as Cfg
-
-    return {
-      ...cfg,
-      componentTesting: true,
-      viewportHeight: rawJson.viewportHeight ?? 500,
-      viewportWidth: rawJson.viewportWidth ?? 500,
-    }
-  }
-
-  createServer (testingType: Cypress.TestingType) {
-    return testingType === 'e2e'
-      ? new ServerE2E() as TServer
-      : new ServerCt() as TServer
+  get remoteStates () {
+    return this._server?.remoteStates
   }
 
   async open () {
     debug('opening project instance %s', this.projectRoot)
     debug('project open options %o', this.options)
 
-    let cfg = this.getConfig()
+    const cfg = this.getConfig()
 
     process.chdir(this.projectRoot)
 
-    // TODO: we currently always scaffold the plugins file
-    // even when headlessly or else it will cause an error when
-    // we try to load it and it's not there. We must do this here
-    // else initialing the plugins will instantly fail.
-    if (cfg.pluginsFile) {
-      debug('scaffolding with plugins file %s', cfg.pluginsFile)
+    this._server = new ServerBase(cfg)
 
-      await scaffold.plugins(path.dirname(cfg.pluginsFile), cfg)
+    const isSimulatedOpenMode = !!process.env.CYPRESS_INTERNAL_SIMULATE_OPEN_MODE
+
+    // cy.prompt requires both an authenticated user and a projectId. In open mode
+    // the user can still log in or add a projectId to their config, so we download
+    // the bundle eagerly. A run's config is fixed, so without a projectId there is
+    // no way to reach a usable state and downloading the bundle is wasted work.
+    if (!cfg.isTextTerminal || isSimulatedOpenMode || cfg.projectId || process.env.CYPRESS_LOCAL_CY_PROMPT_PATH) {
+      new CyPromptLifecycleManager().initializeCyPromptManager({
+        cloudDataSource: this.ctx.cloud,
+        ctx: this.ctx,
+        record: this.options.record,
+        key: this.options.key,
+        projectId: cfg.projectId,
+      })
     }
 
-    this._server = this.createServer(this.testingType)
+    if ((!cfg.isTextTerminal || process.env.CYPRESS_INTERNAL_SIMULATE_OPEN_MODE) && this.testingType === 'e2e') {
+      const studioLifecycleManager = new StudioLifecycleManager()
 
-    cfg = await this.initializePlugins(cfg, this.options)
-
-    const {
-      specsStore,
-      startSpecWatcher,
-      ctDevServerPort,
-    } = await this.initializeSpecStore(cfg)
-
-    if (this.testingType === 'component') {
-      cfg.baseUrl = `http://localhost:${ctDevServerPort}`
+      await studioLifecycleManager.initializeStudioManager({
+        cloudDataSource: this.ctx.cloud,
+        cfg,
+        debugData: this.configDebugData,
+        ctx: this.ctx,
+      })
     }
 
     const [port, warning] = await this._server.open(cfg, {
       getCurrentBrowser: () => this.browser,
       getSpec: () => this.spec,
-      exit: this.options.args?.exit,
       onError: this.options.onError,
       onWarning: this.options.onWarning,
       shouldCorrelatePreRequests: this.shouldCorrelatePreRequests,
       testingType: this.testingType,
       SocketCtor: this.testingType === 'e2e' ? SocketE2E : SocketCt,
-      specsStore,
     })
 
+    this.ctx.actions.servers.setAppServerPort(port)
     this._isServerOpen = true
 
     // if we didnt have a cfg.port
@@ -236,6 +223,9 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       _.extend(cfg, config.setUrls(cfg))
     }
 
+    // The network path is per-launch and per-browser, so it is unknown here and
+    // the proxy address must always be available; the launch layer decides which
+    // browsers actually receive it. `omitConfigKeys` keeps it out of run results.
     cfg.proxyServer = cfg.proxyUrl
 
     // store the cfg from
@@ -251,19 +241,15 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
     // save the last time they opened the project
     // along with the first time they opened it
     const now = Date.now()
+
     const stateToSave = {
       lastOpened: now,
+      lastProjectId: cfg.projectId ?? null,
     } as any
 
     if (!cfg.state || !cfg.state.firstOpened) {
       stateToSave.firstOpened = now
     }
-
-    this.watchSettings({
-      onSettingsChanged: this.options.onSettingsChanged,
-      projectRoot: this.projectRoot,
-      configFile: this.options.configFile,
-    })
 
     this.startWebsockets({
       onReloadBrowser: this.options.onReloadBrowser,
@@ -279,26 +265,17 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       projectRoot: this.projectRoot,
     })
 
-    await Promise.all([
-      this.scaffold(cfg),
-      this.saveState(stateToSave),
-    ])
+    // Cypress sessions only apply to an interactive (`cypress open`) session that an
+    // external tool can attach to; skip it for headless `cypress run`.
+    if (!cfg.isTextTerminal) {
+      await cypressSessions.addSession({ projectRoot: this.projectRoot, serverPort: port, testingType: this.testingType })
+    }
 
-    await Promise.all([
-      checkSupportFile({ configFile: cfg.configFile, supportFile: cfg.supportFile }),
-      this.watchPluginsFile(cfg, this.options),
-    ])
+    await this.saveState(stateToSave)
 
     if (cfg.isTextTerminal) {
       return
     }
-
-    // start watching specs
-    // whenever a spec file is added or removed, we notify the
-    // <SpecList>
-    // This is only used for CT right now by general users.
-    // It is is used with E2E if the CypressInternal_UseInlineSpecList flag is true.
-    startSpecWatcher()
 
     if (!cfg.experimentalInteractiveRunEvents) {
       return
@@ -311,20 +288,20 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       system: _.pick(sys, 'osName', 'osVersion'),
     }
 
-    return runEvents.execute('before:run', cfg, beforeRunDetails)
-  }
+    this.isOpen = true
 
-  async getRuns () {
-    const [projectId, authToken] = await Promise.all([
-      this.getProjectId(),
-      user.ensureAuthToken(),
-    ])
-
-    return api.getProjectRuns(projectId, authToken)
+    return runEvents.execute('before:run', beforeRunDetails)
   }
 
   reset () {
     debug('resetting project instance %s', this.projectRoot)
+
+    // if we're in studio mode, we need to close the protocol manager
+    // to ensure the config is initialized properly on browser relaunch
+    if (this.ctx.coreData.studioLifecycleManager) {
+      this.protocolManager?.close()
+      this.protocolManager = undefined
+    }
 
     this.spec = null
     this.browser = null
@@ -340,6 +317,12 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
     return
   }
 
+  __reset () {
+    preprocessor.close()
+
+    process.chdir(localCwd)
+  }
+
   async close () {
     debug('closing project instance %s', this.projectRoot)
 
@@ -350,206 +333,24 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       return
     }
 
-    const closePreprocessor = (this.testingType === 'e2e' && preprocessor.close) ?? undefined
+    this.__reset()
+
+    this.ctx.actions.servers.setAppServerPort(undefined)
+    this.ctx.actions.servers.setAppSocketServer(undefined)
 
     await Promise.all([
       this.server?.close(),
-      this.watchers?.close(),
-      closePreprocessor?.(),
+      cypressSessions.remove(),
     ])
 
     this._isServerOpen = false
-
-    process.chdir(localCwd)
+    this.isOpen = false
 
     const config = this.getConfig()
 
     if (config.isTextTerminal || !config.experimentalInteractiveRunEvents) return
 
-    return runEvents.execute('after:run', config)
-  }
-
-  _onError<Options extends Record<string, any>> (err: Error, options: Options) {
-    debug('got plugins error', err.stack)
-
-    browsers.close()
-
-    options.onError(err)
-  }
-
-  async initializeSpecStore (updatedConfig: Cfg): Promise<{
-    specsStore: SpecsStore
-    ctDevServerPort: number | undefined
-    startSpecWatcher: () => void
-  }> {
-    const allSpecs = await specsUtil.findSpecs({
-      projectRoot: updatedConfig.projectRoot,
-      fixturesFolder: updatedConfig.fixturesFolder,
-      supportFile: updatedConfig.supportFile,
-      testFiles: updatedConfig.testFiles,
-      ignoreTestFiles: updatedConfig.ignoreTestFiles,
-      componentFolder: updatedConfig.componentFolder,
-      integrationFolder: updatedConfig.integrationFolder,
-    })
-    const specs = allSpecs.filter((spec: Cypress.Cypress['spec']) => {
-      if (this.testingType === 'component') {
-        return spec.specType === 'component'
-      }
-
-      if (this.testingType === 'e2e') {
-        return spec.specType === 'integration'
-      }
-
-      throw Error(`Cannot return specType for testingType: ${this.testingType}`)
-    })
-
-    return this.initSpecStore({ specs, config: updatedConfig })
-  }
-
-  async initializePlugins (cfg, options) {
-    // only init plugins with the
-    // allowed config values to
-    // prevent tampering with the
-    // internals and breaking cypress
-    const allowedCfg = allowed(cfg)
-
-    const modifiedCfg = await plugins.init(allowedCfg, {
-      projectRoot: this.projectRoot,
-      configFile: settings.pathToConfigFile(this.projectRoot, options),
-      testingType: options.testingType,
-      onError: (err: Error) => this._onError(err, options),
-      onWarning: options.onWarning,
-    })
-
-    debug('plugin config yielded: %o', modifiedCfg)
-
-    return config.updateWithPluginValues(cfg, modifiedCfg)
-  }
-
-  async startCtDevServer (specs: Cypress.Cypress['spec'][], config: any) {
-    // CT uses a dev-server to build the bundle.
-    // We start the dev server here.
-    const devServerOptions = await devServer.start({ specs, config })
-
-    if (!devServerOptions) {
-      throw new Error([
-        'It looks like nothing was returned from on(\'dev-server:start\', {here}).',
-        'Make sure that the dev-server:start function returns an object.',
-        'For example: on("dev-server:start", () => startWebpackDevServer({ webpackConfig }))',
-      ].join('\n'))
-    }
-
-    return { port: devServerOptions.port }
-  }
-
-  async initSpecStore ({
-    specs,
-    config,
-  }: {
-    specs: Cypress.Cypress['spec'][]
-    config: any
-  }) {
-    const specsStore = new SpecsStore(config, this.testingType)
-
-    const startSpecWatcher = () => {
-      return specsStore.watch({
-        onSpecsChanged: (specs) => {
-        // both e2e and CT watch the specs and send them to the
-        // client to be shown in the SpecList.
-          this.server.sendSpecList(specs, this.testingType)
-
-          if (this.testingType === 'component') {
-          // ct uses the dev-server to build and bundle the speces.
-          // send new files to dev server
-            devServer.updateSpecs(specs)
-          }
-        },
-      })
-    }
-
-    let ctDevServerPort: number | undefined
-
-    if (this.testingType === 'component') {
-      const { port } = await this.startCtDevServer(specs, config)
-
-      ctDevServerPort = port
-    }
-
-    return specsStore.storeSpecFiles()
-    .return({
-      specsStore,
-      ctDevServerPort,
-      startSpecWatcher,
-    })
-  }
-
-  async watchPluginsFile (cfg, options) {
-    debug(`attempt watch plugins file: ${cfg.pluginsFile}`)
-    if (!cfg.pluginsFile || options.isTextTerminal) {
-      return Promise.resolve()
-    }
-
-    const found = await fs.pathExists(cfg.pluginsFile)
-
-    debug(`plugins file found? ${found}`)
-    // ignore if not found. plugins#init will throw the right error
-    if (!found) {
-      return
-    }
-
-    debug('watch plugins file')
-
-    return this.watchers.watchTree(cfg.pluginsFile, {
-      onChange: () => {
-        // TODO: completely re-open project instead?
-        debug('plugins file changed')
-
-        // re-init plugins after a change
-        this.initializePlugins(cfg, options)
-        .catch((err) => {
-          options.onError(err)
-        })
-      },
-    })
-  }
-
-  watchSettings ({
-    onSettingsChanged,
-    configFile,
-    projectRoot,
-  }: {
-    projectRoot: string
-    configFile?: string | false
-    onSettingsChanged?: false | (() => void)
-  }) {
-    // bail if we havent been told to
-    // watch anything (like in run mode)
-    if (!onSettingsChanged) {
-      return
-    }
-
-    debug('watch settings files')
-
-    const obj = {
-      onChange: () => {
-        // dont fire change events if we generated
-        // a project id less than 1 second ago
-        if (this.generatedProjectIdTimestamp &&
-          ((Date.now() - this.generatedProjectIdTimestamp) < 1000)) {
-          return
-        }
-
-        // call our callback function
-        // when settings change!
-        onSettingsChanged()
-      },
-    }
-
-    if (configFile !== false) {
-      this.watchers.watchTree(settings.pathToConfigFile(projectRoot, { configFile }), obj)
-    }
-
-    return this.watchers.watch(settings.pathToCypressEnvJson(projectRoot), obj)
+    return runEvents.execute('after:run')
   }
 
   initializeReporter ({
@@ -564,16 +365,12 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
 
     try {
       Reporter.loadReporter(reporter, projectRoot)
-    } catch (err: any) {
+    } catch (error: any) {
       const paths = Reporter.getSearchPathsForReporter(reporter, projectRoot)
 
-      // only include the message if this is the standard MODULE_NOT_FOUND
-      // else include the whole stack
-      const errorMsg = err.code === 'MODULE_NOT_FOUND' ? err.message : err.stack
-
-      errors.throw('INVALID_REPORTER_NAME', {
+      errors.throwErr('INVALID_REPORTER_NAME', {
         paths,
-        error: errorMsg,
+        error,
         name: reporter,
       })
     }
@@ -582,8 +379,8 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
   }
 
   startWebsockets (options: Omit<OpenProjectLaunchOptions, 'args'>, { socketIoCookie, namespace, screenshotsFolder, report, reporter, reporterOptions, projectRoot }: StartWebsocketOptions) {
-  // if we've passed down reporter
-  // then record these via mocha reporter
+    // if we've passed down reporter
+    // then record these via mocha reporter
     const reporterInstance = this.initializeReporter({
       report,
       reporter,
@@ -591,21 +388,214 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       projectRoot,
     })
 
-    const onBrowserPreRequest = (browserPreRequest) => {
-      this.server.addBrowserPreRequest(browserPreRequest)
+    const onBrowserPreRequest = async (browserPreRequest) => {
+      await this.server.addBrowserPreRequest(browserPreRequest)
     }
 
-    const onRequestEvent = (eventName, data) => {
+    const onRequestEvent = <T extends keyof AutomationCommands>(eventName: T, data: AutomationCommands[T]['dataType']): Promise<AutomationCommands[T]['returnType']> => {
       this.server.emitRequestEvent(eventName, data)
+
+      return Promise.resolve()
     }
 
-    this._automation = new Automation(namespace, socketIoCookie, screenshotsFolder, onBrowserPreRequest, onRequestEvent)
+    const onRemoveBrowserPreRequest = (requestId: string) => {
+      this.server.removeBrowserPreRequest(requestId)
+    }
 
-    this.server.startWebsockets(this.automation, this.cfg, {
+    const onDownloadLinkClicked = (downloadUrl: string) => {
+      this.server.addPendingUrlWithoutPreRequest(downloadUrl)
+    }
+
+    const onServiceWorkerRegistrationUpdated = (data: Protocol.ServiceWorker.WorkerRegistrationUpdatedEvent) => {
+      this.server.updateServiceWorkerRegistrations(data)
+    }
+
+    const onServiceWorkerVersionUpdated = (data: Protocol.ServiceWorker.WorkerVersionUpdatedEvent) => {
+      this.server.updateServiceWorkerVersions(data)
+    }
+
+    const onServiceWorkerClientSideRegistrationUpdated = (data: { scriptURL: string, initiatorOrigin: string }) => {
+      this.server.updateServiceWorkerClientSideRegistrations(data)
+    }
+
+    const onServiceWorkerClientEvent = (event: ServiceWorkerClientEvent) => {
+      this.server.handleServiceWorkerClientEvent(event)
+    }
+
+    this._automation = new Automation({
+      cyNamespace: namespace,
+      cookieNamespace: socketIoCookie,
+      screenshotsFolder,
+      onBrowserPreRequest,
+      onRequestEvent,
+      onRemoveBrowserPreRequest,
+      onDownloadLinkClicked,
+      onServiceWorkerRegistrationUpdated,
+      onServiceWorkerVersionUpdated,
+      onServiceWorkerClientSideRegistrationUpdated,
+      onServiceWorkerClientEvent,
+    })
+
+    const destroyStudio = async () => {
+      if (!this._isStudioInitialized) {
+        debug('Studio is not initialized - skipping destroy')
+
+        return
+      }
+
+      const isStudioReady = await this.ctx.coreData.studioLifecycleManager?.isStudioReady()
+
+      if (!isStudioReady) {
+        debug('Studio is not ready - skipping destroy')
+
+        return
+      }
+
+      const studio = await this.ctx.coreData.studioLifecycleManager?.getStudio()
+
+      await studio?.destroy()
+
+      if (this.protocolManager) {
+        debug('Closing protocol connection')
+        await browsers.closeProtocolConnection({ browser: this.browser, foundBrowsers: this.options.browsers })
+        debug('Protocol connection closed')
+        this.protocolManager?.close()
+        this.protocolManager = undefined
+      }
+
+      debug('Studio destroyed')
+      this._isStudioInitialized = false
+    }
+
+    const ios = this.server.startWebsockets(this.automation, this.cfg, {
       onReloadBrowser: options.onReloadBrowser,
       onFocusTests: options.onFocusTests,
       onSpecChanged: options.onSpecChanged,
-      onSavedStateChanged: (state: any) => this.saveState(state),
+      getSavedState: this.getSavedState.bind(this),
+      onSavedStateChanged: this.saveState.bind(this),
+      closeExtraTargets: this.closeExtraTargets,
+
+      /**
+       * Called any time the test is run in Studio
+       */
+      onStudioInit: async ({ sessionId }: StudioInitOptions = {}) => {
+        // if already initialized, tear down studio first
+        if (this._isStudioInitialized) {
+          debug('Studio is already initialized - destroying studio')
+
+          await destroyStudio()
+        }
+
+        debug('Initializing studio')
+
+        telemetryManager.mark(INITIALIZATION_MARK_NAMES.INITIALIZATION_START)
+
+        const endTelemetry = ({ status, canAccessStudioAI }: { status: string, canAccessStudioAI: boolean }) => {
+          telemetryManager.mark(INITIALIZATION_MARK_NAMES.INITIALIZATION_END)
+
+          TelemetryReporter.getInstance().reportTelemetry(INITIALIZATION_TELEMETRY_GROUP_NAMES.INITIALIZE_STUDIO, {
+            status,
+            canAccessStudioAI,
+          })
+        }
+
+        // Only need a new session if Studio is being entered from a non-opened
+        // state. If the test is being re-run, we use the existing session
+        const cloudStudioSessionId = sessionId ?? randomUUID()
+
+        try {
+          const isStudioReady = this.ctx.coreData.studioLifecycleManager?.isStudioReady()
+
+          if (!isStudioReady) {
+            debug('User entered studio mode before cloud studio was initialized')
+
+            endTelemetry({ status: 'studio-not-ready', canAccessStudioAI: false })
+
+            return { canAccessStudioAI: false, cloudStudioSessionId }
+          }
+
+          const studio = await this.ctx.coreData.studioLifecycleManager?.getStudio()
+
+          // Update the session id in the studio manager
+          studio?.updateSessionId(cloudStudioSessionId)
+
+          if (this.spec && studio?.protocolManager) {
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.CAN_ACCESS_STUDIO_AI_START)
+            const canAccessStudioAI = await studio?.canAccessStudioAI(this.browser) ?? false
+
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.CAN_ACCESS_STUDIO_AI_END)
+
+            if (!canAccessStudioAI) {
+              endTelemetry({ status: 'success', canAccessStudioAI })
+
+              return { canAccessStudioAI, cloudStudioSessionId }
+            }
+
+            this.protocolManager = studio.protocolManager
+            this.protocolManager.setupProtocol()
+            this.protocolManager.beforeSpec({
+              ...this.spec,
+              instanceId: randomUUID(),
+            })
+
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.CONNECT_PROTOCOL_TO_BROWSER_START)
+            await browsers.connectProtocolToBrowser({ browser: this.browser, foundBrowsers: this.options.browsers, protocolManager: studio.protocolManager })
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.CONNECT_PROTOCOL_TO_BROWSER_END)
+
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.CONNECT_STUDIO_TO_BROWSER_START)
+            await browsers.connectStudioToBrowser({ browser: this.browser, foundBrowsers: this.options.browsers, studioManager: studio })
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.CONNECT_STUDIO_TO_BROWSER_END)
+
+            if (!studio.protocolManager.dbPath) {
+              debug('Protocol database path is not set after initializing protocol manager')
+
+              endTelemetry({ status: 'protocol-db-path-not-set', canAccessStudioAI: false })
+
+              return { canAccessStudioAI: false, cloudStudioSessionId }
+            }
+
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.INITIALIZE_STUDIO_AI_START)
+            await Promise.all([
+              studio.initializeStudioAI({
+                protocolDbPath: studio.protocolManager.dbPath,
+              }),
+              // Reset browser state on initialization to avoid issues
+              // with cached assets from previous test executions.
+              this.resetBrowserState(),
+            ])
+
+            telemetryManager.mark(INITIALIZATION_MARK_NAMES.INITIALIZE_STUDIO_AI_END)
+
+            endTelemetry({ status: 'success', canAccessStudioAI: true })
+
+            this._isStudioInitialized = true
+
+            debug('Studio successfully initialized')
+
+            return { canAccessStudioAI: true, cloudStudioSessionId }
+          }
+
+          this.protocolManager = undefined
+
+          debug('Studio not initialized - has spec: %o, has protocol manager: %o', !!this.spec, !!this.protocolManager)
+
+          endTelemetry({ status: 'success', canAccessStudioAI: false })
+
+          return { canAccessStudioAI: false, cloudStudioSessionId }
+        } catch (error) {
+          debug('Error initializing studio', error)
+
+          endTelemetry({ status: 'exception', canAccessStudioAI: false })
+
+          return { canAccessStudioAI: false, cloudStudioSessionId }
+        }
+      },
+
+      onStudioDestroy: destroyStudio,
+
+      onCyPromptReady: async (cyPromptManager: CyPromptManagerShape) => {
+        await browsers.connectCyPromptToBrowser({ browser: this.browser, foundBrowsers: this.options.browsers, cyPromptManager })
+      },
 
       onCaptureVideoFrames: (data: any) => {
         // TODO: move this to browser automation middleware
@@ -621,11 +611,17 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
         debug('received runnables %o', runnables)
 
         if (reporterInstance) {
-          reporterInstance.setRunnables(runnables)
+          reporterInstance.setRunnables(runnables, this.getConfig())
         }
 
         if (this._recordTests) {
-          await this._recordTests?.(runnables, cb)
+          this._protocolManager?.addRunnables(runnables)
+          // when test-level rerun optimization is armed, this resolves to the
+          // full titles of the tests that will actually execute; tell the
+          // reporter to omit the rest from what it reports to Cloud
+          const filteredTests = await this._recordTests?.(runnables, cb)
+
+          reporterInstance?.setTestFilter(filteredTests)
 
           this._recordTests = null
 
@@ -636,7 +632,6 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
       },
 
       onMocha: async (event, runnable) => {
-        debug('onMocha', event)
         // bail if we dont have a
         // reporter instance
         if (!reporterInstance) {
@@ -645,7 +640,16 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
 
         reporterInstance.emit(event, runnable)
 
-        if (event === 'end') {
+        if (event === 'test:before:run') {
+          debugVerbose('browserPreRequests prior to running %s: %o', runnable.title, this.server.getBrowserPreRequests())
+
+          this.emit('test:before:run', {
+            runnable,
+            previousResults: reporterInstance?.results() || {},
+          })
+        } else if (event === 'end') {
+          debugVerbose('browserPreRequests at the end: %o', this.server.getBrowserPreRequests())
+
           const [stats = {}] = await Promise.all([
             (reporterInstance != null ? reporterInstance.end() : undefined),
             this.server.end(),
@@ -657,35 +661,63 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
         return
       },
     })
+
+    this.ctx.actions.servers.setAppSocketServer(ios)
   }
 
-  changeToUrl (url) {
-    this.server.changeToUrl(url)
+  async resetBrowserTabsForNextSpec (shouldKeepTabOpen: boolean) {
+    return this.server.socket.resetBrowserTabsForNextSpec(shouldKeepTabOpen)
+  }
+
+  async resetBrowserState () {
+    return this.server.socket.resetBrowserState()
+  }
+
+  closeExtraTargets () {
+    return browsers.closeExtraTargets()
+  }
+
+  isRunnerSocketConnected () {
+    return this.server.socket.isRunnerSocketConnected()
+  }
+
+  async sendFocusBrowserMessage () {
+    if (this.browser.family === 'firefox') {
+      await browsers.setFocus()
+    } else {
+      await this.server.sendFocusBrowserMessage()
+    }
   }
 
   shouldCorrelatePreRequests = () => {
-    if (!this.browser) {
-      return false
-    }
-
-    const { family, majorVersion } = this.browser
-
-    return family === 'chromium' || (family === 'firefox' && majorVersion >= 86)
+    return !!this.browser
   }
 
-  setCurrentSpecAndBrowser (spec, browser: Cypress.Browser) {
+  async setCurrentSpecAndBrowser (spec, browser: FoundBrowser, useBrowserNetworkInterception: boolean) {
     this.spec = spec
     this.browser = browser
+
+    // Awaited so the browser cannot launch and issue its first request while the
+    // CDP Fetch runtime is still installed: a proxy-path launch has to have its
+    // https proxy (first call may generate the root CA) and the shared network
+    // pointers handed back to the proxy runtime before then.
+    await this._server?.setNetworkMode(useBrowserNetworkInterception)
+
+    if (this.browser.family !== 'chromium') {
+      // If we're not in chromium, our strategy for correlating service worker prerequests doesn't work in non-chromium browsers (https://github.com/cypress-io/cypress/issues/28079)
+      // in order to not hang for 2 seconds, we override the prerequest timeout to be 500 ms (which is what it has been historically).
+      this._server?.setPreRequestTimeout(500)
+    }
   }
 
-  async setBrowsers (browsers = []) {
-    debug('getting config before setting browsers %o', browsers)
+  get protocolManager (): ProtocolManagerShape | undefined {
+    return this._protocolManager
+  }
 
-    const cfg = this.getConfig()
+  set protocolManager (protocolManager: ProtocolManagerShape | undefined) {
+    this._protocolManager = protocolManager
 
-    debug('setting config browsers to %o', browsers)
-
-    cfg.browsers = browsers
+    this._server?.setProtocolManager(protocolManager)
   }
 
   getAutomation () {
@@ -693,48 +725,17 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
   }
 
   async initializeConfig (): Promise<Cfg> {
-    // set default for "configFile" if undefined
-    if (this.options.configFile === undefined
-  || this.options.configFile === null) {
-      this.options.configFile = await getDefaultConfigFilePath(this.projectRoot, !this.options.args?.runProject)
-    }
-
-    let theCfg: Cfg = await config.get(this.projectRoot, this.options)
-
-    if (theCfg.browsers) {
-      theCfg.browsers = theCfg.browsers?.map((browser) => {
-        if (browser.family === 'chromium' || theCfg.chromeWebSecurity) {
-          return browser
-        }
-
-        return {
-          ...browser,
-          warning: browser.warning || errors.getMsgByType('CHROME_WEB_SECURITY_NOT_SUPPORTED', browser.name),
-        }
-      })
-    }
-
-    theCfg = this.testingType === 'e2e'
-      ? theCfg
-      : this.injectCtSpecificConfig(theCfg)
+    this.ctx.lifecycleManager.setAndLoadCurrentTestingType(this.testingType)
+    const theCfg: Cfg = {
+      ...(await this.ctx.lifecycleManager.getFullInitialConfig()),
+      testingType: this.testingType,
+    } as Cfg // ?? types are definitely wrong here I think
 
     if (theCfg.isTextTerminal) {
       this._cfg = theCfg
 
       return this._cfg
     }
-
-    // decide if new project by asking scaffold
-    // and looking at previously saved user state
-    if (!theCfg.integrationFolder) {
-      throw new Error('Missing integration folder')
-    }
-
-    const untouchedScaffold = await this.determineIsNewProject(theCfg)
-    const userHasSeenBanner = _.get(theCfg, 'state.showedNewProjectBanner', false)
-
-    debugScaffold(`untouched scaffold ${untouchedScaffold} banner closed ${userHasSeenBanner}`)
-    theCfg.isNewProject = untouchedScaffold && !userHasSeenBanner
 
     const cfgWithSaved = await this._setSavedState(theCfg)
 
@@ -743,7 +744,7 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
     return this._cfg
   }
 
-  // returns project config (user settings + defaults + cypress.json)
+  // returns project config (user settings + defaults + cypress.config.{js,ts,mjs,cjs})
   // with additional object "state" which are transient things like
   // window width and height, DevTools open or not, etc.
   getConfig (): Cfg {
@@ -753,126 +754,84 @@ export class ProjectBase<TServer extends ServerE2E | ServerCt> extends EE {
 
     debug('project has config %o', this._cfg)
 
-    return this._cfg
+    const isDefaultProtocolEnabled = this._protocolManager?.isProtocolEnabled ?? false
+
+    const simulateOpenMode = !!process.env.CYPRESS_INTERNAL_SIMULATE_OPEN_MODE
+
+    const hideRunnerUi = (
+      (this.options?.args?.runnerUi === false ||
+      (isDefaultProtocolEnabled && this._cfg.isTextTerminal && !this.options?.args?.runnerUi)) &&
+      !simulateOpenMode
+    )
+
+    // hide the command log if explicitly requested or if we are hiding the runner
+    const hideCommandLog = this._cfg.env?.NO_COMMAND_LOG === 1 || hideRunnerUi
+
+    // isInteractive must be computed here and serialized via HtmlDataSource (see
+    // getPropertiesFromServerConfig) because cfg.env is not sent to the browser.
+    // The driver reads this top-level value at bootstrap; it cannot rely on
+    // config.env.INTERNAL_SIMULATE_OPEN_MODE. When CYPRESS_INTERNAL_SIMULATE_OPEN_MODE
+    // is set, run mode should behave like open mode in the driver (retries, stack traces, etc.).
+    return {
+      ...this._cfg,
+      remote: this.remoteStates?.current() ?? {} as Cypress.RemoteState,
+      browser: this.browser,
+      testingType: this.ctx.coreData.currentTestingType ?? 'e2e',
+      specs: [],
+      isDefaultProtocolEnabled,
+      isInteractive: !this._cfg.isTextTerminal || simulateOpenMode,
+      hideCommandLog,
+      hideRunnerUi,
+    }
   }
 
   // Saved state
 
-  // forces saving of project's state by first merging with argument
-  async saveState (stateChanges = {}) {
+  async getSavedState (options: { type: 'global' | 'project' } = { type: 'project' }) {
     if (!this.cfg) {
-      throw new Error('Missing project config')
+      throw new Error('Missing project config trying to get saved state')
     }
 
-    if (!this.projectRoot) {
+    const state = await savedState.create(options.type === 'project' ? this.projectRoot : undefined, this.cfg.isTextTerminal)
+
+    return state.get()
+  }
+
+  // forces saving of project's state by first merging with argument
+  async saveState (stateChanges = {}, options: { type: 'global' | 'project' } = { type: 'project' }) {
+    if (!this.cfg) {
+      throw new Error('Missing project config trying to save state')
+    }
+
+    if (options.type === 'project' && !this.projectRoot) {
       throw new Error('Missing project root')
     }
 
-    let state = await savedState.create(this.projectRoot, this.cfg.isTextTerminal)
+    const state = await savedState.create(options.type === 'project' ? this.projectRoot : undefined, this.cfg.isTextTerminal)
 
-    state.set(stateChanges)
-    state = await state.get()
-    this.cfg.state = state
+    await state.set(stateChanges)
+    this.cfg.state = await state.get()
 
-    return state
+    return this.cfg.state
   }
 
   async _setSavedState (cfg: Cfg) {
     debug('get saved state')
 
-    let state = await savedState.create(this.projectRoot, cfg.isTextTerminal)
+    const state = await savedState.create(this.projectRoot, cfg.isTextTerminal)
 
-    state = await state.get()
-    cfg.state = state
+    cfg.state = await state.get()
 
     return cfg
   }
 
-  // Scaffolding
-  removeScaffoldedFiles () {
-    if (!this.cfg) {
-      throw new Error('Missing project config')
-    }
-
-    return scaffold.removeIntegration(this.cfg.integrationFolder, this.cfg)
-  }
-
-  // do not check files again and again - keep previous promise
-  // to refresh it - just close and open the project again.
-  determineIsNewProject (folder) {
-    return scaffold.isNewProject(folder)
-  }
-
-  scaffold (cfg: Cfg) {
-    debug('scaffolding project %s', this.projectRoot)
-
-    const scaffolds = []
-
-    const push = scaffolds.push.bind(scaffolds) as any
-
-    // TODO: we are currently always scaffolding support
-    // even when headlessly - this is due to a major breaking
-    // change of 0.18.0
-    // we can later force this not to always happen when most
-    // of our users go beyond 0.18.0
-    //
-    // ensure support dir is created
-    // and example support file if dir doesnt exist
-    push(scaffold.support(cfg.supportFolder, cfg))
-
-    // if we're in headed mode add these other scaffolding tasks
-    debug('scaffold flags %o', {
-      isTextTerminal: cfg.isTextTerminal,
-      CYPRESS_INTERNAL_FORCE_SCAFFOLD: process.env.CYPRESS_INTERNAL_FORCE_SCAFFOLD,
-    })
-
-    const scaffoldExamples = !cfg.isTextTerminal || process.env.CYPRESS_INTERNAL_FORCE_SCAFFOLD
-
-    if (scaffoldExamples) {
-      debug('will scaffold integration and fixtures folder')
-      push(scaffold.integration(cfg.integrationFolder, cfg))
-      push(scaffold.fixture(cfg.fixturesFolder, cfg))
-    } else {
-      debug('will not scaffold integration or fixtures folder')
-    }
-
-    return Promise.all(scaffolds)
-  }
-
   // These methods are not related to start server/sockets/runners
-
   async getProjectId () {
-    await this.verifyExistence()
-    const readSettings = await settings.read(this.projectRoot, this.options)
-
-    if (readSettings && readSettings.projectId) {
-      return readSettings.projectId
-    }
-
-    errors.throw('NO_PROJECT_ID', settings.configFile(this.options), this.projectRoot)
+    return getCtx().lifecycleManager.getProjectId()
   }
 
-  async verifyExistence () {
-    try {
-      await fs.statAsync(this.projectRoot)
-    } catch (err) {
-      errors.throw('NO_PROJECT_FOUND_AT_PROJECT_ROOT', this.projectRoot)
-    }
-  }
-
-  async getRecordKeys () {
-    const [projectId, authToken] = await Promise.all([
-      this.getProjectId(),
-      user.ensureAuthToken(),
-    ])
-
-    return api.getProjectRecordKeys(projectId, authToken)
-  }
-
-  async requestAccess (projectId) {
-    const authToken = await user.ensureAuthToken()
-
-    return api.requestAccess(projectId, authToken)
+  get configDebugData () {
+    return this.ctx.lifecycleManager.configDebugData
   }
 
   // For testing

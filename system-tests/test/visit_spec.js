@@ -1,6 +1,6 @@
 const _ = require('lodash')
 const Bluebird = require('bluebird')
-const cert = require('@packages/https-proxy/test/helpers/certs')
+const { options } = require('@packages/https-proxy/test/helpers/certs')
 const https = require('https')
 const useragent = require('express-useragent')
 const { allowDestroy } = require('@packages/network')
@@ -11,7 +11,7 @@ const startTlsV1Server = (port) => {
   return Bluebird.fromCallback((cb) => {
     const opts = _.merge({
       secureProtocol: 'TLSv1_server_method',
-    }, cert)
+    }, options)
 
     const serv = https.createServer(opts, (req, res) => {
       res.setHeader('content-type', 'text/html')
@@ -72,8 +72,8 @@ const onServer = function (app) {
 
     return setTimeout(() => {
       return res.send(`<html>timeout: <span>${ms}</span></html>`)
-    }
-    , ms)
+    },
+     ms)
   })
 
   app.get('/response_never_finishes', (req, res) => {
@@ -121,6 +121,8 @@ describe('e2e visit', () => {
       settings: {
         responseTimeout: 500,
         pageLoadTimeout: 1000,
+        e2e: {
+        },
       },
       servers: {
         port: 3434,
@@ -130,63 +132,60 @@ describe('e2e visit', () => {
     })
 
     systemTests.it('passes', {
-      spec: 'visit_spec.js',
+      browser: '!webkit', // TODO(webkit): fix+unskip
+      spec: 'visit.cy.js',
       snapshot: true,
-      onRun (exec) {
-        return startTlsV1Server(6776)
-        .then((serv) => {
-          return exec()
-          .then(() => {
-            return serv.destroy()
-          })
-        })
-      },
-    })
-
-    systemTests.it('passes with experimentalSourceRewriting', {
-      spec: 'source_rewriting_spec.js',
+      // The context's low timeouts are for the failure-mode tests below. The
+      // TLSv1 visit's fail-then-retry handshake is racy under a 500ms
+      // responseTimeout, so restore normal timeouts for these passing visits.
       config: {
-        experimentalSourceRewriting: true,
+        responseTimeout: 30000,
+        pageLoadTimeout: 60000,
       },
-      snapshot: true,
       onRun (exec) {
         return startTlsV1Server(6776)
         .then((serv) => {
           return exec()
-          .then(() => {
+          .finally(() => {
             return serv.destroy()
           })
         })
       },
     })
 
-    systemTests.it('fails when network connection immediately fails', {
-      spec: 'visit_http_network_error_failing_spec.js',
+    // TODO: fix flaky test https://github.com/cypress-io/cypress/issues/23252
+    systemTests.it.skip('fails when network connection immediately fails', {
+      spec: 'visit_http_network_error_failing.cy.js',
       snapshot: true,
       expectedExitCode: 1,
     })
 
     systemTests.it('fails when server responds with 500', {
-      spec: 'visit_http_500_response_failing_spec.js',
+      spec: 'visit_http_500_response_failing.cy.js',
       snapshot: true,
       expectedExitCode: 1,
+      config: { screenshotOnRunFailure: false },
     })
 
-    systemTests.it('fails when file server responds with 404', {
-      spec: 'visit_file_404_response_failing_spec.js',
+    // TODO: fix flaky test https://github.com/cypress-io/cypress/issues/23162
+    systemTests.it.skip('fails when file server responds with 404', {
+      spec: 'visit_file_404_response_failing.cy.js',
       snapshot: true,
       expectedExitCode: 1,
     })
 
     systemTests.it('fails when content type isnt html', {
-      spec: 'visit_non_html_content_type_failing_spec.js',
+      spec: 'visit_non_html_content_type_failing.cy.js',
       snapshot: true,
       expectedExitCode: 1,
+      config: {
+        screenshotOnRunFailure: false,
+      },
     })
 
     systemTests.it('calls onBeforeLoad when overwriting cy.visit', {
       snapshot: true,
-      spec: 'issue_2196_spec.js',
+      spec: 'issue_2196.cy.js',
     })
   })
 
@@ -194,6 +193,8 @@ describe('e2e visit', () => {
     systemTests.setup({
       settings: {
         responseTimeout: 2000,
+        e2e: {
+        },
       },
       servers: {
         port: 3434,
@@ -203,9 +204,30 @@ describe('e2e visit', () => {
     })
 
     systemTests.it('fails when response never ends', {
-      spec: 'visit_response_never_ends_failing_spec.js',
+      spec: 'visit_response_never_ends_failing.cy.js',
       snapshot: true,
       expectedExitCode: 3,
+      config: { screenshotOnRunFailure: false },
+    })
+  })
+
+  context('source rewriting', () => {
+    systemTests.setup({
+      servers: {
+        port: 3434,
+        static: true,
+        onServer,
+      },
+      settings: {
+        e2e: {
+        },
+      },
+    })
+
+    systemTests.it('passes with the default source rewriter', {
+      browser: '!webkit', // TODO(webkit): fix+unskip
+      spec: 'source_rewriting.cy.js',
+      snapshot: true,
     })
   })
 
@@ -213,6 +235,8 @@ describe('e2e visit', () => {
     systemTests.setup({
       settings: {
         pageLoadTimeout: 1000,
+        e2e: {
+        },
       },
       servers: {
         port: 3434,
@@ -222,9 +246,10 @@ describe('e2e visit', () => {
     })
 
     systemTests.it('fails when visit times out', {
-      spec: 'visit_http_timeout_failing_spec.js',
+      spec: 'visit_http_timeout_failing.cy.js',
       snapshot: true,
       expectedExitCode: 2,
+      config: { screenshotOnRunFailure: false },
     })
   })
 })

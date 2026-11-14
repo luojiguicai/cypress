@@ -1,49 +1,144 @@
-/* eslint-disable no-console */
-
 import Bluebird from 'bluebird'
 import fsExtra from 'fs-extra'
+import sanitize from 'sanitize-filename'
+import path from 'path'
+import _ from 'lodash'
+
+const RUNNABLE_SEPARATOR = ' -- '
+const pathSeparatorRe = /[\\/]/g
+
+// many filesystems limit filename length to 255 bytes/characters, so truncate the filename to
+// the smallest common denominator of safe filenames, which is 255 bytes. when ENAMETOOLONG
+// errors are encountered, `maxSafeBytes` will be decremented to at most `MIN_PREFIX_BYTES`, at
+// which point the latest ENAMETOOLONG error will be emitted.
+// @see https://en.wikipedia.org/wiki/Comparison_of_file_systems#Limits
+let maxSafeBytes = Number(process.env.CYPRESS_MAX_SAFE_FILENAME_BYTES) || 254
+const MIN_PREFIX_BYTES = 64
 
 type Promisified<T extends (...args: any) => any>
   = (...params: Parameters<T>) => Bluebird<ReturnType<T>>
 
 interface PromisifiedFsExtra {
   statAsync: (path: string | Buffer) => Bluebird<ReturnType<typeof fsExtra.statSync>>
+  copyAsync: Promisified<typeof fsExtra.copySync>
   removeAsync: Promisified<typeof fsExtra.removeSync>
+  readFileAsync: Promisified<typeof fsExtra.readFileSync>
   writeFileAsync: Promisified<typeof fsExtra.writeFileSync>
+  pathExistsAsync: Promisified<typeof fsExtra.pathExistsSync>
+  outputFileAsync: Promisified<typeof fsExtra.outputFileSync>
+  readJsonAsync: Promisified<typeof fsExtra.readJsonSync>
+  /** Added by Bluebird.promisifyAll on fs-extra's promise-based helpers */
+  ensureDirAsync: (dir: string) => Bluebird<void>
+  ensureSymlinkAsync: (src: string, dest: string, type?: 'dir' | 'file' | 'junction') => Bluebird<void>
 }
 
-// warn users if somehow synchronous file methods are invoked
-// these methods due to "too many files" errors are a huge pain
-const warnOnSyncFileSystem = () => {
-  console.error('WARNING: fs sync methods can fail due to EMFILE errors')
-  console.error('Cypress only works reliably when ALL fs calls are async')
-
-  return console.error('You should modify these sync calls to be async')
+interface Clip {
+  x: number
+  y: number
+  width: number
+  height: number
 }
 
-const topLines = (from, n, text) => {
-  return text.split('\n').slice(from, n).join('\n')
-}
+export type ScreenshotsFolder = string | false | undefined
 
-// just hide this function itself
-// stripping top few lines of the stack
-const getStack = () => {
-  const err = new Error()
-
-  return topLines(3, 10, err.stack)
-}
-
-const addSyncFileSystemWarnings = (fs) => {
-  const oldExistsSync = fs.existsSync
-
-  fs.existsSync = (filename) => {
-    warnOnSyncFileSystem()
-    console.error(getStack())
-
-    return oldExistsSync(filename)
+// TODO: This is likely not representative of the entire Type and should be updated
+export interface Data {
+  specName: string
+  name: string
+  startTime: Date
+  viewport: {
+    width: number
+    height: number
   }
+  titles?: string[]
+  testFailure?: boolean
+  overwrite?: boolean
+  simple?: boolean
+  current?: number
+  total?: number
+  testAttemptIndex?: number
+  appOnly?: boolean
+  hideRunnerUi?: boolean
+  clip?: Clip
+  userClip?: Clip
 }
-
-addSyncFileSystemWarnings(fsExtra)
 
 export const fs = Bluebird.promisifyAll(fsExtra) as PromisifiedFsExtra & typeof fsExtra
+
+const ensureSafePath = async function (withoutExt: string, extension: string | null, overwrite: boolean | undefined, num: number = 0): Promise<string> {
+  const suffix = `${(num && !overwrite) ? ` (${num})` : ''}.${extension}`
+
+  const maxSafePrefixBytes = maxSafeBytes - suffix.length
+  const filenameBuf = Buffer.from(path.basename(withoutExt))
+
+  if (filenameBuf.byteLength > maxSafePrefixBytes) {
+    const truncated = filenameBuf.slice(0, maxSafePrefixBytes).toString()
+
+    withoutExt = path.join(path.dirname(withoutExt), truncated)
+  }
+
+  const fullPath = [withoutExt, suffix].join('')
+
+  // creating the file reserves the name and surfaces ENAMETOOLONG. without overwrite, the
+  // exclusive 'wx' create makes the claim atomic, so concurrent `cypress run` processes
+  // sharing a folder can never both take the same name
+  return fs.outputFileAsync(fullPath, '', overwrite ? {} : { flag: 'wx' })
+  .then(() => fullPath)
+  .catch((err) => {
+    if (err.code === 'EEXIST' && !overwrite) {
+      return ensureSafePath(withoutExt, extension, overwrite, num + 1)
+    }
+
+    if (err.code === 'ENAMETOOLONG' && maxSafePrefixBytes >= MIN_PREFIX_BYTES) {
+      maxSafeBytes -= 1
+
+      return ensureSafePath(withoutExt, extension, overwrite, num)
+    }
+
+    throw err
+  })
+}
+
+const sanitizeToString = (title: any, idx: number, arr: Array<string>) => {
+  // test titles may be values which aren't strings like
+  // null or undefined - so convert before trying to sanitize
+  return sanitize(_.toString(title))
+}
+
+export const getPath = async function (data: Data, ext: string | null, screenshotsFolder: ScreenshotsFolder, overwrite: boolean | undefined): Promise<string> {
+  let names
+  const specNames = (data.specName || '')
+  .split(pathSeparatorRe)
+
+  if (data.name) {
+    names = data.name.split(pathSeparatorRe).map(sanitizeToString)
+  } else {
+    // we put this in array so to match with type of the if branch above
+    names = [_
+    .chain(data.titles)
+    .map(sanitizeToString)
+    .join(RUNNABLE_SEPARATOR)
+    .value()]
+  }
+
+  const index = names.length - 1
+
+  // append '(failed)' to the last name
+  if (data.testFailure) {
+    names[index] = `${names[index]} (failed)`
+  }
+
+  if (data.testAttemptIndex && data.testAttemptIndex > 0) {
+    names[index] = `${names[index]} (attempt ${data.testAttemptIndex + 1})`
+  }
+
+  let withoutExt
+
+  if (screenshotsFolder) {
+    withoutExt = path.join(screenshotsFolder, ...specNames, ...names)
+  } else {
+    withoutExt = path.join(...specNames, ...names)
+  }
+
+  return await ensureSafePath(withoutExt, ext, overwrite)
+}

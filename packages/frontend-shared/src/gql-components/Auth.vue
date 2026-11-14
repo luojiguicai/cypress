@@ -1,0 +1,328 @@
+<template>
+  <div
+    v-if="props.showRetry"
+    class="flex gap-[16px]"
+  >
+    <Button
+      size="lg"
+      data-cy="auth-try-again-button"
+      @click="handleTryAgain"
+    >
+      <template
+        #prefix
+      >
+        <i-cy-action-restart_x16
+          class=" icon-light-white"
+        />
+      </template>
+      Try again
+    </Button>
+    <Button
+      variant="outline"
+      size="lg"
+      @click="handleCancel"
+    >
+      Cancel
+    </Button>
+  </div>
+  <div v-else-if="props.showLogout">
+    <button
+      class="bg-white border-rounded outline-transparent border-gray-100 border w-full py-[8px] text-[14px] text-indigo-500 block whitespace-nowrap hocus:border-gray-200 hover:no-underline"
+      @click="handleLogout"
+    >
+      Log out
+    </button>
+  </div>
+  <div v-else>
+    <Button
+      v-if="loginMutationIsPending"
+      size="lg"
+      variant="pending"
+      aria-live="polite"
+      :disabled="true"
+    >
+      <template
+        #prefix
+      >
+        <i-cy-loading_x16
+          class="animate-spin icon-dark-white icon-light-gray-400"
+        />
+      </template>
+      {{ browserOpened ? 'Waiting for browser...' : 'Opening browser' }}
+    </Button>
+    <Button
+      v-else
+      ref="loginButtonRef"
+      size="lg"
+      variant="primary"
+      data-cy="auth-login-button"
+      aria-live="polite"
+      :disabled="!cloudViewer && !isOnline"
+      :prefix-icon="buttonPrefixIcon"
+      @click="handleLoginOrContinue"
+    >
+      {{ buttonText }}
+    </Button>
+  </div>
+</template>
+
+<script lang="ts" setup>
+import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import { gql } from '@urql/core'
+import { useMutation } from '@urql/vue'
+import { useOnline } from '@vueuse/core'
+import { getUtmSource } from '@packages/frontend-shared/src/utils/getUtmSource'
+import ChainIcon from '~icons/cy/chain-link_x16.svg'
+
+import {
+  Auth_LoginDocument,
+  Auth_LogoutDocument,
+  Auth_ResetAuthStateDocument,
+  Auth_SignupDocument,
+} from '../generated/graphql'
+import type {
+  AuthFragment,
+} from '../generated/graphql'
+import Button from '@cy/components/Button.vue'
+import { useUserProjectStatusStore } from '@packages/frontend-shared/src/store/user-project-status-store'
+import type { AuthFlow } from '@packages/frontend-shared/src/store/user-project-status-store'
+
+const userProjectStatusStore = useUserProjectStatusStore()
+
+const isOnline = useOnline()
+
+const props = withDefaults(defineProps<{
+  gql: AuthFragment
+  authFlow?: AuthFlow
+  /** When true (e.g. login modal), start login/signup as soon as preconditions are met without a second click */
+  autoStartAuth?: boolean
+  showRetry?: boolean
+  showLogout?: boolean
+  utmMedium: string
+  utmContent?: string
+}>(), {
+  authFlow: 'login',
+  autoStartAuth: false,
+  utmContent: undefined,
+})
+
+gql`
+fragment Auth on Query {
+  ...SelectCloudProjectModal
+  cloudViewer {
+    id
+    email
+    fullName
+    firstOrganization: organizations(first: 1) {
+      nodes {
+        id
+      }
+    }
+  }
+  authState {
+    browserOpened
+    name
+    message
+  }
+  currentProject {
+    id
+    cloudProject {
+      __typename
+      ... on CloudProject {
+        id
+      }
+    }
+  }
+}
+`
+
+gql`
+mutation Auth_Logout {
+  logout {
+    ...Auth
+  }
+}
+`
+
+gql`
+mutation Auth_Login ($utmSource: String!, $utmMedium: String!, $utmContent: String) {
+  login (utmSource: $utmSource, utmContent: $utmContent, utmMedium: $utmMedium) {
+    ...Auth
+  }
+}
+`
+
+gql`
+mutation Auth_Signup ($utmSource: String!, $utmMedium: String!, $utmContent: String) {
+  signup (utmSource: $utmSource, utmContent: $utmContent, utmMedium: $utmMedium) {
+    ...Auth
+  }
+}
+`
+
+gql`
+mutation Auth_ResetAuthState {
+  resetAuthState {
+    ...Auth
+  }
+}
+`
+
+const login = useMutation(Auth_LoginDocument)
+const signup = useMutation(Auth_SignupDocument)
+const logout = useMutation(Auth_LogoutDocument)
+const reset = useMutation(Auth_ResetAuthStateDocument)
+
+const loginButtonRef = ref(Button)
+const loginInitiated = ref(false)
+const didAttemptAutoStart = ref(false)
+
+const startAuthFlow = () => {
+  loginInitiated.value = true
+  executeAuthMutation()
+}
+
+const tryStartAuthIfNeeded = () => {
+  if (!props.autoStartAuth || props.showRetry || props.showLogout) {
+    return
+  }
+
+  if (didAttemptAutoStart.value) {
+    return
+  }
+
+  if (!isOnline.value) {
+    return
+  }
+
+  if (userProjectStatusStore.user.isLoggedIn) {
+    didAttemptAutoStart.value = true
+    if (props.gql.cloudViewer) {
+      return
+    }
+
+    emit('close')
+
+    return
+  }
+
+  didAttemptAutoStart.value = true
+
+  if (browserOpened.value) {
+    return
+  }
+
+  startAuthFlow()
+}
+
+onMounted(() => {
+  if (!props.autoStartAuth) {
+    loginButtonRef?.value?.$el?.focus()
+  }
+
+  tryStartAuthIfNeeded()
+})
+
+watch(isOnline, () => {
+  if (props.autoStartAuth) {
+    tryStartAuthIfNeeded()
+  }
+})
+
+onBeforeUnmount(() => {
+  // If a log in was initiated from this component instance, then the auth state
+  // may be polluted, due to the mutation still being fetched or due to
+  // errors returned during the login process. So a reset occurs when
+  // this instance unmounts to cover all scenarios where the LoginModal may be dismissed.
+  //
+  // We only perform the reset for the component that triggered a login
+  // to prevent state conflicts when LoginModals are presented within the launchpad
+  // and app simultaneously.
+  if (loginInitiated.value) {
+    reset.executeMutation({})
+  }
+})
+
+const showConnectButton = computed(() => {
+  return userProjectStatusStore.project.isConfigLoaded && userProjectStatusStore.cloudStatusMatches('needsProjectConnect')
+})
+
+const emit = defineEmits<{
+  (event: 'close'): void
+  (event: 'cancel'): void
+}>()
+
+const cloudViewer = computed(() => {
+  return props.gql.cloudViewer
+})
+
+const browserOpened = computed(() => {
+  return props.gql.authState.browserOpened
+})
+
+const executeAuthMutation = () => {
+  const variables = { utmMedium: props.utmMedium, utmContent: props.utmContent || null, utmSource: getUtmSource() }
+
+  return props.authFlow === 'signup' ? signup.executeMutation(variables) : login.executeMutation(variables)
+}
+
+// We determine that a login is pending if there is no current cloudViewer and
+// either a login has been initiated from this component, or the browser has been
+// successfully opened.
+//
+// It is possible for the browser to be open but not due to actions by this component,
+// particularly when LoginModals are presented in both the launchpad and app simultaneously.
+const loginMutationIsPending = computed(() => {
+  return !cloudViewer.value && (loginInitiated.value || browserOpened.value)
+})
+
+const handleLoginOrContinue = async () => {
+  if (userProjectStatusStore.user.isLoggedIn) {
+    // user is already logged in, just emit close event & return early
+    emit('close')
+
+    return
+  }
+
+  // user has not already logged in, kick off the login process
+  startAuthFlow()
+}
+
+const handleCancel = () => {
+  emit('cancel')
+}
+
+const handleLogout = () => {
+  logout.executeMutation({})
+}
+
+const handleTryAgain = async () => {
+  await reset.executeMutation({})
+
+  startAuthFlow()
+}
+
+const buttonText = computed(() => {
+  const strings = {
+    login: 'Log in',
+    signup: 'Sign up',
+    connectProject: 'Connect project',
+    continue: 'Continue',
+  }
+
+  if (showConnectButton.value) {
+    return strings.connectProject
+  }
+
+  if (userProjectStatusStore.user.isLoggedIn) {
+    return strings.continue
+  }
+
+  return props.authFlow === 'signup' ? strings.signup : strings.login
+})
+
+const buttonPrefixIcon = computed(() => {
+  return showConnectButton.value ? ChainIcon : undefined
+})
+
+</script>

@@ -1,93 +1,146 @@
-const https = require('https')
 const fs = require('fs')
+const yaml = require('yaml')
+const path = require('path')
 
-const getLatestVersionData = () => {
-  const options = {
-    hostname: 'omahaproxy.appspot.com',
-    port: 443,
-    path: '/all.json',
-    method: 'GET',
+const CHROME_STABLE_KEY = 'chrome-stable-version'
+const CHROME_BETA_KEY = 'chrome-beta-version'
+const CHROME_FOR_TESTING_STABLE_KEY = 'chrome-for-testing-stable-version'
+
+// This is the path to the CircleCI file that contains the browser version anchors
+const CIRCLECI_WORKFLOWS_FILEPATH = path.join(__dirname, '../../.circleci/src/pipeline/@pipeline.yml')
+
+const CHROME_FOR_TESTING_LAST_KNOWN_GOOD_URL = 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json'
+
+/** @returns {number} negative if a < b, 0 if equal, positive if a > b */
+const compareChromeVersions = (a, b) => {
+  const partsA = a.split('.').map((n) => parseInt(n, 10) || 0)
+  const partsB = b.split('.').map((n) => parseInt(n, 10) || 0)
+  const len = Math.max(partsA.length, partsB.length)
+
+  for (let i = 0; i < len; i++) {
+    const da = partsA[i] || 0
+    const db = partsB[i] || 0
+
+    if (da !== db) {
+      return da - db
+    }
   }
 
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, (res) => {
-      let response = ''
+  return 0
+}
 
-      res.on('data', (d) => {
-        response += d.toString()
-      })
+// https://developer.chrome.com/docs/versionhistory/reference/#platform-identifiers
+const getLatestVersionData = async ({ channel, currentVersion }) => {
+  const url = `https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/${channel}/versions?filter=version>${currentVersion}&order_by=version%20desc`
 
-      res.on('end', () => {
-        resolve(response)
-      })
-    })
+  const response = await fetch(url)
 
-    req.on('error', (err) => {
-      reject(err)
-    })
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
 
-    req.end()
-  })
+  return await response.text()
+}
+
+const getLastKnownGoodChromeForTestingStable = async () => {
+  const response = await fetch(CHROME_FOR_TESTING_LAST_KNOWN_GOOD_URL)
+
+  if (!response.ok) {
+    throw new Error(`HTTP error fetching Chrome for Testing versions! status: ${response.status}`)
+  }
+
+  const data = JSON.parse(await response.text())
+  const version = data?.channels?.Stable?.version
+
+  if (!version || typeof version !== 'string') {
+    throw new Error('Chrome for Testing JSON missing channels.Stable.version')
+  }
+
+  return version
 }
 
 const getVersions = async ({ core }) => {
   try {
-    // file path is relative to repo root
-    const currentBrowserVersions = JSON.parse(fs.readFileSync('./browser-versions.json'))
-    const data = JSON.parse(await getLatestVersionData())
-    const linuxData = data.find((item) => item.os === 'linux')
-    const stableData = linuxData.versions.find((version) => version.channel === 'stable')
-    const betaData = linuxData.versions.find((version) => version.channel === 'beta')
-    const hasStableUpdate = currentBrowserVersions['chrome:stable'] !== stableData.version
-    const hasBetaUpdate = currentBrowserVersions['chrome:beta'] !== betaData.version
+    const doc = yaml.parseDocument(fs.readFileSync(CIRCLECI_WORKFLOWS_FILEPATH, 'utf8'))
+
+    const currentChromeStable = doc.contents.items.find((item) => item.key.value === CHROME_STABLE_KEY).value.value
+    const currentChromeBeta = doc.contents.items.find((item) => item.key.value === CHROME_BETA_KEY).value.value
+    const currentChromeForTestingStable = doc.contents.items.find((item) => item.key.value === CHROME_FOR_TESTING_STABLE_KEY).value.value
+
+    const [stableDataText, betaDataText, latestChromeForTestingStable] = await Promise.all([
+      getLatestVersionData({ channel: 'stable', currentVersion: currentChromeStable }),
+      getLatestVersionData({ channel: 'beta', currentVersion: currentChromeBeta }),
+      getLastKnownGoodChromeForTestingStable(),
+    ])
+
+    const stableData = JSON.parse(stableDataText)
+    const betaData = JSON.parse(betaDataText)
+    const hasStableUpdate = stableData.versions.length > 0
+    const hasBetaUpdate = betaData.versions.length > 0
+    const hasChromeForTestingUpdate = compareChromeVersions(latestChromeForTestingStable, currentChromeForTestingStable) > 0
     let description = 'Update '
 
-    if (hasStableUpdate) {
-      description += `Chrome (stable) to ${stableData.version}`
+    const parts = []
 
-      if (hasBetaUpdate) {
-        description += ' and '
-      }
+    if (hasStableUpdate) {
+      parts.push(`Chrome (stable) to ${stableData.versions[0].version}`)
     }
 
     if (hasBetaUpdate) {
-      description += `Chrome (beta) to ${betaData.version}`
+      parts.push(`Chrome (beta) to ${betaData.versions[0].version}`)
     }
 
-    core.setOutput('has_update', (hasStableUpdate || hasBetaUpdate) ? 'true' : 'false')
-    core.setOutput('current_stable_version', currentBrowserVersions['chrome:stable'])
-    core.setOutput('latest_stable_version', stableData.version)
-    core.setOutput('current_beta_version', currentBrowserVersions['chrome:beta'])
-    core.setOutput('latest_beta_version', betaData.version)
+    if (hasChromeForTestingUpdate) {
+      parts.push(`Chrome for Testing (stable) to ${latestChromeForTestingStable}`)
+    }
+
+    description += parts.join(' and ')
+
+    core.setOutput('has_update', (hasStableUpdate || hasBetaUpdate || hasChromeForTestingUpdate) ? 'true' : 'false')
+    core.setOutput('current_stable_version', currentChromeStable)
+    core.setOutput('latest_stable_version', hasStableUpdate ? stableData.versions[0].version : currentChromeStable)
+    core.setOutput('current_beta_version', currentChromeBeta)
+    core.setOutput('latest_beta_version', hasBetaUpdate ? betaData.versions[0].version : currentChromeBeta)
+    core.setOutput('current_chrome_for_testing_stable_version', currentChromeForTestingStable)
+    core.setOutput('latest_chrome_for_testing_stable_version', hasChromeForTestingUpdate ? latestChromeForTestingStable : currentChromeForTestingStable)
     core.setOutput('description', description)
   } catch (err) {
-    // eslint-disable-next-line no-console
     console.log('Errored checking for new Chrome versions:', err.stack)
     core.setOutput('has_update', 'false')
+    process.exit(1)
   }
 }
 
-const checkNeedForBranchUpdate = ({ core, latestStableVersion, latestBetaVersion }) => {
-  // file path is relative to repo root
-  const branchBrowserVersions = JSON.parse(fs.readFileSync('./browser-versions.json'))
-  const hasNewerStableVersion = branchBrowserVersions['chrome:stable'] !== latestStableVersion
-  const hasNewerBetaVersion = branchBrowserVersions['chrome:beta'] !== latestBetaVersion
+const checkNeedForBranchUpdate = ({ core, latestStableVersion, latestBetaVersion, latestChromeForTestingStableVersion }) => {
+  const doc = yaml.parseDocument(fs.readFileSync(CIRCLECI_WORKFLOWS_FILEPATH, 'utf8'))
 
-  core.setOutput('has_newer_update', (hasNewerStableVersion || hasNewerBetaVersion) ? 'true' : 'false')
+  const currentChromeStable = doc.contents.items.find((item) => item.key.value === CHROME_STABLE_KEY).value.value
+  const currentChromeBeta = doc.contents.items.find((item) => item.key.value === CHROME_BETA_KEY).value.value
+  const currentChromeForTestingStable = doc.contents.items.find((item) => item.key.value === CHROME_FOR_TESTING_STABLE_KEY).value.value
+
+  const hasNewerStableVersion = currentChromeStable !== latestStableVersion
+  const hasNewerBetaVersion = currentChromeBeta !== latestBetaVersion
+  const hasNewerChromeForTestingVersion = currentChromeForTestingStable !== latestChromeForTestingStableVersion
+
+  core.setOutput('has_newer_update', (hasNewerStableVersion || hasNewerBetaVersion || hasNewerChromeForTestingVersion) ? 'true' : 'false')
 }
 
-const updateBrowserVersionsFile = ({ latestBetaVersion, latestStableVersion }) => {
-  const versions = {
-    'chrome:beta': latestBetaVersion,
-    'chrome:stable': latestStableVersion,
-  }
+const updateBrowserVersionsFile = ({ latestBetaVersion, latestStableVersion, latestChromeForTestingStableVersion }) => {
+  const doc = yaml.parseDocument(fs.readFileSync(CIRCLECI_WORKFLOWS_FILEPATH, 'utf8'))
 
-  // file path is relative to repo root
-  fs.writeFileSync('./browser-versions.json', `${JSON.stringify(versions, null, 2) }\n`)
+  const currentChromeStableYamlRef = doc.contents.items.find((item) => item.key.value === CHROME_STABLE_KEY)
+  const currentChromeBetaYamlRef = doc.contents.items.find((item) => item.key.value === CHROME_BETA_KEY)
+  const currentChromeForTestingYamlRef = doc.contents.items.find((item) => item.key.value === CHROME_FOR_TESTING_STABLE_KEY)
+
+  currentChromeStableYamlRef.value.value = latestStableVersion
+  currentChromeBetaYamlRef.value.value = latestBetaVersion
+  currentChromeForTestingYamlRef.value.value = latestChromeForTestingStableVersion
+
+  fs.writeFileSync(CIRCLECI_WORKFLOWS_FILEPATH, yaml.stringify(doc), 'utf8')
 }
 
 const updatePRTitle = async ({ context, github, baseBranch, branchName, description }) => {
-  const { data } = await github.pulls.list({
+  const { data } = await github.rest.pulls.list({
     owner: context.repo.owner,
     repo: context.repo.repo,
     base: baseBranch,
@@ -95,29 +148,16 @@ const updatePRTitle = async ({ context, github, baseBranch, branchName, descript
   })
 
   if (!data.length) {
-    // eslint-disable-next-line no-console
     console.log('Could not find PR for branch:', branchName)
 
     return
   }
 
-  await github.pulls.update({
+  await github.rest.pulls.update({
     owner: context.repo.owner,
     repo: context.repo.repo,
     pull_number: data[0].number,
     title: `chore: ${description}`,
-  })
-}
-
-const createPullRequest = async ({ context, github, baseBranch, branchName, description }) => {
-  await github.pulls.create({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    base: baseBranch,
-    head: branchName,
-    title: `chore: ${description}`,
-    body: 'This PR was auto-generated to update the version(s) of Chrome for driver tests',
-    maintainer_can_modify: true,
   })
 }
 
@@ -126,5 +166,5 @@ module.exports = {
   checkNeedForBranchUpdate,
   updateBrowserVersionsFile,
   updatePRTitle,
-  createPullRequest,
+  CIRCLECI_WORKFLOWS_FILEPATH,
 }

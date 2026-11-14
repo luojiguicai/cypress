@@ -63,8 +63,8 @@ outer contents
   return app.get('/timeout', (req, res) => {
     return setTimeout(() => {
       return res.send('<html>timeout</html>')
-    }
-    , 2000)
+    },
+     2000)
   })
 }
 
@@ -77,7 +77,7 @@ describe('e2e iframes', () => {
   })
 
   systemTests.it('passes', {
-    spec: 'iframe_spec.js',
+    spec: 'iframe.cy.js',
     snapshot: true,
     config: {
       hosts: {

@@ -1,58 +1,109 @@
 import _ from 'lodash'
 import Debug from 'debug'
+import mime from 'mime'
 import isHtml from 'is-html'
 import { IncomingMessage } from 'http'
-import {
-  RouteMatcherOptionsGeneric,
-  STRING_MATCHER_FIELDS,
-  DICT_STRING_MATCHER_FIELDS,
+import type {
   BackendStaticResponse,
-} from '../types'
-import { Readable, PassThrough } from 'stream'
-import type CyServer from '@packages/server'
+  GetFixtureFn, CyHttpMessages } from '@packages/network-interception'
+
+import type { Readable } from 'stream'
+import { PassThrough } from 'stream'
 import { Socket } from 'net'
-import type { GetFixtureFn } from './types'
 import ThrottleStream from 'throttle'
-import MimeTypes from 'mime-types'
 import type { CypressIncomingRequest } from '@packages/proxy'
 import type { InterceptedRequest } from './intercepted-request'
+import type { SocketBroadcaster } from '@packages/socket'
 import { caseInsensitiveGet, caseInsensitiveHas } from '../util'
 
-// TODO: move this into net-stubbing once cy.route is removed
-import { parseContentType } from '@packages/server/lib/controllers/xhrs'
-import type { CyHttpMessages } from '../external-types'
 import { getEncoding } from 'istextorbinary'
 
 const debug = Debug('cypress:net-stubbing:server:util')
 
-export function emit (socket: CyServer.Socket, eventName: string, data: object) {
+const isLineTerminator = (ch: string) => {
+  return ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029'
+}
+
+/**
+ * Whether `text` has an opening `<…>` and a later closing `</…>`, each on a
+ * single line, with at least one character between them. Stubbed bodies are
+ * user fixtures that can be large, so this scans in linear time rather than
+ * using a backtracking regex.
+ *
+ * The earliest `<` on a line is always the best start for a tag, and the
+ * earliest-ending opening tag leaves the most room for the closing one, so a
+ * single forward pass per half is enough.
+ */
+function isHtmlLike (text: string) {
+  let openStart = -1
+  let openEnd = -1
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+
+    if (isLineTerminator(ch)) {
+      openStart = -1
+    } else if (ch === '<') {
+      if (openStart === -1) openStart = i
+    } else if (ch === '>' && openStart !== -1 && i >= openStart + 2) {
+      openEnd = i
+      break
+    }
+  }
+
+  if (openEnd === -1) {
+    return false
+  }
+
+  let closeStart = -1
+
+  for (let i = openEnd + 2; i < text.length; i++) {
+    const ch = text[i]
+
+    if (isLineTerminator(ch)) {
+      closeStart = -1
+    } else if (ch === '<') {
+      if (closeStart === -1 && text[i + 1] === '/') closeStart = i
+    } else if (ch === '>' && closeStart !== -1 && i >= closeStart + 3) {
+      return true
+    }
+  }
+
+  return false
+}
+
+const isValidJSON = function (text: unknown) {
+  if (_.isObject(text)) {
+    return true
+  }
+
+  try {
+    const o = JSON.parse(text as string)
+
+    return _.isObject(o)
+  } catch (error) {
+    return false
+  }
+}
+
+export function parseContentType (response?: string) {
+  if (isValidJSON(response)) {
+    return mime.getType('json')
+  }
+
+  if (response && isHtmlLike(String(response))) {
+    return mime.getType('html')
+  }
+
+  return mime.getType('text')
+}
+
+export function emit (socket: SocketBroadcaster, eventName: string, data: object) {
   if (debug.enabled) {
     debug('sending event to driver %o', { eventName, data: _.chain(data).cloneDeep().omit('res.body').value() })
   }
 
   socket.toDriver('net:stubbing:event', eventName, data)
-}
-
-export function getAllStringMatcherFields (options: RouteMatcherOptionsGeneric<any>) {
-  return _.concat(
-    _.filter(STRING_MATCHER_FIELDS, _.partial(_.has, options)),
-    // add the nested DictStringMatcher values to the list of fields
-    _.flatten(
-      _.filter(
-        DICT_STRING_MATCHER_FIELDS.map((field) => {
-          const value = options[field]
-
-          if (value) {
-            return _.keys(value).map((key) => {
-              return `${field}.${key}`
-            })
-          }
-
-          return ''
-        }),
-      ),
-    ),
-  )
 }
 
 /**
@@ -126,7 +177,7 @@ export async function setResponseFromFixture (getFixtureFn: GetFixtureFn, static
 
   if (!headers || !caseInsensitiveGet(headers, 'content-type')) {
     // attempt to detect mimeType based on extension, fall back to regular cy.fixture inspection otherwise
-    const mimeType = MimeTypes.lookup(fixture.filePath) || parseContentType(data)
+    const mimeType = mime.getType(fixture.filePath) || parseContentType(data)
 
     _.set(staticResponse, 'headers.content-type', mimeType)
   }
@@ -158,7 +209,12 @@ export async function sendStaticResponse (backendRequest: Pick<InterceptedReques
 
   if (staticResponse.forceNetworkError) {
     debug('forcing network error')
-    const err = new Error('forceNetworkError called')
+    const err: Error & { isForceNetworkError?: boolean } = new Error('forceNetworkError called')
+
+    // The CDP Fetch transport has no connection to reset, so it needs to tell
+    // a requested network error apart from a real pipeline failure to map it
+    // to Fetch.failRequest instead of releasing the pause untouched.
+    err.isForceNetworkError = true
 
     return onError(err)
   }
@@ -213,26 +269,6 @@ function wait (fn, ms) {
     setTimeout(() => {
       resolve(fn())
     }, ms)
-  })
-}
-
-export function mergeDeletedHeaders (before: CyHttpMessages.BaseMessage, after: CyHttpMessages.BaseMessage) {
-  for (const k in before.headers) {
-    // a header was deleted from `after` but was present in `before`, delete it in `before` too
-    !after.headers[k] && delete before.headers[k]
-  }
-}
-
-export function mergeWithPreservedBuffers (before: CyHttpMessages.BaseMessage, after: Partial<CyHttpMessages.BaseMessage>) {
-  // lodash merge converts Buffer into Array (by design)
-  // https://github.com/lodash/lodash/issues/2964
-  // @see https://github.com/cypress-io/cypress/issues/15898
-  _.mergeWith(before, after, (_a, b) => {
-    if (b instanceof Buffer) {
-      return b
-    }
-
-    return undefined
   })
 }
 

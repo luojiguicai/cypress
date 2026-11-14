@@ -1,118 +1,82 @@
-// @ts-nocheck
-
 import _ from 'lodash'
-import Promise from 'bluebird'
 
 import $errUtils from '../../cypress/error_utils'
-const { throwErrByPath } = $errUtils
+import { getUrlFromAutomation } from './helpers/location'
 
-export default (Commands, Cypress, cy) => {
-  Commands.addAll({
-    url (options = {}) {
-      const userOptions = options
+export function urlQueryCommand (Cypress: Cypress.Cypress, options: Partial<Cypress.UrlOptions> = {}) {
+  Cypress.log({ message: '', hidden: options.log === false, timeout: options.timeout })
 
-      options = _.defaults({}, userOptions, { log: true })
+  const fn = getUrlFromAutomation.bind(this)(Cypress, options)
 
-      if (options.log !== false) {
-        options._log = Cypress.log({
-          message: '',
-          timeout: options.timeout,
-        })
-      }
+  return () => {
+    const fullUrlObj = fn()
 
-      const getHref = () => {
-        return cy.getRemoteLocation('href')
-      }
+    if (fullUrlObj) {
+      const href = fullUrlObj.href
 
-      const resolveHref = () => {
-        return Promise.try(getHref).then((href) => {
-          if (options.decode) {
-            href = decodeURI(href)
-          }
+      return options.decode ? decodeURI(href) : href
+    }
+  }
+}
 
-          return cy.verifyUpcomingAssertions(href, options, {
-            onRetry: resolveHref,
-          })
-        })
-      }
+export function hashQueryCommand (Cypress: Cypress.Cypress, options: Partial<Cypress.Loggable & Cypress.Timeoutable> = {}) {
+  Cypress.log({ message: '', hidden: options.log === false, timeout: options.timeout })
 
-      return resolveHref()
-    },
+  const fn = getUrlFromAutomation.bind(this)(Cypress, options)
 
-    hash (options = {}) {
-      const userOptions = options
+  return () => {
+    const fullUrlObj = fn()
 
-      options = _.defaults({}, userOptions, { log: true })
+    if (fullUrlObj) {
+      return fullUrlObj.hash
+    }
+  }
+}
 
-      if (options.log !== false) {
-        options._log = Cypress.log({
-          message: '',
-          timeout: options.timeout,
-        })
-      }
+export function locationQueryCommand (Cypress: Cypress.Cypress, key?: string | Partial<Cypress.Loggable & Cypress.Timeoutable>, options: Partial<Cypress.Loggable & Cypress.Timeoutable> = {}) {
+  // normalize arguments allowing key + options to be undefined
+  // key can represent the options
+  if (_.isObject(key)) {
+    options = key
+  }
 
-      const getHash = () => {
-        return cy.getRemoteLocation('hash')
-      }
+  Cypress.log({
+    message: _.isString(key) ? key : '',
+    hidden: options.log === false,
+    timeout: options.timeout,
+  })
 
-      const resolveHash = () => {
-        return Promise.try(getHash).then((hash) => {
-          return cy.verifyUpcomingAssertions(hash, options, {
-            onRetry: resolveHash,
-          })
-        })
-      }
+  const fn = getUrlFromAutomation.bind(this)(Cypress, options)
 
-      return resolveHash()
-    },
+  return () => {
+    const location = fn({ retryAfterResolve: true })
 
-    location (key, options) {
-      let userOptions = options
+    if (location === '') {
+      // maybe the page's domain is "invisible" to us
+      // and we cannot get the location. Return null
+      // so the command keeps retrying, maybe there is
+      // a redirect that puts us on the domain we can access
+      return null
+    }
 
-      // normalize arguments allowing key + options to be undefined
-      // key can represent the options
-      if (_.isObject(key) && _.isUndefined(userOptions)) {
-        userOptions = key
-      }
+    return _.isString(key)
+      // use existential here because we only want to throw
+      // on null or undefined values (and not empty strings)
+      ? location[key] ?? $errUtils.throwErrByPath('location.invalid_key', { args: { key } })
+      : location
+  }
+}
 
-      userOptions = userOptions || {}
+export default (Commands, Cypress) => {
+  Commands.addQuery('url', function (options: Partial<Cypress.UrlOptions> = {}) {
+    return urlQueryCommand.call(this, Cypress, options)
+  })
 
-      options = _.defaults({}, userOptions, { log: true })
+  Commands.addQuery('hash', function (options: Partial<Cypress.Loggable & Cypress.Timeoutable> = {}) {
+    return hashQueryCommand.call(this, Cypress, options)
+  })
 
-      const getLocation = () => {
-        const location = cy.getRemoteLocation()
-
-        if (location === '') {
-          // maybe the page's domain is "invisible" to us
-          // and we cannot get the location. Return null
-          // so the command keeps retrying, maybe there is
-          // a redirect that puts us on the domain we can access
-          return null
-        }
-
-        return _.isString(key)
-          // use existential here because we only want to throw
-          // on null or undefined values (and not empty strings)
-          ? location[key] ?? throwErrByPath('location.invalid_key', { args: { key } })
-          : location
-      }
-
-      if (options.log !== false) {
-        options._log = Cypress.log({
-          message: key != null ? key : '',
-          timeout: options.timeout,
-        })
-      }
-
-      const resolveLocation = () => {
-        return Promise.try(getLocation).then((ret) => {
-          return cy.verifyUpcomingAssertions(ret, options, {
-            onRetry: resolveLocation,
-          })
-        })
-      }
-
-      return resolveLocation()
-    },
+  Commands.addQuery('location', function (key?: string | Partial<Cypress.Loggable & Cypress.Timeoutable>, options: Partial<Cypress.Loggable & Cypress.Timeoutable> = {}) {
+    return locationQueryCommand.call(this, Cypress, key, options)
   })
 }

@@ -1,0 +1,223 @@
+import type { StudioManagerShape, StudioStatus, StudioServerDefaultShape, StudioServerShape, StudioConfig, ProtocolManagerShape, StudioCloudApi, StudioAIInitializeOptions, StudioEvent, StudioAddSocketListenersOptions, StudioServerOptions, StudioCDPClient } from '@packages/types'
+import type { Router } from 'express'
+import Debug from 'debug'
+import { requireScript } from '../require_script'
+import path from 'path'
+import type { BinaryLike } from 'crypto'
+import crypto from 'crypto'
+import { StudioElectron } from './StudioElectron'
+import exception from '../exception'
+import type { DebugData } from '@packages/types'
+
+interface StudioServer { default: StudioServerDefaultShape }
+
+interface SetupOptions {
+  script: string
+  studioPath: string
+  studioHash?: string
+  cloudApi: StudioCloudApi
+  manifest: Record<string, string>
+  getProjectOptions: StudioServerOptions['getProjectOptions']
+  debugData?: DebugData
+}
+
+const debug = Debug('cypress:server:studio')
+
+export class StudioManager implements StudioManagerShape {
+  status: StudioStatus = 'NOT_INITIALIZED'
+  protocolManager: ProtocolManagerShape | undefined
+  private _studioServer: StudioServerShape | undefined
+  private _studioElectron: StudioElectron | undefined
+
+  async setup ({ script, studioPath, studioHash, cloudApi, manifest, getProjectOptions, debugData }: SetupOptions): Promise<void> {
+    const { createStudioServer } = requireScript<StudioServer>(script).default
+
+    this._studioServer = await createStudioServer({
+      studioHash,
+      studioPath,
+      cloudApi,
+      betterSqlite3Path: path.dirname(require.resolve('better-sqlite3/package.json')),
+      manifest,
+      verifyHash: (contents: BinaryLike, expectedHash: string) => {
+        // If we are running locally, we don't need to verify the signature. This
+        // environment variable will get stripped in the binary.
+        if (process.env.CYPRESS_LOCAL_STUDIO_PATH) {
+          return true
+        }
+
+        const actualHash = crypto.createHash('sha256').update(contents).digest('hex')
+
+        return actualHash === expectedHash
+      },
+      getProjectOptions,
+      debugData,
+    })
+
+    this.status = 'ENABLED'
+  }
+
+  initializeRoutes (router: Router): void {
+    if (this._studioServer) {
+      this.invokeSync('initializeRoutes', { isEssential: true }, router)
+    }
+  }
+
+  async captureStudioEvent (event: StudioEvent): Promise<void> {
+    if (this._studioServer) {
+      // this request is not essential - we don't want studio to error out if a telemetry request fails
+      await this.invokeAsync('captureStudioEvent', { isEssential: false }, event)
+    }
+  }
+
+  addSocketListeners (options: StudioAddSocketListenersOptions): void {
+    if (this._studioServer) {
+      this.invokeSync('addSocketListeners', { isEssential: true }, options)
+    }
+  }
+
+  async canAccessStudioAI (browser: Cypress.Browser): Promise<boolean> {
+    return !!(await this.invokeAsync('canAccessStudioAI', { isEssential: true }, browser))
+  }
+
+  async getStudioConfig (browser: Cypress.Browser): Promise<StudioConfig> {
+    const config = await this.invokeAsync('getStudioConfig', { isEssential: true }, browser)
+
+    if (config === undefined) {
+      throw new Error('Studio is not available: server not initialized or an error occurred')
+    }
+
+    return config
+  }
+
+  getCachedStudioConfig (): StudioConfig {
+    const config = this.invokeSync('getCachedStudioConfig', { isEssential: true })
+
+    if (config === undefined) {
+      throw new Error('Studio is not available: server not initialized or an error occurred')
+    }
+
+    return config
+  }
+
+  connectToBrowser (target: StudioCDPClient): void {
+    if (this._studioServer) {
+      return this.invokeSync('connectToBrowser', { isEssential: true }, target)
+    }
+  }
+
+  async initializeStudioAI (options: StudioAIInitializeOptions): Promise<void> {
+    // Only create a studio electron instance when studio AI is enabled
+    if (!this._studioElectron) {
+      this._studioElectron = new StudioElectron()
+    }
+
+    await this.invokeAsync('initializeStudioAI', { isEssential: true }, {
+      ...options,
+      studioElectron: this._studioElectron,
+    })
+  }
+
+  updateSessionId (sessionId: string): void {
+    if (this._studioServer && typeof this._studioServer.updateSessionId === 'function') {
+      this.invokeSync('updateSessionId', { isEssential: false }, sessionId)
+    } else {
+      debug('updateSessionId method not available on studio server')
+    }
+  }
+
+  async destroy (): Promise<void> {
+    await this.invokeAsync('destroy', { isEssential: true })
+  }
+
+  reportError (error: unknown, studioMethod: string, ...studioMethodArgs: unknown[]): void {
+    try {
+      this._studioServer?.reportError(error, studioMethod, ...studioMethodArgs)
+    } catch (e) {
+      // If we fail to report the error, we shouldn't try and report it again
+      debug(`Error calling StudioManager.reportError: %o, original error %o`, e, error)
+    }
+  }
+
+  /**
+   * Abstracts invoking a synchronous method on the StudioServer instance, so we can handle
+   * errors in a uniform way
+   */
+  private invokeSync<K extends StudioServerSyncMethods> (method: K, { isEssential }: { isEssential: boolean }, ...args: Parameters<StudioServerShape[K]>): any | void {
+    if (!this._studioServer) {
+      return
+    }
+
+    try {
+      debug('invoking sync method %s with args %o', method, args)
+
+      // @ts-expect-error - TS not associating the method & args properly, even though we know it's correct
+      return this._studioServer[method](...args)
+    } catch (error: unknown) {
+      let actualError: Error
+
+      if (!(error instanceof Error)) {
+        // Use safe serialization that handles circular references and other edge cases
+        const message = exception.safeErrorSerialize(error)
+
+        actualError = new Error(message)
+      } else {
+        actualError = error
+      }
+
+      this.status = 'IN_ERROR'
+      this.reportError(actualError, method, ...args)
+    }
+  }
+
+  get isProtocolEnabled () {
+    return !!this.protocolManager
+  }
+
+  /**
+   * Abstracts invoking an asynchronous method on the StudioServer instance, so we can handle
+   * errors in a uniform way
+   */
+  private async invokeAsync <K extends StudioServerAsyncMethods> (method: K, { isEssential }: { isEssential: boolean }, ...args: Parameters<StudioServerShape[K]>): Promise<ReturnType<StudioServerShape[K]> | undefined> {
+    if (!this._studioServer) {
+      return undefined
+    }
+
+    try {
+      debug('invoking async method %s with args %o', method, args)
+
+      // @ts-expect-error - TS not associating the method & args properly, even though we know it's correct
+      return await this._studioServer[method](...args)
+    } catch (error: unknown) {
+      let actualError: Error
+
+      if (!(error instanceof Error)) {
+        // Use safe serialization that handles circular references and other edge cases
+        const message = exception.safeErrorSerialize(error)
+
+        actualError = new Error(message)
+      } else {
+        actualError = error
+      }
+
+      // only set error state if this request is essential
+      if (isEssential) {
+        this.status = 'IN_ERROR'
+      }
+
+      this.reportError(actualError, method, ...args)
+
+      return undefined
+    }
+  }
+}
+
+// Helper types for invokeSync / invokeAsync (only method keys; exclude e.g. sessionId)
+type StudioServerMethodKey = Exclude<keyof StudioServerShape, 'sessionId'>
+
+type StudioServerSyncMethods = {
+  [K in StudioServerMethodKey]: ReturnType<StudioServerShape[K]> extends Promise<any> ? never : K
+}[StudioServerMethodKey]
+
+type StudioServerAsyncMethods = {
+  [K in StudioServerMethodKey]: ReturnType<StudioServerShape[K]> extends Promise<any> ? K : never
+}[StudioServerMethodKey]

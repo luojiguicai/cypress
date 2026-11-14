@@ -4,7 +4,7 @@ import stream from 'stream'
 
 const debug = debugModule('cypress:server:stream_buffer')
 
-function streamBuffer (initialSize = 2048) {
+export function streamBuffer (initialSize = 2048) {
   let buffer: Buffer | null = Buffer.allocUnsafe(initialSize)
   let bytesWritten = 0
   let finished = false
@@ -23,7 +23,7 @@ function streamBuffer (initialSize = 2048) {
         newBufferLength *= 2
       }
 
-      debug('extending buffer to accomodate new chunk', {
+      debug('extending buffer to accommodate new chunk', {
         bufferLength: buffer.length,
         newBufferLength,
       })
@@ -109,7 +109,6 @@ function streamBuffer (initialSize = 2048) {
 
       const readable = new stream.Readable({
         read: onRead,
-        // @ts-ignore
         autoDestroy: true,
       })
 
@@ -117,13 +116,16 @@ function streamBuffer (initialSize = 2048) {
 
       return readable
     }
+
     unpipeAll () {
       buffer = null // aggressive GC
       _.invokeMap(this.readers, 'unpipe')
     }
+
     _buffer () {
       return buffer
     }
+
     _finished () {
       return finished
     }
@@ -132,13 +134,8 @@ function streamBuffer (initialSize = 2048) {
   const writeable = new StreamBuffer({
     write: onWrite,
     final: onFinal,
-    // @ts-ignore
     autoDestroy: true,
   })
 
   return writeable
-}
-
-module.exports = {
-  streamBuffer,
 }

@@ -1,9 +1,6 @@
 import _ from 'lodash'
 
-import {
-  PLAIN_FIELDS,
-  STRING_MATCHER_FIELDS,
-  DICT_STRING_MATCHER_FIELDS,
+import type {
   RouteHandler,
   RouteMatcherOptions,
   RouteMatcher,
@@ -15,11 +12,17 @@ import {
   StringMatcher,
   NumberMatcher,
   BackendStaticResponseWithArrayBuffer,
-} from '@packages/net-stubbing/lib/types'
+  StaticResponseWithOptions,
+} from '@packages/network-interception'
+import {
+  PLAIN_FIELDS,
+  STRING_MATCHER_FIELDS,
+  DICT_STRING_MATCHER_FIELDS,
+} from '@packages/network-interception'
 import {
   validateStaticResponse,
   getBackendStaticResponse,
-  hasStaticResponseKeys,
+  hasStaticResponseWithOptionsKeys,
 } from './static-response-utils'
 import {
   getRouteMatcherLogConfig,
@@ -27,12 +30,13 @@ import {
 import { registerEvents } from './events'
 import $errUtils from '../../cypress/error_utils'
 import $utils from '../../cypress/utils'
+import type { StateFunc } from '../../cypress/state'
 import isValidDomain from 'is-valid-domain'
 import isValidHostname from 'is-valid-hostname'
 
 const lowercaseFieldNames = (headers: { [fieldName: string]: any }) => _.mapKeys(headers, (v, k) => _.toLower(k))
 
-export function hasOnlyRouteMatcherKeys (obj: any) {
+function hasOnlyRouteMatcherKeys (obj: any): obj is RouteMatcherOptions {
   return !_.isEmpty(obj) && !_.isArray(obj) && _.isEmpty(_.omit(obj, _.concat(PLAIN_FIELDS, STRING_MATCHER_FIELDS, DICT_STRING_MATCHER_FIELDS)))
 }
 
@@ -152,13 +156,8 @@ function validateRouteMatcherOptions (routeMatcher: RouteMatcherOptions): { isVa
         return err(`\`${k}\` was specified more than once in \`headers\`. Header fields can only be matched once (HTTP header field names are case-insensitive).`)
       }
 
-      knownFieldNames.push(k)
+      knownFieldNames.push(k.toLowerCase())
     }
-  }
-
-  // @ts-ignore
-  if (routeMatcher.matchUrlAgainstPath) {
-    return err(`\`matchUrlAgainstPath\` was removed in Cypress 7.0.0 and should be removed from your tests. Your tests will run the same. For more information, visit https://on.cypress.io/migration-guide`)
   }
 
   for (const prop in routeMatcher) {
@@ -170,7 +169,7 @@ function validateRouteMatcherOptions (routeMatcher: RouteMatcherOptions): { isVa
   return { isValid: true }
 }
 
-export function addCommand (Commands, Cypress: Cypress.Cypress, cy: Cypress.cy, state: Cypress.State) {
+export function addCommand (Commands, Cypress: Cypress.Cypress, cy: Cypress.cy, state: StateFunc) {
   const { emitNetEvent } = registerEvents(Cypress, cy)
 
   function addRoute (matcher: RouteMatcherOptions, handler?: RouteHandler) {
@@ -186,7 +185,7 @@ export function addCommand (Commands, Cypress: Cypress.Cypress, cy: Cypress.cy, 
     } else if (_.isString(handler)) {
       staticResponse = { body: handler }
     } else if (_.isObjectLike(handler)) {
-      if (!hasStaticResponseKeys(handler)) {
+      if (!hasStaticResponseWithOptionsKeys(handler)) {
         // the user has not supplied any of the StaticResponse keys, assume it's a JSON object
         // that should become the body property
         handler = {
@@ -194,9 +193,9 @@ export function addCommand (Commands, Cypress: Cypress.Cypress, cy: Cypress.cy, 
         }
       }
 
-      validateStaticResponse('cy.intercept', <StaticResponse>handler)
+      validateStaticResponse('cy.intercept', <StaticResponseWithOptions>handler)
 
-      staticResponse = handler as StaticResponse
+      staticResponse = handler as StaticResponseWithOptions
     } else if (!_.isUndefined(handler)) {
       // a handler was passed but we dunno what it's supposed to be
       $errUtils.throwErrByPath('net_stubbing.intercept.invalid_handler', { args: { handler } })
@@ -227,7 +226,7 @@ export function addCommand (Commands, Cypress: Cypress.Cypress, cy: Cypress.cy, 
     state('routes')[routeId] = {
       log: Cypress.log(getRouteMatcherLogConfig(matcher, !!handler, alias, staticResponse)),
       options: matcher,
-      handler,
+      handler: handler!,
       hitCount: 0,
       requests: {},
       command: state('current'),
@@ -255,7 +254,6 @@ export function addCommand (Commands, Cypress: Cypress.Cypress, cy: Cypress.cy, 
     function getMatcherOptions (): RouteMatcherOptions {
       if (isStringMatcher(matcher) && hasOnlyRouteMatcherKeys(handler)) {
         // url, mergeRouteMatcher, handler
-        // @ts-ignore
         if (handler.url) {
           $errUtils.throwErrByPath('net_stubbing.intercept.no_duplicate_url')
         }

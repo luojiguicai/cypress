@@ -1,37 +1,38 @@
 import _ from 'lodash'
-import Bluebird from 'bluebird'
-import contextMenu from 'electron-context-menu'
+// tslint:disable-next-line no-implicit-dependencies - electron dep needs to be defined
 import { BrowserWindow } from 'electron'
 import Debug from 'debug'
-import cwd from '../cwd'
-import savedState from '../saved_state'
-import { getPathToDesktopIndex } from '@packages/resolve-dist'
+import * as savedState from '../saved_state'
 
 const debug = Debug('cypress:server:windows')
 
 export type WindowOptions = Electron.BrowserWindowConstructorOptions & {
   type?: 'INDEX'
-  url?: string
   devTools?: boolean
+  graphqlPort?: number
+  contextMenu?: boolean
+  partition?: string
+  /**
+   * Synchronizes properties of browserwindow with local state
+   */
+  trackState?: TrackStateMap
+  onFocus?: () => void
+  onNewWindow?: ({ disposition, features, frameName, postBody, referrer, url }) => Promise<void>
+  onCrashed?: () => void
 }
+
+export type WindowOpenOptions = WindowOptions & { url: string }
+
+type TrackStateMap = Record<'width' | 'height' | 'x' | 'y' | 'devTools', string>
 
 let windows = {}
 let recentlyCreatedWindow = false
 
-const getUrl = function (type) {
-  switch (type) {
-    case 'INDEX':
-      return getPathToDesktopIndex()
-    default:
-      throw new Error(`No acceptable window type found for: '${type}'`)
-  }
-}
-
-const getByType = (type) => {
+const getByType = (type: string) => {
   return windows[type]
 }
 
-const setWindowProxy = function (win) {
+const setWindowProxy = function (win: BrowserWindow) {
   if (!process.env.HTTP_PROXY) {
     return
   }
@@ -42,7 +43,7 @@ const setWindowProxy = function (win) {
   })
 }
 
-export function installExtension (win: BrowserWindow, path) {
+export function installExtension (win: BrowserWindow, path: string) {
   return win.webContents.session.loadExtension(path)
   .then((data) => {
     debug('electron extension installed %o', { data, path })
@@ -57,10 +58,10 @@ export function removeAllExtensions (win: BrowserWindow) {
   let extensions
 
   try {
-    extensions = win.webContents.session.getAllExtensions()
+    extensions = win.webContents.session.extensions.getAllExtensions()
 
     extensions.forEach(({ id }) => {
-      win.webContents.session.removeExtension(id)
+      win.webContents.session.extensions.removeExtension(id)
     })
   } catch (err) {
     debug('error removing all extensions %o', { err, extensions })
@@ -69,20 +70,6 @@ export function removeAllExtensions (win: BrowserWindow) {
 
 export function reset () {
   windows = {}
-}
-
-export function destroy (type) {
-  let win
-
-  if (type && (win = getByType(type))) {
-    return win.destroy()
-  }
-}
-
-export function get (type) {
-  return getByType(type) || (() => {
-    throw new Error(`No window exists for: '${type}'`)
-  })()
 }
 
 export function showAll () {
@@ -100,6 +87,10 @@ export function hideAllUnlessAnotherWindowIsFocused () {
   return _.invoke(windows, 'hide')
 }
 
+export function isMainWindowFocused () {
+  return getByType('INDEX').isFocused()
+}
+
 export function focusMainWindow () {
   return getByType('INDEX').show()
 }
@@ -108,7 +99,7 @@ export function getByWebContents (webContents) {
   return BrowserWindow.fromWebContents(webContents)
 }
 
-export function _newBrowserWindow (options) {
+function _newBrowserWindow (options) {
   return new BrowserWindow(options)
 }
 
@@ -140,11 +131,16 @@ export function defaults (options = {}) {
   })
 }
 
-export function create (projectRoot, _options: WindowOptions = {}, newBrowserWindow = _newBrowserWindow) {
+export function create (projectRoot, _options: WindowOptions, newBrowserWindow = _newBrowserWindow) {
   const options = defaults(_options)
 
   if (options.show === false) {
     options.frame = false
+    // Windows reserves part of a frameless window's client area for resize
+    // targets when it keeps a thick frame, shrinking the web contents and
+    // every screenshot and video frame taken of it
+    // @see https://github.com/cypress-io/cypress/issues/34771
+    options.thickFrame = false
   }
 
   options.webPreferences.webSecurity = !!options.chromeWebSecurity
@@ -180,12 +176,20 @@ export function create (projectRoot, _options: WindowOptions = {}, newBrowserWin
     })
   }
 
-  win.webContents.on('crashed', function (...args) {
+  win.webContents.on('render-process-gone', function (...args) {
     return options.onCrashed.apply(win, args)
   })
 
-  win.webContents.on('new-window', function (...args) {
-    return options.onNewWindow.apply(win, args)
+  // As of Electron v22, the 'new-window' event has been removed for 'setWindowOpenHandler'.
+  // @see https://github.com/electron/electron/blob/v21.0.0/docs/api/web-contents.md#event-new-window-deprecated
+  // @see https://github.com/electron/electron/pull/34526
+  win.webContents.setWindowOpenHandler(function (...args) {
+    // opens the child window from the root window so Cypress can decorate it with needed events and configuration
+    options.onNewWindow.apply(win, args)
+
+    // Because the opening of the window is handled by the root window above, deny opening the window.
+    // @see https://github.com/electron/electron/blob/v21.0.0/docs/api/web-contents.md#contentssetwindowopenhandlerhandler
+    return { action: 'deny' }
   })
 
   if (options.trackState) {
@@ -200,7 +204,7 @@ export function create (projectRoot, _options: WindowOptions = {}, newBrowserWin
 
   if (options.contextMenu) {
     // adds context menu with copy, paste, inspect element, etc
-    contextMenu({
+    require('electron-context-menu')({
       showInspectElement: true,
       window: win,
     })
@@ -209,18 +213,16 @@ export function create (projectRoot, _options: WindowOptions = {}, newBrowserWin
   return win
 }
 
-// open desktop-gui BrowserWindow
-export function open (projectRoot, options: WindowOptions = {}, newBrowserWindow = _newBrowserWindow) {
+// open launchpad BrowserWindow
+export async function open (projectRoot: string, options: WindowOpenOptions, newBrowserWindow = _newBrowserWindow): Promise<BrowserWindow> {
   // if we already have a window open based
   // on that type then just show + focus it!
-  let win
+  const knownWin = options.type && getByType(options.type)
 
-  win = getByType(options.type)
+  if (knownWin) {
+    knownWin.show()
 
-  if (win) {
-    win.show()
-
-    return Bluebird.resolve(win)
+    return Promise.resolve(knownWin)
   }
 
   recentlyCreatedWindow = true
@@ -231,15 +233,10 @@ export function open (projectRoot, options: WindowOptions = {}, newBrowserWindow
     show: true,
     webPreferences: {
       contextIsolation: true,
-      preload: cwd('lib', 'ipc', 'ipc.js'),
     },
   })
 
-  if (!options.url) {
-    options.url = getUrl(options.type)
-  }
-
-  win = create(projectRoot, options, newBrowserWindow)
+  const win = create(projectRoot, options, newBrowserWindow)
 
   debug('creating electron window with options %o', options)
 
@@ -251,21 +248,15 @@ export function open (projectRoot, options: WindowOptions = {}, newBrowserWindow
     })
   }
 
-  // enable our url to be a promise
-  // and wait for this to be resolved
-  return Bluebird.join(
-    options.url,
-    setWindowProxy(win),
-  )
-  .spread((url) => {
-    // navigate the window here!
-    win.loadURL(url)
+  await setWindowProxy(win)
+  await win.loadURL(options.url)
 
-    recentlyCreatedWindow = false
-  }).thenReturn(win)
+  recentlyCreatedWindow = false
+
+  return win
 }
 
-export function trackState (projectRoot, isTextTerminal, win, keys) {
+export function trackState (projectRoot, isTextTerminal, win, keys: TrackStateMap) {
   const isDestroyed = () => {
     return win.isDestroyed()
   }
@@ -288,8 +279,8 @@ export function trackState (projectRoot, isTextTerminal, win, keys) {
     .then((state) => {
       return state.set(newState)
     })
-  }
-  , 500))
+  },
+   500))
 
   win.on('moved', _.debounce(() => {
     if (isDestroyed()) {
@@ -306,8 +297,8 @@ export function trackState (projectRoot, isTextTerminal, win, keys) {
     .then((state) => {
       return state.set(newState)
     })
-  }
-  , 500))
+  },
+   500))
 
   win.webContents.on('devtools-opened', () => {
     const newState = {}
@@ -320,7 +311,7 @@ export function trackState (projectRoot, isTextTerminal, win, keys) {
     })
   })
 
-  return win.webContents.on('devtools-closed', () => {
+  win.webContents.on('devtools-closed', () => {
     const newState = {}
 
     newState[keys.devTools] = false

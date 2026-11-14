@@ -1,18 +1,26 @@
 import _ from 'lodash'
-import charset from 'charset'
-import type { CookieOptions } from 'express'
-import { cors, concatStream, httpUtils } from '@packages/network'
-import type { CypressIncomingRequest, CypressOutgoingResponse } from '@packages/proxy'
-import debugModule from 'debug'
-import type { HttpMiddleware } from '.'
-import iconv from 'iconv-lite'
-import type { IncomingMessage, IncomingHttpHeaders } from 'http'
-import { InterceptResponse } from '@packages/net-stubbing'
-import { PassThrough, Readable } from 'stream'
-import * as rewriter from './util/rewriter'
+import { isIP } from 'net'
+import type { Readable } from 'stream'
+import { PassThrough } from 'stream'
+import { URL } from 'url'
 import zlib from 'zlib'
+import { InterceptResponse } from '@packages/net-stubbing'
+import { isRedirectStatus } from '@packages/network-interception'
+import { concatStream, httpUtils } from '@packages/network'
+import { telemetry } from '@packages/telemetry'
+import { hasServiceWorkerHeader, isVerboseTelemetry as isVerbose } from '.'
 
-export type ResponseMiddleware = HttpMiddleware<{
+import type { CookieOptions } from 'express'
+import type { CypressOutgoingResponseLike } from '../types'
+import type { HttpMiddleware } from '.'
+import type { IncomingMessage } from 'http'
+
+import { cspHeaderNames, generateCspDirectives, parseCspHeaders, problematicCspDirectives, unsupportedCSPDirectives } from './util/csp-header'
+import { injectIntoServiceWorker } from './util/service-worker-injector'
+import { validateHeaderName, validateHeaderValue } from 'http'
+import error from '@packages/errors'
+
+interface ResponseMiddlewareProps {
   /**
    * Before using `res.incomingResStream`, `prepareResStream` can be used
    * to remove any encoding that prevents it from being returned as plain text.
@@ -21,79 +29,113 @@ export type ResponseMiddleware = HttpMiddleware<{
    */
   makeResStreamPlainText: () => void
   isGunzipped: boolean
+  isBrotliDecompressed: boolean
+  /**
+   * Original content-encoding order (first = innermost). Used to re-compress in the
+   * same order when multiple encodings (e.g. gzip, br) were present.
+   */
+  contentEncodingOrder: SupportedContentEncoding[]
+  /**
+   * Set in OmitProblematicHeaders when the origin response declared `Content-Length: 0`,
+   * before that header is stripped. Consumed by MaybeEndWithEmptyBody so the proxy can
+   * re-emit `Content-Length: 0` instead of letting Node's HTTP layer fall back to
+   * `Transfer-Encoding: chunked` for an empty body. See cypress-io/cypress#16469.
+   */
+  incomingResHadEmptyBody: boolean
   incomingRes: IncomingMessage
   incomingResStream: Readable
-}>
+  /**
+   * Set by the synthetic proxy codec when the CDP Fetch transport deliberately
+   * never read the response body (stream-shaped, e.g. SSE). Consumed by the
+   * network capture adapter so it doesn't record a skipped body as an empty one.
+   */
+  resBodySkipped?: boolean
+  /**
+   * Set by the synthetic proxy codec when the CDP Fetch transport captured a
+   * side-channel stream of the bytes the browser delivered for a
+   * stream-classified response. Consumed by the network capture adapter so
+   * Replay records those bytes instead of skipping the body. Not
+   * incomingResStream, because the two have disjoint lifetimes: the body
+   * middleware drains incomingResStream to completion BEFORE the pause is
+   * released (a never-ending stream there wedges the pipeline), while these
+   * bytes only begin to flow AFTER Fetch.continueResponse.
+   */
+  resCaptureStream?: Readable
+}
 
-const debug = debugModule('cypress:proxy:http:response-middleware')
+export type ResponseMiddleware = HttpMiddleware<ResponseMiddlewareProps>
+
+// do not use a debug namespace in this file - use the per-request `this.debug` instead
+// available as cypress-verbose:proxy:http
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const debug = null
 
 // https://github.com/cypress-io/cypress/issues/1756
-const zlibOptions = {
-  flush: zlib.Z_SYNC_FLUSH,
-  finishFlush: zlib.Z_SYNC_FLUSH,
+const zlibGzipDecompressOptions = {
+  flush: zlib.constants.Z_SYNC_FLUSH,
+  finishFlush: zlib.constants.Z_SYNC_FLUSH,
 }
 
-// https://github.com/cypress-io/cypress/issues/1543
-function getNodeCharsetFromResponse (headers: IncomingHttpHeaders, body: Buffer) {
-  const httpCharset = (charset(headers, body, 1024) || '').toLowerCase()
+const zlibGzipCompressOptions = {
+  flush: zlib.constants.Z_SYNC_FLUSH,
+  // Compression must use Z_FINISH so the gzip trailer (CRC + size) is written; otherwise
+  // gunzip fails with "unexpected end of file" when decoding layered encoding (e.g. gzip, br).
+  finishFlush: zlib.constants.Z_FINISH,
+  level: zlib.constants.Z_BEST_SPEED,
+}
 
-  debug('inferred charset from response %o', { httpCharset })
-  if (iconv.encodingExists(httpCharset)) {
-    return httpCharset
+// Brotli decompression: use BROTLI_OPERATION_FLUSH for lenient decompression of truncated or
+// slightly invalid brotli from upstream (same rationale as zlibGzipDecompressOptions for createGunzip).
+const zlibBrotliDecompressOptions = {
+  flush: zlib.constants.BROTLI_OPERATION_FLUSH,
+  finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH,
+}
+
+const zlibBrotliCompressOptions = {
+  flush: zlib.constants.BROTLI_OPERATION_FLUSH,
+  finishFlush: zlib.constants.BROTLI_OPERATION_FINISH,
+  params: {
+    // Brotli default quality is 11 (slowest). Use quality 1 for fast re-compression in the proxy.
+    [zlib.constants.BROTLI_PARAM_QUALITY]: 1,
+  },
+}
+
+type SupportedContentEncoding = 'gzip' | 'br'
+
+/**
+ * Returns the content-encoding list in application order (first = applied first = innermost).
+ * Only includes encodings we support (gzip, br). Used so we decompress in reverse order
+ * and re-compress in the same order, preserving layered encoding semantics per RFC 7230.
+ */
+function getOrderedContentEncodings (res: IncomingMessage): SupportedContentEncoding[] {
+  const raw = (res.headers['content-encoding'] || '').toLowerCase()
+
+  if (!raw) return []
+
+  const order: SupportedContentEncoding[] = []
+
+  for (const part of raw.split(',')) {
+    const token = part.trim()
+    const enc = token === 'x-gzip' ? 'gzip' : token
+
+    if ((enc === 'gzip' || enc === 'br') && !order.includes(enc)) {
+      order.push(enc)
+    }
   }
 
-  // browsers default to latin1
-  return 'latin1'
+  return order
 }
 
-function reqMatchesOriginPolicy (req: CypressIncomingRequest, remoteState) {
-  if (remoteState.strategy === 'http') {
-    return cors.urlMatchesOriginPolicyProps(req.proxiedUrl, remoteState.props)
-  }
-
-  if (remoteState.strategy === 'file') {
-    return req.proxiedUrl.startsWith(remoteState.origin)
-  }
-
-  return false
+// Whether `domain` is an IPv6 literal, with or without the surrounding brackets.
+function isIPv6Host (domain: string): boolean {
+  return !!domain && isIP(domain.replace(/^\[|\]$/g, '')) === 6
 }
 
-function reqWillRenderHtml (req: CypressIncomingRequest) {
-  // will this request be rendered in the browser, necessitating injection?
-  // https://github.com/cypress-io/cypress/issues/288
-
-  // don't inject if this is an XHR from jquery
-  if (req.headers['x-requested-with']) {
-    return
-  }
-
-  // don't inject if we didn't find both text/html and application/xhtml+xml,
-  const accept = req.headers['accept']
-
-  return accept && accept.includes('text/html') && accept.includes('application/xhtml+xml')
-}
-
-function resContentTypeIs (res: IncomingMessage, contentType: string) {
-  return (res.headers['content-type'] || '').includes(contentType)
-}
-
-function resContentTypeIsJavaScript (res: IncomingMessage) {
-  return _.some(
-    ['application/javascript', 'application/x-javascript', 'text/javascript']
-    .map(_.partial(resContentTypeIs, res)),
-  )
-}
-
-function isHtml (res: IncomingMessage) {
-  return !resContentTypeIsJavaScript(res)
-}
-
-function resIsGzipped (res: IncomingMessage) {
-  return (res.headers['content-encoding'] || '').includes('gzip')
-}
-
-function setCookie (res: CypressOutgoingResponse, k: string, v: string, domain: string) {
-  let opts: CookieOptions = { domain }
+function setCookie (res: CypressOutgoingResponseLike, k: string, v: string, domain: string) {
+  // `cookie`'s serializer rejects an IPv6 literal Domain (e.g. `[::1]`), crashing
+  // the proxy. Browsers scope cookies for IP hosts to that host anyway, so omit
+  // Domain and let the cookie default to host-only. See #34143.
+  const opts: CookieOptions = isIPv6Host(domain) ? {} : { domain }
 
   if (!v) {
     v = ''
@@ -104,7 +146,7 @@ function setCookie (res: CypressOutgoingResponse, k: string, v: string, domain: 
   return res.cookie(k, v, opts)
 }
 
-function setInitialCookie (res: CypressOutgoingResponse, remoteState: any, value) {
+function setInitialCookie (res: CypressOutgoingResponseLike, remoteState: any, value) {
   // dont modify any cookies if we're trying to clear the initial cookie and we're not injecting anything
   // dont set the cookies if we're not on the initial request
   if ((!value && !res.wantsInjection) || !res.isInitial) {
@@ -112,6 +154,29 @@ function setInitialCookie (res: CypressOutgoingResponse, remoteState: any, value
   }
 
   return setCookie(res, '__cypress.initial', value, remoteState.domainName)
+}
+
+// The `__cypress.unload` cookie is set browser-side on the runner's
+// `beforeunload` so the proxy can redirect a navigation back to the client
+// route if the primary app is navigated away from directly. It is meant to be
+// cleared on the corresponding `unload`/`pagehide` event, but that event is
+// unreliable (especially `unload` in Firefox), so under load the cookie can
+// linger past a super-domain reload. A stale flag then causes
+// `RedirectToClientRouteIfUnloaded` to bounce a later primary-origin
+// navigation (e.g. a cy.origin login redirect) to the client route, leaving
+// the AUT stranded and failing the test.
+//
+// Whenever we serve an injected app document the primary app is loading -
+// definitively NOT in the "navigated away" state the flag exists to recover
+// from - so the flag is stale and is expired here. The genuine
+// "navigated away" recovery is a redirect handled in the request middleware and
+// never reaches response injection, so clearing here cannot undermine it.
+function clearUnloadCookie (res: CypressOutgoingResponseLike, remoteState: any) {
+  if (!res.wantsInjection) {
+    return
+  }
+
+  return setCookie(res, '__cypress.unload', '', remoteState.domainName)
 }
 
 // "autoplay *; document-domain 'none'" => { autoplay: "*", "document-domain": "'none'" }
@@ -129,7 +194,8 @@ const stringifyFeaturePolicy = (policy: any): string => {
 }
 
 const LogResponse: ResponseMiddleware = function () {
-  debug('received response %o', {
+  this.debug('received response %o', {
+    browserPreRequest: _.pick(this.req.browserPreRequest, 'requestId'),
     req: _.pick(this.req, 'method', 'proxiedUrl', 'headers'),
     incomingRes: _.pick(this.incomingRes, 'headers', 'statusCode'),
   })
@@ -137,19 +203,73 @@ const LogResponse: ResponseMiddleware = function () {
   this.next()
 }
 
+const FilterNonProxiedResponse: ResponseMiddleware = function () {
+  // if the request is from an extra target (i.e. not the main Cypress tab, but
+  // an extra tab/window), we want to skip any manipulation of the response and
+  // only run the middleware necessary to get it back to the browser
+  if (this.req.isFromExtraTarget) {
+    this.debug('response for [%s %s] is from extra target', this.req.method, this.req.proxiedUrl)
+
+    // this is normally done in the OmitProblematicHeaders middleware, but we
+    // don't want to omit any headers in this case
+    this.res.set(this.incomingRes.headers)
+
+    this.onlyRunMiddleware([
+      'AttachPlainTextStreamFn',
+      'PatchExpressSetHeader',
+      'MaybeSendRedirectToClient',
+      'CopyResponseStatusCode',
+      'MaybeEndWithEmptyBody',
+      'NotifyResponseStreamReceived',
+      'CompressBody',
+      'SendResponseBodyToClient',
+    ])
+  }
+
+  this.next()
+}
+
 const AttachPlainTextStreamFn: ResponseMiddleware = function () {
   this.makeResStreamPlainText = function () {
-    debug('ensuring resStream is plaintext')
+    const span = telemetry.startSpan({ name: 'make:res:stream:plain:text', parentSpan: this.resMiddlewareSpan, isVerbose })
 
-    if (!this.isGunzipped && resIsGzipped(this.incomingRes)) {
-      debug('gunzipping response body')
+    this.debug('ensuring resStream is plaintext')
 
-      const gunzip = zlib.createGunzip(zlibOptions)
+    // RFC 7230: content-encoding lists encodings in application order (first = innermost).
+    // Decompress in reverse order (outermost first) so we respect layered encoding.
+    const order = getOrderedContentEncodings(this.incomingRes)
 
-      this.incomingResStream = this.incomingResStream.pipe(gunzip).on('error', this.onError)
+    this.contentEncodingOrder = order
 
-      this.isGunzipped = true
+    span?.setAttributes({
+      isResGunzupped: order.includes('gzip'),
+      isResBrotli: order.includes('br'),
+    })
+
+    // Decompress outermost first: reverse order (e.g. "gzip, br" → un-br then un-gzip).
+    for (let i = order.length - 1; i >= 0; i--) {
+      const enc = order[i]
+
+      if (enc === 'gzip' && !this.isGunzipped) {
+        this.debug('gunzipping response body')
+
+        const gunzip = zlib.createGunzip(zlibGzipDecompressOptions)
+
+        this.incomingResStream = this.incomingResStream.pipe(gunzip).on('error', this.onError)
+
+        this.isGunzipped = true
+      } else if (enc === 'br' && !this.isBrotliDecompressed) {
+        this.debug('decompressing Brotli response body')
+
+        const brotliDecompress = zlib.createBrotliDecompress(zlibBrotliDecompressOptions)
+
+        this.incomingResStream = this.incomingResStream.pipe(brotliDecompress).on('error', this.onError)
+
+        this.isBrotliDecompressed = true
+      }
     }
+
+    span?.end()
   }
 
   this.next()
@@ -189,6 +309,8 @@ const PatchExpressSetHeader: ResponseMiddleware = function () {
 
   let kOutHeaders
 
+  const ctxDebug = this.debug
+
   this.res.setHeader = function (name, value) {
     // express.Response.setHeader does all kinds of silly/nasty stuff to the content-type...
     // but we don't want to change it at all!
@@ -205,7 +327,7 @@ const PatchExpressSetHeader: ResponseMiddleware = function () {
         throw err
       }
 
-      debug('setHeader error ignored %o', { name, value, code: err.code, err })
+      ctxDebug('setHeader error ignored %o', { name, value, code: err.code, err })
 
       if (!kOutHeaders) {
         kOutHeaders = getKOutHeadersSymbol()
@@ -219,60 +341,131 @@ const PatchExpressSetHeader: ResponseMiddleware = function () {
       }
 
       headers[name.toLowerCase()] = [name, value]
+
+      return this
     }
   }
 
   this.next()
 }
 
-const SetInjectionLevel: ResponseMiddleware = function () {
-  this.res.isInitial = this.req.cookies['__cypress.initial'] === 'true'
+const OmitProblematicHeaders: ResponseMiddleware = function () {
+  const span = telemetry.startSpan({ name: 'omit:problematic:header', parentSpan: this.resMiddlewareSpan, isVerbose })
 
-  const isRenderedHTML = reqWillRenderHtml(this.req)
+  this.incomingResHadEmptyBody = this.incomingRes.headers['content-length'] === '0'
 
-  if (isRenderedHTML) {
-    const origin = new URL(this.req.proxiedUrl).origin
+  const headers = _.omit(this.incomingRes.headers, [
+    'set-cookie',
+    'x-frame-options',
+    'content-length',
+    'transfer-encoding',
+    'connection',
+  ])
 
-    this.getRenderedHTMLOrigins()[origin] = true
-  }
+  this.debug('The headers are %o', headers)
 
-  const isReqMatchOriginPolicy = reqMatchesOriginPolicy(this.req, this.getRemoteState())
-  const getInjectionLevel = () => {
-    if (this.incomingRes.headers['x-cypress-file-server-error'] && !this.res.isInitial) {
-      return 'partial'
-    }
+  // Filter for invalid headers
+  const filteredHeaders = Object.fromEntries(
+    Object.entries(headers).filter(([key, value]) => {
+      try {
+        validateHeaderName(key)
+        if (Array.isArray(value)) {
+          value.forEach((v) => validateHeaderValue(key, v))
+        } else if (value !== undefined) {
+          validateHeaderValue(key, value)
+        } else {
+          error.warning('PROXY_ENCOUNTERED_INVALID_HEADER_VALUE', { [key]: value }, this.req.method, this.req.originalUrl, new TypeError('Header value is undefined while expecting string'))
 
-    if (!resContentTypeIs(this.incomingRes, 'text/html') || !isReqMatchOriginPolicy) {
-      return false
-    }
+          return false
+        }
 
-    if (this.res.isInitial) {
-      return 'full'
-    }
+        return true
+      } catch (err) {
+        if (err.code === 'ERR_INVALID_HTTP_TOKEN') {
+          error.warning('PROXY_ENCOUNTERED_INVALID_HEADER_NAME', { [key]: value }, this.req.method, this.req.originalUrl, err)
+        } else if (err.code === 'ERR_INVALID_CHAR') {
+          error.warning('PROXY_ENCOUNTERED_INVALID_HEADER_VALUE', { [key]: value }, this.req.method, this.req.originalUrl, err)
+        } else {
+          // rethrow any other errors
+          throw err
+        }
 
-    if (!isRenderedHTML) {
-      return false
-    }
-
-    return 'partial'
-  }
-
-  if (!this.res.wantsInjection) {
-    this.res.wantsInjection = getInjectionLevel()
-  }
-
-  this.res.wantsSecurityRemoved = this.config.modifyObstructiveCode && isReqMatchOriginPolicy && (
-    (this.res.wantsInjection === 'full')
-    || resContentTypeIsJavaScript(this.incomingRes)
+        return false
+      }
+    }),
   )
 
-  debug('injection levels: %o', _.pick(this.res, 'isInitial', 'wantsInjection', 'wantsSecurityRemoved'))
+  this.res.set(filteredHeaders)
+
+  this.debug('the new response headers are %o', this.res.getHeaderNames())
+
+  span?.setAttributes({
+    experimentalCspAllowList: this.config.experimentalCspAllowList,
+  })
+
+  if (this.config.experimentalCspAllowList) {
+    const allowedDirectives = this.config.experimentalCspAllowList === true ? [] : this.config.experimentalCspAllowList as Cypress.experimentalCspAllowedDirectives[]
+
+    // If the user has specified CSP directives to allow, we must not remove them from the CSP headers
+    const stripDirectives = [...unsupportedCSPDirectives, ...problematicCspDirectives.filter((directive) => !allowedDirectives.includes(directive))]
+
+    // Iterate through each CSP header
+    cspHeaderNames.forEach((headerName) => {
+      const modifiedCspHeaders = parseCspHeaders(this.incomingRes.headers, headerName, stripDirectives)
+      .map(generateCspDirectives)
+      .filter(Boolean)
+
+      if (modifiedCspHeaders.length === 0) {
+        // If there are no CSP policies after stripping directives, we will remove it from the response
+        // Altering the CSP headers using the native response header methods is case-insensitive
+        this.res.removeHeader(headerName)
+      } else {
+        // To replicate original response CSP headers, we must apply all header values as an array
+        this.res.setHeader(headerName, modifiedCspHeaders)
+      }
+    })
+  } else {
+    cspHeaderNames.forEach((headerName) => {
+      // Altering the CSP headers using the native response header methods is case-insensitive
+      this.res.removeHeader(headerName)
+    })
+  }
+
+  span?.end()
 
   this.next()
+}
+
+const MaybeSetOriginAgentClusterHeader: ResponseMiddleware = function () {
+  if (process.env.CYPRESS_INTERNAL_E2E_TESTING_SELF_PARENT_PROJECT) {
+    const origin = new URL(this.req.proxiedUrl).origin
+
+    if (process.env.HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS && process.env.HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS === origin) {
+      // For cypress-in-cypress tests exclusively, we need to bucket all origin-agent-cluster requests
+      // from HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS to include Origin-Agent-Cluster=false. This has to do with changed
+      // behavior starting in Chrome 119. The new behavior works like the following:
+      //    - If the first page from an origin does not set the header,
+      //      then no other pages from that origin will be origin-keyed, even if those other pages do set the header.
+      //    - If the first page from an origin sets the header and is made origin-keyed,
+      //      then all other pages from that origin will be origin-keyed whether they ask for it or not.
+      // To work around this, any request that matches the origin of HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS
+      // should set the Origin-Agent-Cluster=false header to avoid origin-keyed agent clusters.
+      // @see https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Origin-Agent-Cluster for more details.
+      this.res.setHeader('Origin-Agent-Cluster', '?0')
+    }
+  }
+
+  this.next()
+}
+
+const SetInjectionLevel: ResponseMiddleware = async function () {
+  return this.networkInterceptionCore.setInjectionLevel(this)
 }
 
 // https://github.com/cypress-io/cypress/issues/6480
 const MaybeStripDocumentDomainFeaturePolicy: ResponseMiddleware = function () {
+  const span = telemetry.startSpan({ name: 'maybe:strip:document:domain:feature:policy', parentSpan: this.resMiddlewareSpan, isVerbose })
+
   const { 'feature-policy': featurePolicy } = this.incomingRes.headers
 
   if (featurePolicy) {
@@ -283,6 +476,10 @@ const MaybeStripDocumentDomainFeaturePolicy: ResponseMiddleware = function () {
 
       const policy = stringifyFeaturePolicy(directives)
 
+      span?.setAttributes({
+        isFeaturePolicy: !!policy,
+      })
+
       if (policy) {
         this.res.set('feature-policy', policy)
       } else {
@@ -291,22 +488,7 @@ const MaybeStripDocumentDomainFeaturePolicy: ResponseMiddleware = function () {
     }
   }
 
-  this.next()
-}
-
-const OmitProblematicHeaders: ResponseMiddleware = function () {
-  const headers = _.omit(this.incomingRes.headers, [
-    'set-cookie',
-    'x-frame-options',
-    'content-length',
-    'transfer-encoding',
-    'content-security-policy',
-    'content-security-policy-report-only',
-    'connection',
-  ])
-
-  this.res.set(headers)
-
+  span?.end()
   this.next()
 }
 
@@ -320,146 +502,215 @@ const MaybePreventCaching: ResponseMiddleware = function () {
   this.next()
 }
 
-const CopyCookiesFromIncomingRes: ResponseMiddleware = function () {
-  const cookies: string | string[] | undefined = this.incomingRes.headers['set-cookie']
-
-  if (cookies) {
-    ([] as string[]).concat(cookies).forEach((cookie) => {
-      try {
-        this.res.append('Set-Cookie', cookie)
-      } catch (err) {
-        debug('failed to Set-Cookie, continuing %o', { err, cookie })
-      }
-    })
-  }
-
-  this.next()
+const MaybeCopyCookiesFromIncomingRes: ResponseMiddleware = async function () {
+  return this.networkInterceptionCore.copyCookiesFromResponse(this)
 }
 
-const REDIRECT_STATUS_CODES: any[] = [301, 302, 303, 307, 308]
-
 // TODO: this shouldn't really even be necessary?
-const MaybeSendRedirectToClient: ResponseMiddleware = function () {
+const MaybeSendRedirectToClient: ResponseMiddleware = async function () {
+  const span = telemetry.startSpan({ name: 'maybe:send:redirect:to:client', parentSpan: this.resMiddlewareSpan, isVerbose })
+
   const { statusCode, headers } = this.incomingRes
   const newUrl = headers['location']
 
-  if (!REDIRECT_STATUS_CODES.includes(statusCode) || !newUrl) {
+  const isRedirectNeeded = !isRedirectStatus(statusCode) || !newUrl
+
+  span?.setAttributes({
+    isRedirectNeeded,
+  })
+
+  if (isRedirectNeeded) {
+    span?.end()
+
     return this.next()
   }
 
-  setInitialCookie(this.res, this.getRemoteState(), true)
+  // If we're redirecting from a request that doesn't expect to have a preRequest (e.g. download links), we need to treat the redirected url as such as well.
+  if (this.req.noPreRequestExpected) {
+    this.addPendingUrlWithoutPreRequest(newUrl)
+  }
 
-  debug('redirecting to new url %o', { statusCode, newUrl })
+  setInitialCookie(this.res, this.remoteStates.current(), true)
+
+  this.debug('redirecting to new url %o', { statusCode, newUrl })
+  span?.end()
+
   this.res.redirect(Number(statusCode), newUrl)
-
-  return this.end()
+  this.end()
 }
 
 const CopyResponseStatusCode: ResponseMiddleware = function () {
   this.res.status(Number(this.incomingRes.statusCode))
+  // Set custom status message/reason phrase from http response
+  // https://github.com/cypress-io/cypress/issues/16973
+  if (this.incomingRes.statusMessage) {
+    this.res.statusMessage = this.incomingRes.statusMessage
+  }
+
   this.next()
 }
 
 const ClearCyInitialCookie: ResponseMiddleware = function () {
-  setInitialCookie(this.res, this.getRemoteState(), false)
+  setInitialCookie(this.res, this.remoteStates.current(), false)
+  clearUnloadCookie(this.res, this.remoteStates.current())
   this.next()
 }
 
-const MaybeEndWithEmptyBody: ResponseMiddleware = function () {
+const MaybeEndWithEmptyBody: ResponseMiddleware = async function () {
   if (httpUtils.responseMustHaveEmptyBody(this.req, this.incomingRes)) {
-    this.res.end()
+    this.networkInterceptionCore.notifyResponseEndedWithEmptyBody(this, {
+      isCached: this.incomingRes.statusCode === 304,
+    })
 
-    return this.end()
+    this.res.end()
+    this.end()
+
+    return
+  }
+
+  // When the origin response declared `Content-Length: 0`, short-circuit with an
+  // explicit Content-Length: 0 instead of streaming an empty body — otherwise
+  // OmitProblematicHeaders has stripped Content-Length and Node's HTTP layer
+  // adds `Transfer-Encoding: chunked`, which breaks clients that assume a
+  // response for chunked encoding. See cypress-io/cypress#16469.
+  // Skip when downstream middleware will rewrite the body or when a cy.intercept
+  // route matched (the interceptor may have replaced the body without updating
+  // the upstream Content-Length header).
+  const wasIntercepted = !!this.netStubbingState?.requests?.[this.req.requestId]
+
+  if (
+    this.incomingResHadEmptyBody
+    && !wasIntercepted
+    && !this.res.wantsInjection
+    && !this.res.wantsSecurityRemoved
+  ) {
+    this.networkInterceptionCore.notifyResponseEndedWithEmptyBody(this, { isCached: false })
+
+    this.res.setHeader('Content-Length', '0')
+    this.res.end()
+    this.end()
+
+    return
   }
 
   this.next()
 }
 
-const MaybeInjectHtml: ResponseMiddleware = function () {
-  if (!this.res.wantsInjection) {
-    return this.next()
-  }
-
-  this.skipMiddleware('MaybeRemoveSecurity') // we only want to do one or the other
-
-  debug('injecting into HTML')
-
-  this.makeResStreamPlainText()
-
-  this.incomingResStream.pipe(concatStream(async (body) => {
-    const nodeCharset = getNodeCharsetFromResponse(this.incomingRes.headers, body)
-    const decodedBody = iconv.decode(body, nodeCharset)
-    const injectedBody = await rewriter.html(decodedBody, {
-      domainName: this.getRemoteState().domainName,
-      wantsInjection: this.res.wantsInjection,
-      wantsSecurityRemoved: this.res.wantsSecurityRemoved,
-      isHtml: isHtml(this.incomingRes),
-      useAstSourceRewriting: this.config.experimentalSourceRewriting,
-      url: this.req.proxiedUrl,
-      deferSourceMapRewrite: this.deferSourceMapRewrite,
-    })
-    const encodedBody = iconv.encode(injectedBody, nodeCharset)
-
-    const pt = new PassThrough
-
-    pt.write(encodedBody)
-    pt.end()
-
-    this.incomingResStream = pt
-    this.next()
-  })).on('error', this.onError)
+const MaybeInjectHtml: ResponseMiddleware = async function () {
+  return this.networkInterceptionCore.injectHtml(this)
 }
 
-const MaybeRemoveSecurity: ResponseMiddleware = function () {
-  if (!this.res.wantsSecurityRemoved) {
+const MaybeRemoveSecurity: ResponseMiddleware = async function () {
+  return this.networkInterceptionCore.removeSecurity(this)
+}
+
+const MaybeInjectServiceWorker: ResponseMiddleware = function () {
+  const span = telemetry.startSpan({ name: 'maybe:inject:service:worker', parentSpan: this.resMiddlewareSpan, isVerbose })
+  const hasHeader = hasServiceWorkerHeader(this.req.headers)
+
+  span?.setAttributes({ hasServiceWorkerHeader: hasHeader })
+
+  // skip if we don't have the header or we're not in chromium
+  if (!hasHeader || this.getCurrentBrowser().family !== 'chromium') {
+    span?.end()
+
     return this.next()
   }
-
-  debug('removing JS framebusting code')
 
   this.makeResStreamPlainText()
 
   this.incomingResStream.setEncoding('utf8')
-  this.incomingResStream = this.incomingResStream.pipe(rewriter.security({
-    isHtml: isHtml(this.incomingRes),
-    useAstSourceRewriting: this.config.experimentalSourceRewriting,
-    url: this.req.proxiedUrl,
-    deferSourceMapRewrite: this.deferSourceMapRewrite,
-  })).on('error', this.onError)
 
-  this.next()
+  this.incomingResStream.pipe(concatStream(async (body) => {
+    const updatedBody = injectIntoServiceWorker(body, {
+      disableServiceWorkerNavigationPreload: this.useBrowserNetworkInterception,
+      reservedPathPrefixes: this.useBrowserNetworkInterception ? this.reservedPathPrefixes : undefined,
+    })
+
+    const pt = new PassThrough
+
+    pt.write(updatedBody)
+    pt.end()
+
+    this.incomingResStream = pt
+
+    this.next()
+  })).on('error', this.onError).once('close', () => {
+    span?.end()
+  })
 }
 
-const GzipBody: ResponseMiddleware = function () {
-  if (this.isGunzipped) {
-    debug('regzipping response body')
-    this.incomingResStream = this.incomingResStream.pipe(zlib.createGzip(zlibOptions)).on('error', this.onError)
+const NotifyResponseStreamReceived: ResponseMiddleware = function () {
+  return this.networkInterceptionCore.notifyResponseStreamReceived(this)
+}
+
+const CompressBody: ResponseMiddleware = function () {
+  // Re-compress in the same order as the original content-encoding (innermost first).
+  const order = this.contentEncodingOrder ?? []
+
+  for (const enc of order) {
+    if (enc === 'gzip' && this.isGunzipped) {
+      this.debug('regzipping response body')
+
+      const span = telemetry.startSpan({ name: 'gzip:body', parentSpan: this.resMiddlewareSpan, isVerbose })
+
+      this.incomingResStream = this.incomingResStream
+      .pipe(zlib.createGzip(zlibGzipCompressOptions))
+      .on('error', this.onError)
+      .once('close', () => {
+        span?.end()
+      })
+    } else if (enc === 'br' && this.isBrotliDecompressed) {
+      this.debug('re-compressing Brotli response body')
+
+      const span = telemetry.startSpan({ name: 'brotli:body', parentSpan: this.resMiddlewareSpan, isVerbose })
+
+      this.incomingResStream = this.incomingResStream
+      .pipe(zlib.createBrotliCompress(zlibBrotliCompressOptions))
+      .on('error', this.onError)
+      .once('close', () => {
+        span?.end()
+      })
+    }
   }
 
   this.next()
 }
 
 const SendResponseBodyToClient: ResponseMiddleware = function () {
+  if (this.req.isAUTFrame) {
+    // track the previous AUT request URL so we know if the next requests
+    // is cross-origin
+    this.setAUTUrl(this.req.proxiedUrl)
+  }
+
   this.incomingResStream.pipe(this.res).on('error', this.onError)
-  this.res.on('end', () => this.end())
+
+  this.res.once('finish', () => {
+    this.end()
+  })
 }
 
 export default {
   LogResponse,
+  FilterNonProxiedResponse,
   AttachPlainTextStreamFn,
   InterceptResponse,
   PatchExpressSetHeader,
+  OmitProblematicHeaders, // Since we might modify CSP headers, this middleware needs to come BEFORE SetInjectionLevel
+  MaybeSetOriginAgentClusterHeader, // NOTE: only used in cypress-in-cypress testing. this is otherwise a no-op
   SetInjectionLevel,
-  OmitProblematicHeaders,
   MaybePreventCaching,
   MaybeStripDocumentDomainFeaturePolicy,
-  CopyCookiesFromIncomingRes,
+  MaybeCopyCookiesFromIncomingRes,
   MaybeSendRedirectToClient,
   CopyResponseStatusCode,
   ClearCyInitialCookie,
   MaybeEndWithEmptyBody,
   MaybeInjectHtml,
   MaybeRemoveSecurity,
-  GzipBody,
+  MaybeInjectServiceWorker,
+  NotifyResponseStreamReceived,
+  CompressBody,
   SendResponseBodyToClient,
 }

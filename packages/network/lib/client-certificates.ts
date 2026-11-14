@@ -1,10 +1,10 @@
 import type { Url } from 'url'
+import { URL } from 'url'
 import debugModule from 'debug'
 import minimatch from 'minimatch'
-import Forge from 'node-forge'
 import fs from 'fs-extra'
-import { clientCertificateStore } from './agent'
-const { pki, asn1, pkcs12, util } = Forge
+import { X509Certificate, createPrivateKey } from 'crypto'
+import tls from 'tls'
 
 const debug = debugModule('cypress:network:client-certificates')
 
@@ -15,7 +15,7 @@ export class ParsedUrl {
       this.path = undefined
       this.port = undefined
     } else {
-      let parsed = new URL(url)
+      const parsed = new URL(url)
 
       this.host = parsed.hostname
       this.port = !parsed.port ? undefined : parseInt(parsed.port)
@@ -36,11 +36,11 @@ export class ParsedUrl {
     this.pathMatcher = new minimatch.Minimatch(this.path ?? '')
   }
 
-  path: string | undefined;
-  host: string;
-  port: number | undefined;
-  hostMatcher: minimatch.IMinimatch;
-  pathMatcher: minimatch.IMinimatch;
+  path: string | undefined
+  host: string
+  port: number | undefined
+  hostMatcher: minimatch.IMinimatch
+  pathMatcher: minimatch.IMinimatch
 }
 
 export class UrlMatcher {
@@ -60,7 +60,7 @@ export class UrlMatcher {
     }
 
     if (ret && rule.path) {
-      ret = rule.pathMatcher?.match(path ?? '')
+      ret = rule.pathMatcher.match(path ?? '')
     }
 
     return ret
@@ -72,24 +72,15 @@ export class UrlMatcher {
  */
 export class UrlClientCertificates {
   constructor (url: string) {
-    this.subjects = ''
     this.url = url
     this.pathnameLength = new URL(url).pathname.length
     this.clientCertificates = new ClientCertificates()
   }
-  clientCertificates: ClientCertificates;
-  url: string;
-  subjects: string;
-  pathnameLength: number;
-  matchRule: ParsedUrl | undefined;
 
-  addSubject (subject: string) {
-    if (!this.subjects) {
-      this.subjects = subject
-    } else {
-      this.subjects = `${this.subjects} - ${subject}`
-    }
-  }
+  clientCertificates: ClientCertificates
+  url: string
+  pathnameLength: number
+  matchRule: ParsedUrl | undefined
 }
 
 /**
@@ -97,10 +88,10 @@ export class UrlClientCertificates {
  * at https://nodejs.org/api/tls.html#tls_tls_createsecurecontext_options
  */
 export class ClientCertificates {
-  ca: Buffer[] = [];
-  cert: Buffer[] = [];
-  key: PemKey[] = [];
-  pfx: PfxCertificate[] = [];
+  ca: Buffer[] = []
+  cert: Buffer[] = []
+  key: PemKey[] = []
+  pfx: PfxCertificate[] = []
 }
 
 export class PemKey {
@@ -109,8 +100,8 @@ export class PemKey {
     this.passphrase = passphrase
   }
 
-  pem: Buffer;
-  passphrase: string | undefined;
+  pem: Buffer
+  passphrase: string | undefined
 }
 
 export class PfxCertificate {
@@ -119,12 +110,12 @@ export class PfxCertificate {
     this.passphrase = passphrase
   }
 
-  buf: Buffer;
-  passphrase: string | undefined;
+  buf: Buffer
+  passphrase: string | undefined
 }
 
 export class ClientCertificateStore {
-  private _urlClientCertificates: UrlClientCertificates[] = [];
+  private _urlClientCertificates: UrlClientCertificates[] = []
 
   addClientCertificatesForUrl (cert: UrlClientCertificates) {
     debug(
@@ -143,10 +134,7 @@ export class ClientCertificateStore {
   }
 
   getClientCertificateAgentOptionsForUrl (requestUrl: Url): ClientCertificates | null {
-    if (
-      !this._urlClientCertificates ||
-      this._urlClientCertificates.length === 0
-    ) {
+    if (this._urlClientCertificates.length === 0) {
       return null
     }
 
@@ -155,32 +143,34 @@ export class ClientCertificateStore {
       return UrlMatcher.matchUrl(requestUrl.hostname, requestUrl.path, port, cert.matchRule)
     })
 
-    switch (matchingCerts.length) {
-      case 0:
-        debug(`not using client certificate(s) for url '${requestUrl.href}'`)
+    if (matchingCerts.length === 0) {
+      debug(`not using client certificate(s) for url '${requestUrl.href}'`)
 
-        return null
-      case 1:
-        debug(
-          `using client certificate(s) '${matchingCerts[0].subjects}' for url '${requestUrl.href}'`,
-        )
-
-        return matchingCerts[0].clientCertificates
-      default:
-        matchingCerts.sort((a, b) => {
-          return b.pathnameLength - a.pathnameLength
-        })
-
-        debug(
-          `using client certificate(s) '${matchingCerts[0].subjects}' for url '${requestUrl.href}'`,
-        )
-
-        return matchingCerts[0].clientCertificates
+      return null
     }
+
+    // the longest matching path is the most specific rule, so it wins
+    matchingCerts.sort((a, b) => b.pathnameLength - a.pathnameLength)
+
+    debug(`using client certificate(s) for url '${requestUrl.href}'`)
+
+    return matchingCerts[0].clientCertificates
   }
 
-  getCertCount (): Number {
-    return !this._urlClientCertificates ? 0 : this._urlClientCertificates.length
+  /**
+   * Material for one configured URL, matched exactly.
+   *
+   * Distinct from the per-request lookup above, which applies the matcher rules. A caller
+   * that already holds a configured URL must not round-trip it through those rules: a
+   * path-scoped entry does not match its own URL once `ParsedUrl` has normalized the path,
+   * and the entry would be silently dropped.
+   */
+  getClientCertificatesForConfiguredUrl (url: string): ClientCertificates | null {
+    return this._urlClientCertificates.find((x) => x.url === url)?.clientCertificates ?? null
+  }
+
+  getCertCount (): number {
+    return this._urlClientCertificates.length
   }
 
   clear (): void {
@@ -188,19 +178,40 @@ export class ClientCertificateStore {
   }
 }
 
+export const clientCertificateStoreSingleton = new ClientCertificateStore()
+
 /**
  * Load and parse the client certificate configuration.  The structure and content of this
  * has already been validated; this function reads cert content from file and adds it to the
  * network ClientCertificateStore
  * @param config
  */
-export function loadClientCertificateConfig (config) {
+
+type Config = {
+  // not read here, but it keeps `Config` from being a weak type that no caller
+  // structurally matches — every caller passes a full Cypress config
+  projectRoot: string
+  // optional exactly where the public `ClientCertificate` type is: an entry supplies PEM
+  // or PFX, not both, and the loader below guards each field
+  clientCertificates?: Array<{
+    url: string
+    ca?: string[]
+    certs: Array<{
+      cert?: string
+      key?: string
+      passphrase?: string
+      pfx?: string
+    }>
+  }>
+}
+
+export function loadClientCertificateConfig (config: Config) {
   const { clientCertificates } = config
 
   let index = 0
 
   try {
-    clientCertificateStore.clear()
+    clientCertificateStoreSingleton.clear()
 
     // The basic validation of the certificate configuration has already been done by this point
     // within the 'isValidClientCertificatesSet' function within packages/config/src/validation.js
@@ -217,9 +228,11 @@ export function loadClientCertificateConfig (config) {
               const caRaw = loadBinaryFromFile(ca)
 
               try {
-                pki.certificateFromPem(caRaw)
+                // construct to validate; throws on malformed PEM
+
+                new X509Certificate(caRaw)
               } catch (error: any) {
-                throw new Error(`Cannot parse CA cert: ${error.message}`)
+                throw new Error(`Cannot parse CA cert: ${error.message}`, { cause: error })
               }
 
               urlClientCertificates.clientCertificates.ca.push(caRaw)
@@ -247,12 +260,11 @@ export function loadClientCertificateConfig (config) {
 
             debug(`loading PEM cert from '${cert.cert}'`)
             const pemRaw = loadBinaryFromFile(cert.cert)
-            let pemParsed = undefined
 
             try {
-              pemParsed = pki.certificateFromPem(pemRaw)
+              new X509Certificate(pemRaw)
             } catch (error: any) {
-              throw new Error(`Cannot parse PEM cert: ${error.message}`)
+              throw new Error(`Cannot parse PEM cert: ${error.message}`, { cause: error })
             }
 
             urlClientCertificates.clientCertificates.cert.push(pemRaw)
@@ -268,30 +280,34 @@ export function loadClientCertificateConfig (config) {
             const pemKeyRaw = loadBinaryFromFile(cert.key)
 
             try {
-              if (passphrase) {
-                if (!pki.decryptRsaPrivateKey(pemKeyRaw, passphrase)) {
-                  throw new Error(
-                    'Cannot decrypt PEM key with supplied passphrase (check the passphrase file content and that it doesn\'t have unexpected whitespace at the end)',
-                  )
-                }
-              } else {
-                if (!pki.privateKeyFromPem(pemKeyRaw)) {
-                  throw new Error('Cannot load PEM key')
-                }
-              }
+              createPrivateKey({ key: pemKeyRaw, passphrase })
             } catch (error: any) {
-              throw new Error(`Cannot parse PEM key: ${error.message}`)
+              // OpenSSL 3 may surface a wrong passphrase as either ERR_OSSL_BAD_DECRYPT (cipher
+              // padding/MAC check fails) or "DECODER routines::unsupported" (decrypted bytes are
+              // garbage the DER decoder can't classify). Which one fires is data-dependent, so
+              // also treat the DECODER error as a passphrase failure — but only when the key
+              // actually looks like an encrypted PEM, to avoid masking a genuinely malformed key.
+              const isBadDecrypt = error.code === 'ERR_OSSL_BAD_DECRYPT'
+                || (typeof error.message === 'string'
+                  && error.message.includes('DECODER routines::unsupported')
+                  && isEncryptedPemKey(pemKeyRaw))
+
+              if (passphrase && isBadDecrypt) {
+                throw new Error(
+                  `Cannot decrypt PEM key with supplied passphrase (check the passphrase file content and that it doesn't have unexpected whitespace at the end)`,
+                  { cause: error },
+                )
+              }
+
+              throw new Error(`Cannot parse PEM key: ${error.message}`, { cause: error })
             }
 
             urlClientCertificates.clientCertificates.key.push(
               new PemKey(pemKeyRaw, passphrase),
             )
 
-            const subject = extractSubjectFromPem(pemParsed)
-
-            urlClientCertificates.addSubject(subject)
             debug(
-              `loaded client PEM certificate: ${subject} for url: ${urlClientCertificates.url}`,
+              `loaded client PEM certificate for url: ${urlClientCertificates.url}`,
             )
           }
 
@@ -309,27 +325,25 @@ export function loadClientCertificateConfig (config) {
 
             debug(`loading PFX cert from '${cert.pfx}'`)
             const pfxRaw = loadBinaryFromFile(cert.pfx)
-            const pfxParsed = loadPfx(pfxRaw, passphrase)
+
+            loadPfx(pfxRaw, passphrase)
 
             urlClientCertificates.clientCertificates.pfx.push(
               new PfxCertificate(pfxRaw, passphrase),
             )
 
-            const subject = extractSubjectFromPfx(pfxParsed)
-
-            urlClientCertificates.addSubject(subject)
             debug(
-              `loaded client PFX certificate: ${subject} for url: ${urlClientCertificates.url}`,
+              `loaded client PFX certificate for url: ${urlClientCertificates.url}`,
             )
           }
         })
 
-        clientCertificateStore.addClientCertificatesForUrl(urlClientCertificates)
+        clientCertificateStoreSingleton.addClientCertificatesForUrl(urlClientCertificates)
         index++
       })
 
       debug(
-        `loaded client certificates for ${clientCertificateStore.getCertCount()} URL(s)`,
+        `loaded client certificates for ${clientCertificateStoreSingleton.getCertCount()} URL(s)`,
       )
     }
   } catch (e: any) {
@@ -339,6 +353,7 @@ export function loadClientCertificateConfig (config) {
 
     throw new Error(
       `Failed to load client certificates for clientCertificates[${index}]: ${e.message}.  For more debug details run Cypress with DEBUG=cypress:server:client-certificates*`,
+      { cause: e },
     )
   }
 }
@@ -346,52 +361,33 @@ export function loadClientCertificateConfig (config) {
 function loadBinaryFromFile (filepath: string): Buffer {
   debug(`loadCertificateFile: ${filepath}`)
 
+  // TODO: update to async
+  // eslint-disable-next-line no-restricted-syntax
   return fs.readFileSync(filepath)
+}
+
+function isEncryptedPemKey (pem: Buffer): boolean {
+  const text = pem.toString('utf8')
+
+  // PKCS#8 encrypted (`-----BEGIN ENCRYPTED PRIVATE KEY-----`) or a traditional PEM that
+  // declares `Proc-Type: 4,ENCRYPTED` in its headers.
+  return /-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(text)
+    || /Proc-Type:\s*4,ENCRYPTED/i.test(text)
 }
 
 function loadTextFromFile (filepath: string): string {
   debug(`loadPassphraseFile: ${filepath}`)
 
+  // TODO: update to async
+  // eslint-disable-next-line no-restricted-syntax
   return fs.readFileSync(filepath, 'utf8').toString()
 }
 
-/**
- * Extract subject from supplied pem instance
- */
-function extractSubjectFromPem (pem): string {
+function loadPfx (pfx: Buffer, passphrase: string | undefined): void {
   try {
-    return pem.subject.attributes
-    .map((attr) => [attr.shortName, attr.value].join('='))
-    .join(', ')
+    tls.createSecureContext({ pfx, passphrase })
   } catch (e: any) {
-    throw new Error(`Unable to extract subject from PEM file: ${e.message}`)
-  }
-}
-
-/**
- * Load PFX data from the supplied Buffer and passphrase
- */
-function loadPfx (pfx: Buffer, passphrase: string | undefined) {
-  try {
-    const certDer = util.decode64(pfx.toString('base64'))
-    const certAsn1 = asn1.fromDer(certDer)
-
-    return pkcs12.pkcs12FromAsn1(certAsn1, passphrase)
-  } catch (e: any) {
-    debug(`loadPfx fail: ${e.message} ${e.stackTrace}`)
-    throw new Error(`Unable to load PFX file: ${e.message}`)
-  }
-}
-
-/**
- * Extract subject from supplied pfx instance
- */
-function extractSubjectFromPfx (pfx) {
-  try {
-    const certs = pfx.getBags({ bagType: pki.oids.certBag })[pki.oids.certBag].map((item) => item.cert)
-
-    return certs[0].subject.attributes.map((attr) => [attr.shortName, attr.value].join('=')).join(', ')
-  } catch (e: any) {
-    throw new Error(`Unable to extract subject from PFX file: ${e.message}`)
+    debug(`loadPfx fail: ${e.message} ${e.stack}`)
+    throw new Error(`Unable to load PFX file: ${e.message}`, { cause: e })
   }
 }

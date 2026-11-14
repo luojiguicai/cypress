@@ -1,0 +1,8 @@
+{
+  "name": "missing-vite-config",
+  "version": "0.0.0-test",
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vite": "^8.0.9"
+  }
+}

@@ -1,13 +1,21 @@
 import { EventEmitter } from 'events'
 import { action } from 'mobx'
-import appState, { AppState } from './app-state'
-import runnablesStore, { RunnablesStore, RootRunnable, LogProps } from '../runnables/runnables-store'
-import statsStore, { StatsStore, StatsStoreStartInfo } from '../header/stats-store'
-import scroller, { Scroller } from './scroller'
-import TestModel, { UpdatableTestProps, UpdateTestCallback, TestProps } from '../test/test-model'
-import { SessionProps } from '../sessions/sessions-model'
+import type { AppState } from './app-state'
+import appState from './app-state'
+import type { RunnablesStore, LogProps, RootRunnable } from '../runnables/runnables-store'
+import runnablesStore from '../runnables/runnables-store'
+import type { StatsStore } from '../header/stats-store'
+import statsStore from '../header/stats-store'
+import type { Scroller } from './scroller'
+import scroller from './scroller'
+import type { UpdatableTestProps, UpdateTestCallback, TestProps } from '../test/test-model'
+import type Err from '../errors/err-model'
+
+import type { ReporterStartInfo, ReporterRunState } from '@packages/types'
 
 const localBus = new EventEmitter()
+
+type StudioEntrySource = 'welcome' | 'new-test-root' | 'new-test-suite' | 'edit'
 
 interface InitEvent {
   appState: AppState
@@ -17,7 +25,7 @@ interface InitEvent {
 }
 
 export interface Runner {
-  emit: ((event: string, payload?: any) => void)
+  emit(event: string | symbol, ...args: any[]): boolean
   on: ((event: string, action: ((...args: any) => void)) => void)
 }
 
@@ -33,16 +41,7 @@ export interface Events {
   __off: (() => void)
 }
 
-interface StartInfo extends StatsStoreStartInfo {
-  autoScrollingEnabled: boolean
-  scrollTop: number
-  studioActive: boolean
-}
-
-type CollectRunStateCallback = (arg: {
-  autoScrollingEnabled: boolean
-  scrollTop: number
-}) => void
+type CollectRunStateCallback = (arg: ReporterRunState) => void
 
 const events: Events = {
   appState,
@@ -72,10 +71,6 @@ const events: Events = {
       runnablesStore.updateLog(log)
     }))
 
-    runner.on('session:add', action('session:add', (props: SessionProps) => {
-      runnablesStore._withTest(props.testId, (test) => test.addSession(props))
-    }))
-
     runner.on('reporter:log:remove', action('log:remove', (log: LogProps) => {
       runnablesStore.removeLog(log)
     }))
@@ -90,13 +85,16 @@ const events: Events = {
     runner.on('run:start', action('run:start', () => {
       if (runnablesStore.hasTests) {
         appState.startRunning()
+        appState.hasBeenPaused = false
       }
     }))
 
-    runner.on('reporter:start', action('start', (startInfo: StartInfo) => {
+    runner.on('reporter:start', action('start', (startInfo: ReporterStartInfo) => {
       appState.temporarilySetAutoScrolling(startInfo.autoScrollingEnabled)
       runnablesStore.setInitialScrollTop(startInfo.scrollTop)
       appState.setStudioActive(startInfo.studioActive)
+      appState.setStudioSingleTestActive(startInfo.studioSingleTestActive)
+
       if (runnablesStore.hasTests) {
         statsStore.start(startInfo)
       }
@@ -106,10 +104,12 @@ const events: Events = {
       runnablesStore.runnableStarted(runnable)
     }))
 
-    runner.on('test:after:run', action('test:after:run', (runnable: TestProps) => {
-      runnablesStore.runnableFinished(runnable)
+    runner.on('test:after:run', action('test:after:run', (runnable: TestProps, isInteractive: boolean) => {
+      runnablesStore.runnableFinished(runnable, isInteractive)
       if (runnable.final && !appState.studioActive) {
-        statsStore.incrementCount(runnable.state!)
+        // When displaying the overall test status, we want to reference the test outerStatus
+        // as the last runnable (test attempt) may have passed, but the outerStatus might mark the test run as a failure.
+        statsStore.incrementCount(runnable?._cypressTestStatusInfo?.outerStatus || runnable.state!)
       }
     }))
 
@@ -138,6 +138,14 @@ const events: Events = {
       appState.pinnedSnapshotId = null
     }))
 
+    // A pin driven from outside the reporter (e.g. the tap CLI): reflect it the
+    // way a user click would — highlight the command and open its test so the
+    // command (and its pin icon) actually render in the log.
+    runner.on('reporter:snapshot:pinned', action('snapshot:pinned', (testId: string, logId: number | string) => {
+      appState.pinnedSnapshotId = logId
+      runnablesStore.testById(testId)?.setIsOpen(true)
+    }))
+
     localBus.on('resume', action('resume', () => {
       appState.resume()
       statsStore.resume()
@@ -155,58 +163,53 @@ const events: Events = {
       runner.emit('runner:stop')
     }))
 
+    localBus.on('testFilter:cloudDebug:dismiss', () => {
+      runner.emit('testFilter:cloudDebug:dismiss')
+    })
+
     localBus.on('restart', action('restart', () => {
       runner.emit('runner:restart')
     }))
 
-    localBus.on('show:command', (commandId) => {
-      runner.emit('runner:console:log', commandId)
+    localBus.on('show:command', (testId, logId) => {
+      runner.emit('runner:console:log', testId, logId)
     })
 
-    localBus.on('show:error', (test: TestModel) => {
-      const command = test.err.isCommandErr ? test.commandMatchingErr() : null
-
+    localBus.on('show:error', ({ err, testId, commandId }: { err: Err, testId?: string, commandId?: number }) => {
       runner.emit('runner:console:error', {
-        err: test.err,
-        commandId: command?.id,
+        err,
+        testId,
+        logId: commandId,
       })
     })
 
-    localBus.on('show:snapshot', (commandId) => {
-      runner.emit('runner:show:snapshot', commandId)
+    localBus.on('show:snapshot', (testId, logId) => {
+      runner.emit('runner:show:snapshot', testId, logId)
     })
 
-    localBus.on('hide:snapshot', (commandId) => {
-      runner.emit('runner:hide:snapshot', commandId)
+    localBus.on('hide:snapshot', (testId, logId) => {
+      runner.emit('runner:hide:snapshot', testId, logId)
     })
 
-    localBus.on('pin:snapshot', (commandId) => {
-      runner.emit('runner:pin:snapshot', commandId)
+    localBus.on('pin:snapshot', (testId, logId) => {
+      runner.emit('runner:pin:snapshot', testId, logId)
     })
 
-    localBus.on('unpin:snapshot', (commandId) => {
-      runner.emit('runner:unpin:snapshot', commandId)
+    localBus.on('unpin:snapshot', (testId, logId) => {
+      runner.emit('runner:unpin:snapshot', testId, logId)
     })
 
-    localBus.on('focus:tests', () => {
-      runner.emit('focus:tests')
-    })
-
-    localBus.on('get:user:editor', (cb) => {
-      runner.emit('get:user:editor', cb)
-    })
-
-    localBus.on('clear:session', (cb) => {
-      runner.emit('clear:session', cb)
-    })
-
-    localBus.on('set:user:editor', (editor) => {
-      runner.emit('set:user:editor', editor)
+    localBus.on('clear:all:sessions', (cb) => {
+      runner.emit('clear:all:sessions', cb)
     })
 
     localBus.on('save:state', () => {
       runner.emit('save:state', {
-        autoScrollingEnabled: appState.autoScrollingEnabled,
+        // the "autoScrollingEnabled" key in `savedState` stores to the preference value itself, it is not the same as the "autoScrollingEnabled" variable stored in application state, which can be temporarily deactivated
+        autoScrollingEnabled: appState.autoScrollingUserPref,
+        isSpecsListOpen: appState.isSpecsListOpen,
+        showFetchRequests: appState.showFetchRequests,
+        codeEditorLineWrap: appState.codeEditorLineWrap,
       })
     })
 
@@ -214,32 +217,32 @@ const events: Events = {
       runner.emit('external:open', url)
     })
 
+    localBus.on('open:login:connect:modal', (args) => {
+      runner.emit('open:login:connect:modal', args)
+    })
+
     localBus.on('open:file', (fileDetails) => {
       runner.emit('open:file', fileDetails)
     })
 
-    localBus.on('studio:init:test', (testId) => {
-      runner.emit('studio:init:test', testId)
+    localBus.on('open:file:unified', (fileDetails) => {
+      runner.emit('open:file:unified', fileDetails)
     })
 
-    localBus.on('studio:init:suite', (suiteId) => {
-      runner.emit('studio:init:suite', suiteId)
+    localBus.on('studio:init:test', ({ testId }: { testId: string }) => {
+      runner.emit('studio:init:test', { testId })
     })
 
-    localBus.on('studio:remove:command', (commandId) => {
-      runner.emit('studio:remove:command', commandId)
+    localBus.on('studio:init:suite', ({ suiteId, entrySource }: { suiteId: string, entrySource?: StudioEntrySource }) => {
+      runner.emit('studio:init:suite', { suiteId, entrySource })
     })
 
     localBus.on('studio:cancel', () => {
       runner.emit('studio:cancel')
     })
 
-    localBus.on('studio:save', () => {
-      runner.emit('studio:save')
-    })
-
-    localBus.on('studio:copy:to:clipboard', (cb) => {
-      runner.emit('studio:copy:to:clipboard', cb)
+    localBus.on('prompt:get-code', (args: { testId: string, logId: string }) => {
+      runner.emit('prompt:get-code', args)
     })
   },
 

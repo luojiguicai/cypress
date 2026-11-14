@@ -1,72 +1,81 @@
+import { promisify } from 'util'
+import { exec } from 'child_process'
 import gulp from 'gulp'
-import rimraf from 'rimraf'
-import webpack from 'webpack'
-import cypressIcons from '@cypress/icons'
-import webpackConfig from './webpack.config.js'
+import { rimraf } from 'rimraf'
+import { getPathToIcon, getPathToLogo } from '@packages/icons'
 
-const clean = (done) => {
-  rimraf('dist', done)
+const execAsync = promisify(exec)
+
+export async function clean (): Promise<boolean> {
+  const removedAppDist = await rimraf('app-dist')
+  const removedLibDist = await rimraf('lib-dist')
+
+  return removedAppDist && removedLibDist
 }
 
-const manifest = () => {
-  return gulp.src('app/manifest.json')
-  .pipe(gulp.dest('dist'))
+const manifest = (v: 'v2' | 'v3') => {
+  return () => {
+    return gulp.src(`app/${v}/manifest.json`)
+    .pipe(gulp.dest(`app-dist/${v}`))
+  }
 }
 
-const background = (cb) => {
-  const compiler = webpack(webpackConfig as webpack.Configuration)
+const buildAppV2 = async () => {
+  await execAsync('yarn build:v2')
+}
 
-  compiler.run(cb)
+const buildAppV3 = async () => {
+  await execAsync('yarn build:v3')
+}
+
+const buildLib = async () => {
+  await execAsync('yarn build:lib')
 }
 
 const html = () => {
   return gulp.src('app/**/*.html')
-  .pipe(gulp.dest('dist'))
+  .pipe(gulp.dest('app-dist/v2'))
+  .pipe(gulp.dest('app-dist/v3'))
 }
 
 const css = () => {
   return gulp.src('app/**/*.css')
-  .pipe(gulp.dest('dist'))
+  .pipe(gulp.dest('app-dist/v2'))
+  .pipe(gulp.dest('app-dist/v3'))
 }
 
-const icons = () => {
+const icons = async () => {
   return gulp.src([
-    cypressIcons.getPathToIcon('icon_16x16.png'),
-    cypressIcons.getPathToIcon('icon_19x19.png'),
-    cypressIcons.getPathToIcon('icon_38x38.png'),
-    cypressIcons.getPathToIcon('icon_48x48.png'),
-    cypressIcons.getPathToIcon('icon_128x128.png'),
+    getPathToIcon('icon_16x16.png'),
+    getPathToIcon('icon_19x19.png'),
+    getPathToIcon('icon_38x38.png'),
+    getPathToIcon('icon_48x48.png'),
+    getPathToIcon('icon_128x128.png'),
   ])
-  .pipe(gulp.dest('dist/icons'))
+  .pipe(gulp.dest('app-dist/v2/icons'))
+  .pipe(gulp.dest('app-dist/v3/icons'))
 }
 
-const logos = () => {
+const logos = async () => {
+  // appease TS
   return gulp.src([
-    cypressIcons.getPathToLogo('cypress-bw.png'),
+    getPathToLogo('cypress-bw.png'),
   ])
-  .pipe(gulp.dest('dist/logos'))
+  .pipe(gulp.dest('app-dist/v2/logos'))
+  .pipe(gulp.dest('app-dist/v3/logos'))
 }
 
-const build = gulp.series(
+export const build = gulp.series(
   clean,
+  buildAppV2,
+  buildAppV3,
   gulp.parallel(
     icons,
     logos,
-    manifest,
-    background,
+    manifest('v2'),
+    manifest('v3'),
     html,
     css,
+    buildLib,
   ),
 )
-
-const watchBuild = () => {
-  return gulp.watch('app/**/*', build)
-}
-
-const watch = gulp.series(build, watchBuild)
-
-module.exports = {
-  build,
-  clean,
-  watch,
-}

@@ -1,0 +1,14 @@
+{
+  "name": "qwik-app",
+  "version": "0.0.0-test",
+  "scripts": {
+    "qwik": "qwik"
+  },
+  "devDependencies": {
+    "@builder.io/qwik": "0.17.5",
+    "vite": "^8.0.9"
+  },
+  "engines": {
+    "node": "^22.0.0 || ^24.0.0 || >=26.0.0"
+  }
+}

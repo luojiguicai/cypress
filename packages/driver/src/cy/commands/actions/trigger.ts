@@ -1,5 +1,3 @@
-// @ts-nocheck
-
 import _ from 'lodash'
 import Promise from 'bluebird'
 
@@ -59,7 +57,7 @@ export default (Commands, Cypress, cy, state, config) => {
 
       ({ options: userOptions, position, x, y } = $actionability.getPositionFromArguments(positionOrX, y, userOptions))
 
-      const options = _.defaults({}, userOptions, {
+      const options: Record<string, any> = _.defaults({}, userOptions, {
         log: true,
         $el: subject,
         bubbles: true,
@@ -80,22 +78,21 @@ export default (Commands, Cypress, cy, state, config) => {
       // else through so user can specify what the event object needs
       let eventOptions = _.omit(options, 'log', '$el', 'position', 'x', 'y', 'waitForAnimations', 'animationDistanceThreshold')
 
-      if (options.log) {
-        options._log = Cypress.log({
-          $el: subject,
-          timeout: options.timeout,
-          consoleProps () {
-            return {
-              'Yielded': subject,
-              'Event options': eventOptions,
-            }
-          },
-        })
+      options._log = Cypress.log({
+        $el: subject,
+        hidden: options.log === false,
+        timeout: options.timeout,
+        consoleProps () {
+          return {
+            'Yielded': subject,
+            'Event options': eventOptions,
+          }
+        },
+      })
 
-        options._log.snapshot('before', { next: 'after' })
-      }
+      options._log?.snapshot('before', { next: 'after' })
 
-      if (!_.isString(eventName)) {
+      if (!eventName || !_.isString(eventName)) {
         $errUtils.throwErrByPath('trigger.invalid_argument', {
           onFail: options._log,
           args: { eventName },
@@ -119,12 +116,16 @@ export default (Commands, Cypress, cy, state, config) => {
         subject = options.$el.first()
       }
 
+      const subjectChain = cy.subjectChain()
+
       const trigger = () => {
         if (dispatchEarly) {
           return dispatch(subject, state('window'), eventName, eventOptions)
         }
 
         return $actionability.verify(cy, subject, config, options, {
+          subjectFn: () => cy.getSubjectFromChain(subjectChain),
+
           onScroll ($el, type) {
             Cypress.action('cy:scrolled', $el, type)
           },

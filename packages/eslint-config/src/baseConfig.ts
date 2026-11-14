@@ -1,0 +1,443 @@
+import js from '@eslint/js'
+import type { InfiniteDepthConfigWithExtends } from 'typescript-eslint'
+import { configs as tsConfigs, parser as tsParser } from 'typescript-eslint'
+
+import cy from 'eslint-plugin-cypress'
+import chaiFriendly from 'eslint-plugin-chai-friendly'
+
+import mocha from 'eslint-plugin-mocha'
+import globals from 'globals'
+import vue from 'eslint-plugin-vue'
+import vueParser from 'vue-eslint-parser'
+import stylistic from '@stylistic/eslint-plugin'
+import react from 'eslint-plugin-react'
+
+import { flatConfigs as eslintPluginImportXFlatConfigs } from 'eslint-plugin-import-x'
+
+import { cypressDevPlugin } from './rules'
+import { reactRulesOff } from './reactRulesOff'
+
+const testFiles = [
+  '**/test/**/*.{js,jsx,ts,tsx}',
+  '**/cypress/**/*.{js,jsx,ts,tsx}',
+  '**/*.spec.{js,jsx,ts,tsx}',
+  '**/*.cy.{js,jsx,ts,tsx}',
+]
+
+const unusedExpressionsOptions = {
+  allowShortCircuit: true,
+  allowTernary: true,
+  allowTaggedTemplates: true,
+}
+
+// Chai property assertions such as `expect(x).to.be.true` are unused
+// expressions to the TypeScript rule. Add it after `baseConfig` for test code
+// that the shared test globs miss.
+export const chaiFriendlyConfig = (files: string[]): InfiniteDepthConfigWithExtends => {
+  return {
+    files,
+    plugins: {
+      'chai-friendly': chaiFriendly,
+    },
+    rules: {
+      '@typescript-eslint/no-unused-expressions': 'off',
+      'chai-friendly/no-unused-expressions': ['error', unusedExpressionsOptions],
+    },
+  }
+}
+
+export const baseConfig = <InfiniteDepthConfigWithExtends[]>[
+  js.configs.recommended,
+  ...tsConfigs.recommended,
+  cy.configs.recommended,
+  mocha.configs?.recommended ?? {},
+  ...vue.configs['flat/recommended'],
+  {
+    ...react.configs.flat.recommended,
+    settings: {
+      react: {
+        // Keep this explicit: on ESLint 10, eslint-plugin-react 7's 'detect'
+        // calls the removed `context.getFilename()` and crashes every lint run
+        version: '18',
+      },
+    },
+  },
+  // importing { config } from @stylistic/eslint-plugin causes errors
+  stylistic.configs.customize({
+    'braceStyle': '1tbs',
+    'arrowParens': true,
+  }),
+  eslintPluginImportXFlatConfigs.typescript,
+
+  // set up ts parser & import plugin
+  {
+    files: ['**/*.{ts,js,jsx,tsx,vue}'],
+    languageOptions: {
+      parserOptions: {
+        parser: tsParser,
+        extraFileExtensions: ['.vue'],
+        ecmaFeatures: {
+          jsx: true,
+        },
+      },
+    },
+  },
+
+  // eslint-plugin-vue takes vue-eslint-parser as a peer and resolves whichever copy
+  // is hoisted, which can be an ESLint 8 era release that ignores the TS script parser
+  {
+    files: ['**/*.vue'],
+    languageOptions: {
+      parser: vueParser,
+    },
+  },
+
+  // common node files
+  {
+    files: ['vite.config.mjs', 'webpack.config.*'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
+
+  // overrides for stylistic rules
+  {
+    rules: {
+      '@stylistic/space-before-function-paren': ['error', 'always'],
+      '@stylistic/comma-dangle': ['error', 'always-multiline'],
+      '@stylistic/multiline-ternary': 'off',
+      // the following rules are very inconsistent across the codebase.
+      // enabling them, even with customized options, may result in large diffs.
+      '@stylistic/indent': 'off', // ['warn', 2, { MemberExpression: 0 }],
+      '@stylistic/operator-linebreak': 'off',
+      '@stylistic/max-statements-per-line': 'off',
+      '@stylistic/quote-props': 'off',
+      '@stylistic/spaced-comment': 'off',
+      '@stylistic/no-extra-parens': 'off',
+      '@stylistic/new-parens': 'off',
+      '@stylistic/indent-binary-ops': 'off',
+      '@stylistic/template-curly-spacing': 'off',
+      '@stylistic/no-mixed-operators': 'off',
+      '@stylistic/jsx-tag-spacing': 'off',
+      '@stylistic/jsx-function-call-newline': 'off',
+      '@stylistic/jsx-wrap-multilines': 'off',
+      '@stylistic/jsx-closing-tag-location': 'off',
+      '@stylistic/jsx-first-prop-new-line': 'off',
+      '@stylistic/jsx-closing-bracket-location': 'off',
+      '@stylistic/jsx-one-expression-per-line': 'off',
+      '@stylistic/jsx-max-props-per-line': 'off',
+      '@stylistic/jsx-curly-brace-presence': 'off',
+      '@stylistic/jsx-quotes': 'off',
+    },
+  },
+
+  // Cypress-authored rules, under the `@cypress/dev` namespace so existing
+  // `eslint-disable @cypress/dev/...` comments resolve.
+  {
+    plugins: {
+      '@cypress/dev': cypressDevPlugin,
+    },
+    rules: {
+      '@cypress/dev/arrow-body-multiline-braces': ['error', 'always'],
+    },
+  },
+  {
+    files: ['**/*.{jsx,tsx}'],
+    rules: {
+      '@cypress/dev/arrow-body-multiline-braces': 'off',
+    },
+  },
+  {
+    files: testFiles,
+    rules: {
+      '@cypress/dev/skip-comment': 'error',
+    },
+  },
+
+  // overrides for basic recommended rules, and custom rules
+  {
+    linterOptions: {
+      reportUnusedDisableDirectives: 'error',
+    },
+    rules: {
+      'no-console': 'error',
+      'prefer-spread': 'error',
+      'no-prototype-builtins': 'error',
+      // A `let` that a closure reads before its later assignment has to stay
+      // declared up front: as a `const` at the assignment, an early call throws
+      // a TDZ ReferenceError where it used to see `undefined`
+      'prefer-const': ['error', { ignoreReadBeforeAssign: true }],
+      // `== null` is the idiomatic check for both null and undefined
+      'eqeqeq': ['error', 'always', { null: 'ignore' }],
+      // Unused args and caught errors stay allowed: callbacks and interface
+      // implementations often have to accept parameters they ignore. A leading
+      // `_` keeps a variable that exists only to be type-checked, like `_typeCheck`
+      '@typescript-eslint/no-unused-vars': ['error', {
+        args: 'none',
+        caughtErrors: 'none',
+        ignoreRestSiblings: true,
+        varsIgnorePattern: '^_',
+      }],
+      '@typescript-eslint/no-unused-expressions': ['error', unusedExpressionsOptions],
+      // `declare namespace Cypress` is how the public types and user support
+      // files augment the global `Cypress` namespace
+      '@typescript-eslint/no-namespace': ['error', { allowDeclarations: true }],
+      'no-restricted-properties': [
+        'error',
+        {
+          object: 'process',
+          property: 'geteuid',
+          message: 'process.geteuid() will throw on Windows. Do not use it unless you catch any potential errors.',
+        },
+        {
+          object: 'os',
+          property: 'userInfo',
+          message: 'os.userInfo() will throw when there is not an `/etc/passwd` entry for the current user (like when running with --user 12345 in Docker). Do not use it unless you catch any potential errors.',
+        },
+      ],
+      'no-restricted-syntax': [
+        // esquery tool: https://estools.github.io/esquery/
+        'warn',
+        {
+          // match sync FS methods except for `existsSync`
+          // examples: fse.readFileSync, fs.readFileSync, this.ctx.fs.readFileSync...
+          selector: `MemberExpression[object.name='fs'][property.name=/^[A-z]+Sync$/]:not(MemberExpression[property.name='existsSync']), MemberExpression[property.name=/^[A-z]+Sync$/]:not(MemberExpression[property.name='existsSync']):has(MemberExpression[property.name='fs'])`,
+          message: 'Synchronous fs calls should not be used in Cypress. Use an async API instead.',
+        },
+      ],
+      'padding-line-between-statements': [
+        'error',
+        {
+          'blankLine': 'always',
+          'prev': '*',
+          'next': 'return',
+        },
+        {
+          'blankLine': 'always',
+          'prev': [
+            'const',
+            'let',
+            'var',
+            'if',
+            'while',
+            'export',
+            'cjs-export',
+            'import',
+            'cjs-import',
+            'multiline-expression',
+          ],
+          'next': '*',
+        },
+        {
+          'blankLine': 'any',
+          'prev': [
+            'const',
+            'let',
+            'var',
+            'import',
+            'cjs-import',
+          ],
+          'next': [
+            'const',
+            'let',
+            'var',
+            'import',
+            'cjs-import',
+          ],
+        },
+      ],
+    },
+  },
+
+  {
+    // rules that are gold standard, but have many violations. The ones set to
+    // `off` here should be re-enabled once their violations are fixed; that
+    // work is tracked in https://github.com/cypress-io/cypress/issues/35250
+    rules: {
+      'prefer-rest-params': 'off',
+      'no-async-promise-executor': 'off',
+
+      '@typescript-eslint/no-require-imports': 'off',
+      '@typescript-eslint/no-explicit-any': 'off',
+
+      'mocha/no-exclusive-tests': 'error',
+      'mocha/no-mocha-arrows': 'off',
+      'mocha/no-setup-in-describe': 'off',
+      'mocha/max-top-level-suites': 'off',
+      'mocha/no-top-level-hooks': 'off',
+      'mocha/no-global-tests': 'off',
+      'mocha/no-pending-tests': 'off',
+
+      'vue/multi-word-component-names': 'off',
+      'vue/no-dupe-keys': 'off',
+
+      'cypress/unsafe-to-chain-command': 'off',
+
+      // we use react 18+, so these rules do not apply
+      'react/react-in-jsx-scope': 'off',
+      'react/jsx-uses-react': 'off',
+
+      // noisy, and not that helpful at this point. Maybe down the line we can
+      // enable it.
+      'import-x/default': 'warn',
+    },
+  },
+
+  // These rules guard the `cy` command queue, which only exists in Cypress specs
+  // and support files. Node-side mocha and vitest suites write async tests and
+  // keep return values on purpose.
+  {
+    ignores: ['**/*.cy.{js,jsx,ts,tsx}', '**/cypress/**'],
+    rules: {
+      'cypress/no-async-tests': 'off',
+      'cypress/no-assigning-return-values': 'off',
+    },
+  },
+
+  chaiFriendlyConfig(testFiles),
+
+  {
+    // the Vue recommended config ships these as warnings, and
+    // flatConfigs.typescript leaves import-x/namespace unset
+    rules: {
+      'vue/attribute-hyphenation': 'error',
+      'vue/attributes-order': 'error',
+      'vue/block-order': 'error',
+      'vue/component-definition-name-casing': 'error',
+      'vue/first-attribute-linebreak': 'error',
+      'vue/html-closing-bracket-newline': 'error',
+      'vue/html-closing-bracket-spacing': 'error',
+      'vue/html-end-tags': 'error',
+      'vue/html-indent': 'error',
+      'vue/html-quotes': 'error',
+      'vue/html-self-closing': 'error',
+      'vue/max-attributes-per-line': 'error',
+      'vue/multiline-html-element-content-newline': 'error',
+      'vue/mustache-interpolation-spacing': 'error',
+      'vue/no-lone-template': 'error',
+      'vue/no-multi-spaces': 'error',
+      'vue/no-multiple-slot-args': 'error',
+      'vue/no-required-prop-with-default': 'error',
+      'vue/no-spaces-around-equal-signs-in-attribute': 'error',
+      'vue/no-template-shadow': 'error',
+      'vue/no-v-html': 'error',
+      'vue/one-component-per-file': 'error',
+      'vue/order-in-components': 'error',
+      'vue/prop-name-casing': 'error',
+      'vue/require-default-prop': 'error',
+      'vue/require-explicit-emits': 'error',
+      'vue/require-prop-types': 'error',
+      'vue/singleline-html-element-content-newline': 'error',
+      'vue/this-in-template': 'error',
+      'vue/v-bind-style': 'error',
+      'vue/v-on-event-hyphenation': 'error',
+      'vue/v-on-style': 'error',
+      'vue/v-slot-style': 'error',
+
+      'import-x/namespace': 'error',
+    },
+  },
+
+  {
+    files: ['**/*.d.ts'],
+    rules: {
+      // A merged declaration must repeat the original's type parameters, used or not
+      '@typescript-eslint/no-unused-vars': 'off',
+      // An import turns a global declaration file into a module, so the public
+      // typings pull in other declarations with references instead
+      '@typescript-eslint/triple-slash-reference': 'off',
+    },
+  },
+
+  // eslint-plugin-mocha treats any file with a Mocha call, hooks included, as a
+  // test file, which takes in support files, test generators and plugin source
+  // whose exports are their purpose. The rule is there because importing a spec
+  // registers its tests in the importer, so only spec files are held to it.
+  {
+    ignores: ['**/*.cy.*', '**/*.spec.*', '**/*_spec.*', '**/*-spec.*', '**/*.test.*'],
+    rules: {
+      'mocha/no-exports': 'off',
+    },
+  },
+
+  // React rules do not apply to Vue SFCs. Vue JSX/TSX files need `vueTsxOverrides`.
+  {
+    files: ['**/*.vue'],
+    rules: reactRulesOff,
+  },
+
+  // common file patterns to ignore
+  {
+    ignores: [
+      '.releaserc.js',
+      'cjs/**/*',
+      'dist/**/*',
+      'esm/**/*',
+      '**/__snapshots__/**/*',
+      'test/.mocharc.js',
+    ],
+  },
+
+  // globals necessary for mixed js/ts
+  {
+    languageOptions: {
+      globals: {
+        require: 'readonly',
+        module: 'readonly',
+        ...globals['shared-node-browser'],
+        ...globals['es2020'], // this should be aligned with tsconfig "lib"
+      },
+    },
+  },
+
+  // cy, *sx, and vue files are always in browser
+  {
+    files: ['**/*.cy.{js,ts}', '**/*.{j,t}sx', '**/*.vue'],
+    languageOptions: {
+      globals: {
+        ...globals['browser'],
+      },
+    },
+  },
+
+  {
+    files: ['webpack.config.js'],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
+
+  // v8 snapshot bundling fails on mixed inline type + value imports.
+  // Globs are package-relative: lint runs per package, not from the repo root.
+  {
+    files: [
+      'lib/**/*.{js,ts,tsx}',
+      'src/**/*.{js,ts,tsx}',
+    ],
+    ignores: [
+      '**/test/**',
+      '**/*.spec.*',
+      '**/cypress/**',
+      '**/__snapshots__/**',
+    ],
+    rules: {
+      'import-x/consistent-type-specifier-style': ['error', 'prefer-top-level'],
+    },
+  },
+
+  {
+    files: ['**/*.{js,ts,tsx,vue}'],
+    rules: {
+      '@typescript-eslint/consistent-type-imports': ['error', {
+        prefer: 'type-imports',
+        // the fixer must not emit the inline specifiers
+        // `consistent-type-specifier-style` forbids
+        fixStyle: 'separate-type-imports',
+        // inline `import()` type annotations are erased on emit regardless
+        disallowTypeAnnotations: false,
+      }],
+    },
+  },
+]

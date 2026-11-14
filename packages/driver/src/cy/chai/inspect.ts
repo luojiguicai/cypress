@@ -30,7 +30,7 @@ export function create (chai) {
    * @name inspect
    */
   function inspect (obj, showHidden, depth, colors) {
-    let ctx = {
+    const ctx = {
       showHidden,
       seen: [],
       stylize (str) {
@@ -42,7 +42,7 @@ export function create (chai) {
   }
 
   // Returns true if object is a DOM element.
-  let isDOMElement = function (object) {
+  const isDOMElement = function (object) {
     if (typeof HTMLElement === 'object') {
       return object instanceof HTMLElement
     }
@@ -52,6 +52,18 @@ export function create (chai) {
       'nodeType' in object &&
       object.nodeType === 1 &&
       typeof object.nodeName === 'string'
+  }
+
+  // We can't just check if object instanceof ShadowRoot, because it might be the document of an iframe,
+  // which in Chrome 99+ is a separate class, and instanceof ShadowRoot returns false.
+  const isShadowRoot = function (object) {
+    return isDOMElement(object.host) && object.host.shadowRoot === object
+  }
+
+  // We can't just check if object instanceof Document, because it might be the document of an iframe,
+  // which in Chrome 99+ is a separate class, and instanceof Document returns false.
+  const isDocument = function (object) {
+    return object.defaultView && object.defaultView === object.defaultView.window
   }
 
   let formatValueHook
@@ -81,7 +93,7 @@ export function create (chai) {
     }
 
     // Primitive types cannot have properties
-    let primitive = formatPrimitive(ctx, value)
+    const primitive = formatPrimitive(ctx, value)
 
     if (primitive) {
       return primitive
@@ -97,9 +109,9 @@ export function create (chai) {
 
       // Attempt to serialize it
       try {
-        // @ts-ignore
+        // @ts-expect-error - xmlVersion is deprecated and not in the DOM lib types
         if (document.xmlVersion) {
-          let xmlSerializer = new XMLSerializer()
+          const xmlSerializer = new XMLSerializer()
 
           return xmlSerializer.serializeToString(value)
         }
@@ -107,11 +119,11 @@ export function create (chai) {
         // Firefox 11- do not support outerHTML
         //   It does, however, support innerHTML
         //   Use the following to render the element
-        let ns = 'http://www.w3.org/1999/xhtml'
-        let container = document.createElementNS(ns, '_')
+        const ns = 'http://www.w3.org/1999/xhtml'
+        const container = document.createElementNS(ns, '_')
 
         container.appendChild(value.cloneNode(false))
-        let html = container.innerHTML
+        const html = container.innerHTML
         .replace('><', `>${value.innerHTML}<`)
 
         container.innerHTML = ''
@@ -124,9 +136,17 @@ export function create (chai) {
       }
     }
 
+    if (isShadowRoot(value)) {
+      return value.innerHTML
+    }
+
+    if (isDocument(value)) {
+      return value.documentElement.outerHTML
+    }
+
     // Look up the keys of the object.
-    let visibleKeys = getEnumerableProperties(value)
-    let keys = ctx.showHidden ? getProperties(value) : visibleKeys
+    const visibleKeys = getEnumerableProperties(value)
+    const keys = ctx.showHidden ? getProperties(value) : visibleKeys
 
     let name; let nameSuffix
 
@@ -257,7 +277,7 @@ export function create (chai) {
         return ctx.stylize(`${value.toString()}n`, 'bigint')
 
       default:
-        null
+        break
     }
     // For some reason typeof null is "object", so special case here.
     if (value === null) {
@@ -270,7 +290,7 @@ export function create (chai) {
   }
 
   function formatArray (ctx, value, recurseTimes, visibleKeys, keys) {
-    let output: string[] = []
+    const output: string[] = []
 
     for (let i = 0, l = value.length; i < l; ++i) {
       if (Object.prototype.hasOwnProperty.call(value, String(i))) {
@@ -314,7 +334,7 @@ export function create (chai) {
 
   function formatProperty (ctx, value, recurseTimes, visibleKeys, key, array) {
     let name
-    let propDescriptor = Object.getOwnPropertyDescriptor(value, key)
+    const propDescriptor = Object.getOwnPropertyDescriptor(value, key)
     let str
 
     if (propDescriptor) {
@@ -381,7 +401,7 @@ export function create (chai) {
   }
 
   function reduceToSingleString (output, base, braces) {
-    let length = output.reduce(function (prev, cur) {
+    const length = output.reduce(function (prev, cur) {
       return prev + cur.length + 1
     }, 0)
 

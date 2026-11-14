@@ -1,0 +1,298 @@
+/**
+ * E2E tests for accept/content encoding (br, gzip, layered, invalid) through the proxy.
+ * Each test requests the HTML page, which includes the script and stylesheet; we assert
+ * all three (html body, js global, css) in one visit.
+ */
+
+// The default network path intercepts in the browser through CDP, which only
+// Chromium-family browsers support; Firefox, Electron, and WebKit stay on the
+// HTTP/1 proxy either way.
+const usesBrowserNetworkPath = !Cypress.config('forceHttp1') && Cypress.isBrowser([{ name: '!electron', family: 'chromium' }])
+
+const expectedText = (encodingType: string, assetType: string) => `encoding-${encodingType}-${assetType}`
+
+function assertEncodingPage (encodingType: string) {
+  cy.get('#encoding-test').should('contain.text', expectedText(encodingType, 'html'))
+  cy.get('#encoding-js').should('have.text', expectedText(encodingType, 'js'))
+  cy.get('#encoding-test').then(($el) => {
+    expect(getComputedStyle($el[0]).fontSize).to.eq('42px')
+  })
+}
+
+function waitAndAssertInterceptions (alias: string, contentEncoding: string) {
+  cy.wait([`@${alias}`, `@${alias}`, `@${alias}`]).then((interceptions) => {
+    interceptions.forEach((interception) => {
+      expect(interception.response?.statusCode).to.eq(200)
+
+      // NOTE: accepted MITM → CDP drift (#34554): browser-fetched responses reach
+      // net-stubbing already decoded, so content-encoding is honestly absent. The
+      // document is exempt — an intercept-matched visit is still resolved Node-side
+      // through the MITM pipeline, which reports the wire encoding on a decoded body.
+      const isBrowserFetched = usesBrowserNetworkPath && !interception.request.url.endsWith('/html')
+
+      if (isBrowserFetched) {
+        expect(interception.response?.headers?.['content-encoding']).to.be.undefined
+      } else {
+        expect(interception.response?.headers?.['content-encoding']).to.eq(contentEncoding)
+      }
+    })
+  })
+}
+
+describe('encoding', () => {
+  context('br', () => {
+    it('not intercepted: decodes br for html, js, and css', () => {
+      cy.visit('encoding/br/html')
+
+      assertEncodingPage('br')
+    })
+
+    it('intercepted: decodes br for html, js, and css', () => {
+      cy.intercept('*').as('br')
+      cy.visit('encoding/br/html')
+
+      waitAndAssertInterceptions('br', 'br')
+      assertEncodingPage('br')
+    })
+
+    it('sets the accept-encoding header in the cy.visit options', () => {
+      cy.visit('encoding/br/html', { headers: { 'Accept-Encoding': 'br' } })
+
+      assertEncodingPage('br')
+    })
+  })
+
+  context('gzip', () => {
+    it('not intercepted: decodes gzip for html, js, and css', () => {
+      cy.visit('encoding/gzip/html')
+
+      assertEncodingPage('gzip')
+    })
+
+    it('intercepted: decodes gzip for html, js, and css', () => {
+      cy.intercept('*').as('gzip')
+      cy.visit('encoding/gzip/html')
+
+      waitAndAssertInterceptions('gzip', 'gzip')
+      assertEncodingPage('gzip')
+    })
+
+    it('sets the accept-encoding header in the cy.visit options', () => {
+      cy.visit('encoding/gzip/html', { headers: { 'Accept-Encoding': 'gzip' } })
+
+      assertEncodingPage('gzip')
+    })
+  })
+
+  context('layered-gzip-br', () => {
+    it('not intercepted: decodes gzip,br for html, js, and css', () => {
+      cy.visit('encoding/layered-gzip-br/html')
+
+      assertEncodingPage('layered-gzip-br')
+    })
+
+    it('intercepted: decodes gzip,br for html, js, and css', () => {
+      cy.intercept('*').as('layeredGzipBr')
+      cy.visit('encoding/layered-gzip-br/html')
+
+      waitAndAssertInterceptions('layeredGzipBr', 'gzip, br')
+      assertEncodingPage('layered-gzip-br')
+    })
+
+    it('sets the accept-encoding header in the cy.visit options', () => {
+      cy.visit('encoding/layered-gzip-br/html', { headers: { 'Accept-Encoding': 'gzip, br' } })
+
+      assertEncodingPage('layered-gzip-br')
+    })
+  })
+
+  context('layered-br-gzip', () => {
+    it('not intercepted: decodes br,gzip for html, js, and css', () => {
+      cy.visit('encoding/layered-br-gzip/html')
+
+      assertEncodingPage('layered-br-gzip')
+    })
+
+    it('intercepted: decodes br,gzip for html, js, and css', () => {
+      cy.intercept('*').as('layeredBrGzip')
+      cy.visit('encoding/layered-br-gzip/html')
+
+      waitAndAssertInterceptions('layeredBrGzip', 'br, gzip')
+      assertEncodingPage('layered-br-gzip')
+    })
+
+    it('sets the accept-encoding header in the cy.visit options', () => {
+      cy.visit('encoding/layered-br-gzip/html', { headers: { 'Accept-Encoding': 'br, gzip' } })
+
+      assertEncodingPage('layered-br-gzip')
+    })
+  })
+
+  context('invalid-br', () => {
+    it('valid html loads; invalid js and css fail to decode', () => {
+      cy.visit('encoding/invalid-br/html')
+
+      cy.get('#encoding-test').should('contain.text', expectedText('invalid-br', 'html'))
+      cy.get('#encoding-js').should('have.text', '')
+      cy.get('#encoding-test').then(($el) => {
+        expect(getComputedStyle($el[0]).fontSize).not.to.eq('42px')
+      })
+    })
+  })
+
+  context('invalid-gzip', () => {
+    it('valid html loads; invalid js and css fail to decode', () => {
+      cy.visit('encoding/invalid-gzip/html')
+
+      cy.get('#encoding-test').should('contain.text', expectedText('invalid-gzip', 'html'))
+      cy.get('#encoding-js').should('have.text', '')
+      cy.get('#encoding-test').then(($el) => {
+        expect(getComputedStyle($el[0]).fontSize).not.to.eq('42px')
+      })
+    })
+  })
+
+  context('insecure host', () => {
+    it('decodes gzip for html, js, and css', () => {
+      // in firefox, the browser tries to decode the response as br, which is invalid,
+      // so we need to catch the exception and ignore it
+      if (Cypress.isBrowser({ family: 'firefox' })) {
+        cy.on('uncaught:exception', (err) => {
+          return !err.message.includes('illegal character U+FFFD')
+        })
+      }
+
+      cy.intercept('http://www.foobar.com:3500/encoding/br/js').as('brJs')
+
+      cy.visit('http://www.foobar.com:3500/encoding/gzip/html')
+
+      assertEncodingPage('gzip')
+
+      // Try to request brotli js, will should fail due to insecure host
+      cy.window().then((win) => {
+        const script = win.document.createElement('script')
+
+        script.src = 'http://www.foobar.com:3500/encoding/br/js'
+        win.document.body.appendChild(script)
+      })
+
+      // The request will be successful but since the content-encoding is br,
+      // the browser will fail to decode
+      let brJsInterception
+
+      cy.wait('@brJs').then((interception) => {
+        if (usesBrowserNetworkPath) {
+          // NOTE: accepted MITM → CDP drift (#34384): the netstack rejects this br
+          // response before CDP emits any metadata-bearing event, so cy.intercept
+          // can only observe the request phase.
+          expect(interception.request).to.exist
+          expect(interception.response).to.be.undefined
+
+          // #34565: the browser knows the load failed and why, so the
+          // rejection must surface as interception.error. cy.wait resolves
+          // at the request phase and network:error arrives asynchronously —
+          // retry against the interception, which is mutated in place when
+          // it lands.
+          cy.wrap(interception).should((errored) => {
+            expect(errored.state).to.eq('Errored')
+            expect(errored.error, 'interception.error').to.exist
+          })
+        } else {
+          expect(interception.response?.statusCode).to.eq(200)
+          expect(interception.response?.headers?.['content-encoding']).to.eq('br')
+          expect(interception.request.headers['accept-encoding']).to.eq('gzip, deflate')
+
+          brJsInterception = interception
+        }
+      })
+
+      // Assert that the encoding-js element is still gzip since br failed to decode
+      cy.get('#encoding-js').should('have.text', 'encoding-gzip-js')
+
+      cy.then(() => {
+        if (!usesBrowserNetworkPath) {
+          // MITM observes the response directly and never routes it through
+          // the network:error path, so the interception reaches Complete
+          // with interception.error unset — the asymmetry with the
+          // proxy-off branch above is the point.
+          expect(brJsInterception.state).to.eq('Complete')
+          expect(brJsInterception.error).to.be.undefined
+        }
+      })
+    })
+
+    it('fails when brotli is requested due to insecure host', (done) => {
+      if (usesBrowserNetworkPath) {
+        // NOTE: accepted MITM → CDP drift (#34386): buffered cy.visit documents are
+        // fetched Node-side and fulfilled as identity bytes, so the browser never sees
+        // an encoding to reject and the document loads. Subresources stay
+        // browser-fetched, so br js and css still fail the insecure-host policy.
+        cy.visit('http://www.foobar.com:3500/encoding/br/html')
+
+        cy.get('#encoding-test').should('contain.text', expectedText('br', 'html'))
+        cy.get('#encoding-js').should('have.text', '')
+        cy.get('#encoding-test').then(($el) => {
+          expect(getComputedStyle($el[0]).fontSize).not.to.eq('42px')
+          done()
+        })
+
+        return
+      }
+
+      cy.visit(`http://www.foobar.com:3500/encoding/br/html`, { timeout: 500 })
+
+      // in firefox, the browser displays the encoded response whereas in other browsers, it fails to load the page
+      if (Cypress.isBrowser({ family: 'firefox' })) {
+        cy.get('body')
+        // firefox renders the raw, undecoded brotli bytes as text rather than failing to load.
+        // Assert on that garbled state rather than the exact compressed bytes, which vary with
+        // the proxy-injected runner bundle.
+        .should('contain.text', '\uFFFD')
+        .and('not.contain.text', 'encoding-br-html')
+        .then(() => done())
+      } else {
+        cy.on('fail', (err) => {
+          expect(err.message).to.contain('Timed out after waiting `500ms` for your remote page to load.')
+          done()
+        })
+      }
+    })
+
+    it('fails even when brotli is explicitly requested in the accept-encoding header', (done) => {
+      if (usesBrowserNetworkPath) {
+        // NOTE: accepted MITM → CDP drift (#34386): buffered cy.visit documents are
+        // fetched Node-side and fulfilled as identity bytes, so the browser never sees
+        // an encoding to reject and the document loads. Subresources stay
+        // browser-fetched, so br js and css still fail the insecure-host policy.
+        cy.visit('http://www.foobar.com:3500/encoding/br/html', { headers: { 'Accept-Encoding': 'br' } })
+
+        cy.get('#encoding-test').should('contain.text', expectedText('br', 'html'))
+        cy.get('#encoding-js').should('have.text', '')
+        cy.get('#encoding-test').then(($el) => {
+          expect(getComputedStyle($el[0]).fontSize).not.to.eq('42px')
+          done()
+        })
+
+        return
+      }
+
+      cy.visit(`http://www.foobar.com:3500/encoding/br/html`, { timeout: 500, headers: { 'Accept-Encoding': 'br' } })
+
+      // in firefox, the browser displays the encoded response whereas in other browsers, it fails to load the page
+      if (Cypress.isBrowser({ family: 'firefox' })) {
+        cy.get('body')
+        // firefox renders the raw, undecoded brotli bytes as text rather than failing to load.
+        // Assert on that garbled state rather than the exact compressed bytes, which vary with
+        // the proxy-injected runner bundle.
+        .should('contain.text', '\uFFFD')
+        .and('not.contain.text', 'encoding-br-html')
+        .then(() => done())
+      } else {
+        cy.on('fail', (err) => {
+          expect(err.message).to.contain('Timed out after waiting `500ms` for your remote page to load.')
+          done()
+        })
+      }
+    })
+  })
+})

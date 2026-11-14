@@ -1,0 +1,115 @@
+import type { ProjectFixtureDir } from '@tooling/system-tests'
+
+export function loadProjectAndRunSpec ({ projectName = 'studio' as ProjectFixtureDir, specName = 'spec.cy.js', cliArgs = [''], specSelector = 'data-cy-row', shouldLogin = false } = {}) {
+  cy.viewport(1500, 1000)
+
+  cy.scaffoldProject(projectName)
+  cy.openProject(projectName, cliArgs)
+
+  if (shouldLogin) {
+    cy.loginUser()
+  }
+
+  cy.startAppServer('e2e')
+  cy.visitApp()
+  cy.specsPageIsVisible()
+  cy.get(`[${specSelector}="${specName}"]`).click()
+
+  cy.waitForSpecToFinish()
+}
+
+export function openNewTestFromSpecHeader () {
+  cy.reporter().find('[data-cy="runnable-options-button"]').click()
+  cy.reporter().find('[data-cy="more-options-runnable-popover"]').should('be.visible')
+  cy.reporter().find('[data-cy="runnable-popover-new-test"]').click()
+}
+
+export function launchStudio ({ specName = 'spec.cy.js', createNewTestFromSuite = false, createNewTestFromSpecHeader = false, cliArgs = [''], afterLaunch = () => {}, shouldLogin = false }: { specName?: string, createNewTestFromSuite?: boolean, createNewTestFromSpecHeader?: boolean, cliArgs?: string[], afterLaunch?: () => void, shouldLogin?: boolean } = {}) {
+  loadProjectAndRunSpec({ specName, cliArgs, shouldLogin })
+
+  const testTitle = 'visits a basic html page'
+
+  if (createNewTestFromSuite || createNewTestFromSpecHeader) {
+    cy.reporter().contains('studio functionality').as('item')
+  } else {
+    cy.reporter().contains(testTitle).as('item')
+  }
+
+  cy.get('@item')
+  .closest('.runnable-wrapper').as('runnable-wrapper')
+
+  afterLaunch?.()
+
+  if (createNewTestFromSuite || createNewTestFromSpecHeader) {
+    if (createNewTestFromSpecHeader) {
+      openNewTestFromSpecHeader()
+    } else {
+      cy.get('@runnable-wrapper').realHover()
+      cy.reporter().findByTestId('create-new-test-from-suite').click()
+    }
+
+    cy.findByTestId('studio-panel').should('be.visible')
+    cy.findByTestId('create-test-button').should('be.visible')
+  } else {
+    cy.get('@runnable-wrapper')
+    .findByTestId('launch-studio')
+    .click()
+
+    // Studio re-executes spec before waiting for commands - wait for the spec to finish executing.
+    cy.waitForSpecToFinish()
+
+    cy.reporter().find('[data-cy="studio-single-test-title"]').contains(testTitle)
+
+    // verify recording is enabled to ensure the panel is fully ready
+    cy.findByTestId('record-button-recording').should('have.text', 'Recording...')
+  }
+}
+
+export function inputNewTestName ({ name = 'new-test' }: { name?: string } = {}) {
+  cy.findByTestId('test-name-input').type(name)
+  cy.findByTestId('create-test-button').click()
+
+  cy.findByTestId('record-button-disabled').should('have.text', 'Record')
+
+  cy.reporter().find('.studio-single-test-container').should('be.visible')
+}
+
+export function incrementCounter (initialCount: number) {
+  cy.getAutIframe().within(() => {
+    cy.get('p').contains(`Count is ${initialCount}`)
+
+    // (1) First Studio action - get
+    cy.get('#increment')
+
+    // (2) Second Studio action - click
+    .realClick().then(() => {
+      cy.get('p').contains(`Count is ${initialCount + 1}`)
+    })
+  })
+}
+
+export function assertClosingPanelWithoutChanges () {
+  // Cypress re-runs after you cancel Studio.
+  // Original spec should pass
+  cy.waitForSpecToFinish({ passCount: 1 })
+
+  cy.reporter().find('.command').should('have.length', 1)
+
+  // Assert the spec was executed without any new commands.
+  cy.reporter().find('.command-name-visit').within(() => {
+    cy.contains('visit')
+    cy.contains('cypress/e2e/index.html')
+  })
+
+  cy.withCtx(async (ctx) => {
+    const spec = await ctx.actions.file.readFileInProject('cypress/e2e/spec.cy.js')
+
+    // No change, since we closed studio
+    expect(spec.trim().replace(/\r/g, '')).to.eq(`
+describe('studio functionality', () => {
+  it('visits a basic html page', () => {
+    cy.visit('cypress/e2e/index.html')
+  })
+})`.trim())
+  })
+}

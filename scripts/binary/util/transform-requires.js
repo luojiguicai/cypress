@@ -1,13 +1,13 @@
 const fs = require('fs-extra')
 const path = require('path')
 const glob = require('glob')
-const chalk = require('chalk').default
+const chalk = require('chalk')
 const Promise = require('bluebird')
 const Debug = require('debug')
 
 const debug = Debug('cypress:scripts:util:transform-requires')
 
-const requireRE = /(require\(["'`])@packages\/(.+?)([\/"'`])/g
+const requireRE = /(require\(["'`])@packages\/(.+?)([/"'`])/g
 const globAsync = Promise.promisify(glob)
 
 const rewritePackageNames = (fileStr, buildRoot, filePath, onFound) => {
@@ -22,11 +22,8 @@ const rewritePackageNames = (fileStr, buildRoot, filePath, onFound) => {
 
     const replaceString = `${match[1]}${replaceWith}${afterPkg}`
 
-    // eslint-disable-next-line no-console
     console.log()
-    // eslint-disable-next-line no-console
     console.log('resolve:', chalk.grey(pkgPath), '\nfrom:', chalk.grey(filePath))
-    // eslint-disable-next-line no-console
     console.log(chalk.yellow(`@packages/${pkg}`), '->', chalk.green(replaceWith))
 
     onFound && onFound(replaceString)

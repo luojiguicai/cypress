@@ -1,90 +1,36 @@
-// @ts-nocheck
 import _ from 'lodash'
-import $ from 'jquery'
 import $dom from '../dom'
 import $elements from '../dom/elements'
+import type { Callbacks as AssertCallbacks, Methods, PartialAssertionArgs } from './assertions/assert'
+import { assert, assertDom, accessors, selectors, wrap } from './assertions/assert'
 
-const selectors = {
-  visible: 'visible',
-  hidden: 'hidden',
-  selected: 'selected',
-  checked: 'checked',
-  enabled: 'enabled',
-  disabled: 'disabled',
-  focus: 'focused',
-  focused: 'focused',
-}
-
-const accessors = {
-  attr: 'attribute',
-  css: 'CSS property',
-  prop: 'property',
-}
-
-// reset the obj under test
-// to be re-wrapped in our own
-// jquery, so we can control
-// the methods on it
-const wrap = (ctx) => $(ctx._obj)
-
-const maybeCastNumberToString = (num) => {
+const maybeCastNumberToString = (num: number | string) => {
   // if this is a finite number (no Infinity or NaN)
   // cast to a string
   return _.isFinite(num) ? `${num}` : num
 }
 
-export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
+interface Callbacks extends AssertCallbacks {
+  onInvalidArg: (method, description, arg) => void
+}
+
+const $chaiJquery = (chai: Chai.ChaiStatic, chaiUtils: Chai.ChaiUtils, callbacks: Callbacks) => {
   const { inspect, flag } = chaiUtils
 
-  const assertDom = (ctx, method, ...args) => {
-    if (!$dom.isDom(ctx._obj) && !$dom.isJquery(ctx._obj)) {
-      try {
-        // always fail the assertion
-        // if we aren't a DOM like object
-        // depends on the "negate" flag
-        return ctx.assert(!!ctx.__flags.negate, ...args)
-      } catch (err) {
-        return callbacks.onInvalid(method, ctx._obj)
-      }
-    }
-  }
-
-  const assert = (ctx, method, bool, ...args) => {
-    assertDom(ctx, method, ...args)
-
-    try {
-      // reset obj to wrapped
-      const orig = ctx._obj
-      const selector = ctx._obj.selector
-
-      ctx._obj = wrap(ctx)
-
-      if (ctx._obj.length === 0) {
-        // From jQuery 3.x .selector API is deprecated. (https://api.jquery.com/selector/)
-        // Because of that, wrap() above removes selector property.
-        // That's why we're caching the value of selector above and using it here.
-        ctx._obj = selector
-        // if no element found, fail the existence check
-        // depends on the negate flag
-        ctx.assert(!!ctx.__flags.negate, ...args)
-      }
-
-      // apply the assertion
-      const ret = ctx.assert(bool, ...args)
-
-      ctx._obj = orig
-
-      return ret
-    } catch (err) {
-      // send it up with the obj and whether it was negated
-      return callbacks.onError(err, method, ctx._obj, flag(ctx, 'negate'))
-    }
-  }
-
-  const assertPartial = (ctx, method, actual, expected, message, notMessage, ...args) => {
-    if (ctx.__flags.contains || ctx.__flags.includes) {
+  const assertPartial = (
+    ctx: Chai.AssertionStatic,
+    chaiUtils: Chai.ChaiUtils,
+    callbacks: Callbacks,
+    method: Methods,
+    actual: any,
+    expected: any,
+    ...[message, notMessage, ...args]: PartialAssertionArgs
+  ) => {
+    if (chaiUtils.flag(ctx, 'contains') || chaiUtils.flag(ctx, 'includes')) {
       return assert(
         ctx,
+        chaiUtils,
+        callbacks,
         method,
         _.includes(actual, expected),
         `expected #{this} to contain ${message}`,
@@ -95,6 +41,8 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
 
     return assert(
       ctx,
+      chaiUtils,
+      callbacks,
       method,
       actual === expected,
       `expected #{this} to have ${message}`,
@@ -103,8 +51,9 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
     )
   }
 
-  chai.Assertion.addMethod('data', function (...args) {
-    assertDom(this, 'data')
+  chai.Assertion.addMethod('data', function (...args: [name: string, value?: unknown, message?: string]) {
+    // @ts-expect-error - Custom assertions expect messages for failures
+    assertDom(this, chaiUtils, callbacks, 'data')
 
     let a = new chai.Assertion(wrap(this).data())
 
@@ -112,12 +61,14 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
       a = a.not
     }
 
-    return a.property.apply(a, args)
+    return a.property(...args)
   })
 
-  chai.Assertion.addMethod('class', function (className) {
+  chai.Assertion.addMethod('class', function (className: string) {
     return assert(
       this,
+      chaiUtils,
+      callbacks,
       'class',
       wrap(this).hasClass(className),
       'expected #{this} to have class #{exp}',
@@ -126,11 +77,13 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
     )
   })
 
-  chai.Assertion.addMethod('id', function (id) {
+  chai.Assertion.addMethod('id', function (id: string | number) {
     id = maybeCastNumberToString(id)
 
     return assert(
       this,
+      chaiUtils,
+      callbacks,
       'id',
       wrap(this).prop('id') === id,
       'expected #{this} to have id #{exp}',
@@ -139,9 +92,11 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
     )
   })
 
-  chai.Assertion.addMethod('html', function (html) {
+  chai.Assertion.addMethod('html', function (html: string) {
     assertDom(
       this,
+      chaiUtils,
+      callbacks,
       'html',
       'expected #{this} to have HTML #{exp}',
       'expected #{this} not to have HTML #{exp}',
@@ -152,6 +107,8 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
 
     return assertPartial(
       this,
+      chaiUtils,
+      callbacks,
       'html',
       actual,
       html,
@@ -162,11 +119,13 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
     )
   })
 
-  chai.Assertion.addMethod('text', function (text) {
+  chai.Assertion.addMethod('text', function (text: string | number) {
     text = maybeCastNumberToString(text)
 
     assertDom(
       this,
+      chaiUtils,
+      callbacks,
       'text',
       'expected #{this} to have text #{exp}',
       'expected #{this} not to have text #{exp}',
@@ -177,6 +136,8 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
 
     return assertPartial(
       this,
+      chaiUtils,
+      callbacks,
       'text',
       actual,
       text,
@@ -187,7 +148,7 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
     )
   })
 
-  chai.Assertion.addMethod('value', function (value) {
+  chai.Assertion.addMethod('value', function (value: string | number) {
     const $el = wrap(this)
 
     // some elements return a number for the .value property
@@ -198,6 +159,8 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
 
     assertDom(
       this,
+      chaiUtils,
+      callbacks,
       'value',
       'expected #{this} to have value #{exp}',
       'expected #{this} not to have value #{exp}',
@@ -208,6 +171,8 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
 
     return assertPartial(
       this,
+      chaiUtils,
+      callbacks,
       'value',
       actual,
       value,
@@ -218,9 +183,11 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
     )
   })
 
-  chai.Assertion.addMethod('descendants', function (selector) {
+  chai.Assertion.addMethod('descendants', function (selector: string) {
     return assert(
       this,
+      chaiUtils,
+      callbacks,
       'descendants',
       wrap(this).has(selector).length > 0,
       'expected #{this} to have descendants #{exp}',
@@ -234,6 +201,8 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
       if ($dom.isDom(this._obj)) {
         return assert(
           this,
+          chaiUtils,
+          callbacks,
           'empty',
           wrap(this).is(':empty'),
           'expected #{this} to be #{exp}',
@@ -248,11 +217,13 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
 
   chai.Assertion.overwriteMethod('match', (_super) => {
     return (function (...args) {
-      const selector = args[0]
+      const selector: string = args[0]
 
       if ($dom.isDom(this._obj)) {
         return assert(
           this,
+          chaiUtils,
+          callbacks,
           'match',
           wrap(this).is(selector),
           'expected #{this} to match #{exp}',
@@ -266,11 +237,15 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
   })
 
   _.each(selectors, (selectorName, selector) => {
-    return chai.Assertion.addProperty(selector, function () {
+    const sel = selector as keyof typeof selectors
+
+    return chai.Assertion.addProperty(sel, function () {
       return assert(
         this,
-        selector,
-        wrap(this).is(`:${selector}`),
+        chaiUtils,
+        callbacks,
+        sel,
+        wrap(this).is(`:${sel}`),
         'expected #{this} to be #{exp}',
         'expected #{this} not to be #{exp}',
         selectorName,
@@ -279,22 +254,35 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
   })
 
   _.each(accessors, (description, accessor) => {
-    return chai.Assertion.addMethod(accessor, function (name, val) {
+    const acc = accessor as keyof typeof accessors
+
+    return chai.Assertion.addMethod(acc, function (name, val) {
       assertDom(
         this,
-        accessor,
+        chaiUtils,
+        callbacks,
+        acc,
         `expected #{this} to have ${description} #{exp}`,
         `expected #{this} not to have ${description} #{exp}`,
         name,
       )
 
-      const actual = wrap(this)[accessor](name)
+      // jQuery's accessors double as setters when handed an object, which would
+      // mutate the subject instead of asserting on it. Other non-names read back
+      // a value that always satisfies the assertion.
+      if (!_.isString(name) && !_.isFinite(name)) {
+        callbacks.onInvalidArg(acc, description, chaiUtils.inspect(name))
+      }
+
+      const actual = wrap(this)[acc](name)
 
       // when we only have 1 argument dont worry about val
       if (arguments.length === 1) {
         assert(
           this,
-          accessor,
+          chaiUtils,
+          callbacks,
+          acc,
           actual !== undefined,
           `expected #{this} to have ${description} #{exp}`,
           `expected #{this} not to have ${description} #{exp}`,
@@ -306,29 +294,32 @@ export const $chaiJquery = (chai, chaiUtils, callbacks = {}) => {
       } else {
         // if we don't have an accessor here at all we need to
         // have a different failure message
-        let message; let negatedMessage
+        let message: string
+        let negatedMessage: string
 
         if (_.isUndefined(actual)) {
-          message = `expected \#{this} to have ${description} ${inspect(name)}`
+          message = `expected #{this} to have ${description} ${inspect(name)}`
 
-          negatedMessage = `expected \#{this} not to have ${description} ${inspect(name)}`
+          negatedMessage = `expected #{this} not to have ${description} ${inspect(name)}`
         } else {
-          message = `expected \#{this} to have ${description} ${inspect(name)} with the value \#{exp}, but the value was \#{act}`
+          message = `expected #{this} to have ${description} ${inspect(name)} with the value #{exp}, but the value was #{act}`
 
-          negatedMessage = `expected \#{this} not to have ${description} ${inspect(name)} with the value \#{exp}, but the value was \#{act}`
+          negatedMessage = `expected #{this} not to have ${description} ${inspect(name)} with the value #{exp}, but the value was #{act}`
         }
 
         // only cast .attr() as a string
         // since prop stores the native javascript type
         // and we don't want to optimistically cast those
         // values as a string
-        if (accessor === 'attr') {
+        if (acc === 'attr') {
           val = maybeCastNumberToString(val)
         }
 
         assert(
           this,
-          accessor,
+          chaiUtils,
+          callbacks,
+          acc,
           (actual != null) && (actual === val),
           message,
           negatedMessage,

@@ -1,39 +1,47 @@
-// override tty if we're being forced to
-require('./lib/util/tty').override()
-
-const electronApp = require('./lib/util/electron-app')
-
-// are we in the main node process or the electron process?
-const isRunningElectron = electronApp.isRunning()
-
-if (process.env.CY_NET_PROFILE && isRunningElectron) {
-  const netProfiler = require('./lib/util/net_profiler')()
-
-  process.stdout.write(`Network profiler writing to ${netProfiler.logPath}\n`)
+const runChildProcess = async (entryPoint) => {
+  // FIXME: use a bridge here to import TypeScript into a CommonJS context
+  // Once everything is converted to ESM, we can remove this and use import() directly at the top of the file.
+  require('tsx/cjs')
+  require('./lib/util/patch_promise_then').patchPromiseThen()
+  require(entryPoint)
 }
 
-process.env.UV_THREADPOOL_SIZE = 128
+const startCypress = async () => {
+  try {
+    const tsx = require('tsx/cjs/api')
 
-require('graceful-fs').gracefulify(require('fs'))
-// if running in production mode (CYPRESS_INTERNAL_ENV)
-// all transpile should have been done already
-// and these calls should do nothing
-require('@packages/ts/register')
+    // @see https://tsx.hirok.io/dev-api/register-cjs
+    const unregister = tsx.register()
+    // load these files in one by one as we aren't sure if its source TypeScript (development mode) or transpiled JavaScript (production mode).
+    // once the file is converted to TypeScript, we can remove these one-off tsx.require calls.
+    // One off require calls to tsx are needed for now to prevent side effects when building the binary.
+    const { patchPromiseThen } = require('./lib/util/patch_promise_then')
+    const { initializeStartTime } = require('./lib/util/performance_benchmark')
 
-if (isRunningElectron) {
-  require('./lib/util/process_profiler').start()
+    unregister()
+
+    patchPromiseThen()
+    initializeStartTime()
+
+    // No typescript requires before this point please
+    // typescript isn't interpreted until the start cypress file
+    // Avoid putting much code here all together since this is prior to v8 snapshots.
+    const { hookRequire } = require('./hook-require')
+
+    hookRequire({ forceTypeScript: false })
+
+    await require('./start-cypress')
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error(error)
+    process.exit(1)
+  }
 }
 
-// warn when deprecated callback apis are used in electron
-// https://github.com/electron/electron/blob/master/docs/api/process.md#processenablepromiseapis
-process.enablePromiseAPIs = process.env.CYPRESS_INTERNAL_ENV !== 'production'
+const { entryPoint } = require('minimist')(process.argv.slice(1))
 
-// don't show any electron deprecation warnings in prod
-process.noDeprecation = process.env.CYPRESS_INTERNAL_ENV === 'production'
-
-// always show stack traces for Electron deprecation warnings
-process.traceDeprecation = true
-
-require('./lib/util/suppress_warnings').suppress()
-
-module.exports = require('./lib/cypress').start(process.argv)
+if (entryPoint) {
+  module.exports = runChildProcess(entryPoint)
+} else {
+  module.exports = startCypress()
+}

@@ -2,10 +2,6 @@ import _ from 'lodash'
 import mockfs from 'mock-fs'
 import path from 'path'
 
-export const logFs = () => {
-  console.dir(getFs(), { depth: null })
-}
-
 export const getFsPath = (pathStr: string) => {
   return _.get(getFs(), _.compact(pathStr.split(path.sep)))
 }
@@ -25,7 +21,6 @@ export const getFs = () => {
         if (d === -1) {
           nextDepth = d + 1
         } else if (!(d > cwd.length) && key === cwd[d]) {
-          key = 'foo'
           nextDepth = d + 1
 
           if (d === cwd.length - 1) {

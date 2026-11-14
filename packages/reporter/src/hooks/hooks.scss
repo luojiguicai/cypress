@@ -1,39 +1,59 @@
+@import "../lib/mixins.scss";
+
 .reporter {
   .hooks-container {
-    margin: 5px 0 5px 5px;
-    padding-left: 10px;
-    border-left: 1px dotted #DDD;
-
     .hook-item {
-      margin-bottom: 5px;
-
-      &:last-of-type {
-        margin-bottom: 0;
-      }
+      padding-top: 4px;
     }
-
+    
     .hook-header {
+      font-family: $font-system;
       display: flex;
       width: 100%;
+      align-items: center;
+      padding: 0 8px;
 
-      &:hover {
-        .collapsible-header {
-          color: #6a6b6c;
-        }
+      .button-hover-shadow {
+        @include button-hover-shadow();
+      }
+
+      &:hover,
+      &:focus-visible {
+        background-color: $gray-950;
 
         .hook-open-in-ide {
-          display: block;
+          opacity: 1;
+
+          &:hover,
+          &:focus-visible {
+            background-color: $gray-950;
+
+            + .button-hover-shadow {
+              @include button-hover-shadow();
+              opacity: 1;
+            }
+          }
+        }
+
+        .button-hover-shadow {
+          opacity: 1;
         }
       }
 
       .collapsible-header {
         text-transform: uppercase;
-        color: #959595;
-        display: inline-block;
+        color: $gray-400;
+        display: inline-flex;
+        align-items: center;
         flex-grow: 1;
-        font-size: 11px;
+        font-size: 12px;
         cursor: pointer;
-        padding: 4px 0;
+        width: 100%;
+
+        .collapsible-header-inner {
+          padding: 6px 0 !important;
+          width: 100%;
+        }
 
         &:focus {
           outline: none;
@@ -42,33 +62,60 @@
         > .collapsible-header-inner:focus {
           outline: 0;
         }
+
+        .collapsible-header-inner {
+          display: flex;
+          align-items: center;
+        }
       }
 
+      .hook-name {
+        font-weight: 600;
+      }
+      
       .hook-failed-message {
-        color: #E94F5F;
-        display: none;
+        color: $red-400;
       }
 
       .hook-open-in-ide {
+        opacity: 0;
+        position: absolute;
+        top: 0;
+        right: 0;
+        cursor: pointer;
+        display: inline-flex;
         align-items: center;
-        color: #6a6b6c;
-        display: none;
-        padding: 4px 10px;
+        gap: 4px;
+        color: $gray-300;
+        background-color: $gray-950;
+        border: 1px solid $gray-900;
+        z-index: 1;
 
-        &:hover, &:focus {
-          background-color: rgba(186, 186, 186, 0.2);
+        &:hover,
+        &:focus-visible {
+          opacity: 1;
+          border: 1px solid rgb(255 255 255 / 0.6);
           outline: none;
           text-decoration: none;
         }
+
+        &:hover {
+          background-color: $gray-950;
+        }
+
+        &:focus-visible {
+          background-color: $reporter-section-background;
+
+          + .button-hover-shadow {
+            opacity: 1;
+            background: linear-gradient(90deg, rgba(37, 40, 60, 0) -9.8%, $reporter-section-background 19.52%);
+          }
+        }
+
+        svg {
+          flex-shrink: 0;
+        }
       }
-    }
-
-    i {
-      margin-right: 3px;
-    }
-
-    .hook-failed .hook-failed-message {
-      display: inline;
     }
   }
 }

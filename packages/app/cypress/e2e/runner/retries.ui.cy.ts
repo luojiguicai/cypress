@@ -1,0 +1,368 @@
+import { loadSpec } from './support/spec-loader'
+import { snapshotReporter } from './support/snapshot-reporter'
+
+// Returns wrapped attempt tag found within runnable containing selector
+const getAttemptTag = (sel: string) => {
+  return cy.reporter().find(`.test.runnable:contains(${sel}) .attempt-tag`)
+}
+
+describe('runner/cypress retries.ui.spec', {
+  viewportWidth: 1024,
+  viewportHeight: 900,
+  numTestsKeptInMemory: 1,
+}, () => {
+  afterEach(() => {
+    if (cy.state('test').state === 'passed') {
+      snapshotReporter()
+    }
+  })
+
+  it('collapses tests that retry and pass', () => {
+    loadSpec({
+      filePath: 'retries/collapse-after-pass.retries.cy.js',
+      passCount: 2,
+      failCount: 0,
+    })
+
+    cy.reporter().find('.test').should('have.length', 2)
+  })
+
+  it('collapses prev attempts and keeps final one open on failure', () => {
+    loadSpec({
+      filePath: 'retries/collapse-prev-attempts.retries.cy.js',
+      passCount: 1,
+      failCount: 1,
+    })
+
+    cy.reporter().find('.runnable-err-print').should('be.visible')
+  })
+
+  it('passes on the retry after a beforeEach command timed out', () => {
+    loadSpec({
+      filePath: 'retries/before-each-command-timeout.retries.cy.ts',
+      passCount: 1,
+      failCount: 0,
+    })
+
+    cy.reporter().contains('Attempt 1').click()
+    cy.reporter().find('.attempt-1').contains('Cypress test was stopped while running this command.')
+  })
+
+  it('can toggle failed prev attempt open and log its error', { viewportHeight: 1200 }, () => {
+    loadSpec({
+      filePath: 'retries/all-retry-one-failure.retries.cy.js',
+      passCount: 2,
+      failCount: 1,
+    })
+
+    cy.window().then((win) => {
+      cy.spy(win.console, 'error').as('console_error')
+    })
+
+    cy.reporter().contains('Attempt 1')
+    .click()
+    .closest('.attempt-item')
+    .find('.runnable-err-print')
+    .click()
+
+    cy.get('@console_error').should('be.calledWithMatch', 'AssertionError: test 2')
+  })
+
+  // TODO: Determine how best to access the inner Cypress instance prior to test execution
+  // spy on its actions during the test run (https://cypress-io.atlassian.net/browse/UNIFY-1153)
+  it.skip('opens attempt on each attempt failure for the screenshot, and closes after test passes', () => {
+    let stub
+    const cyReject = (fn) => {
+      return () => {
+        try {
+          fn()
+        } catch (e) {
+          // @ts-expect-error - the internal cy.fail type requires an options argument this call does not need
+          cy.fail(e)
+        }
+      }
+    }
+
+    loadSpec({
+      filePath: 'retries/opens-attempt-for-screenshot.retries.cy.js',
+      passCount: 3,
+      failCount: 0,
+      setup: () => {
+        let attempt = 0
+
+        stub = cy.stub().callsFake(cyReject(() => {
+          attempt++
+          expect(cy.$$('.attempt-item > .is-open').length).to.equal(attempt)
+        }))
+
+        cy.window().then((win) => {
+          // @ts-expect-error - Screenshot.onAfterScreenshot is internal and missing from the public Cypress type
+          win.Cypress.Screenshot.onAfterScreenshot = stub
+        })
+      },
+    })
+
+    cy.reporter().find('.test.runnable:contains(t2)').then(($el) => {
+      expect($el).not.class('is-open')
+      expect(stub).callCount(3)
+    })
+  })
+
+  it('includes routes, spies, hooks, and commands in attempt', () => {
+    const attemptTag = (sel) => `.attempt-tag:contains(Attempt ${sel})`
+
+    loadSpec({
+      filePath: 'retries/includes-all-in-attempt.retries.cy.js',
+      passCount: 1,
+      failCount: 0,
+    })
+
+    cy.reporter().find(attemptTag(1)).click().parentsUntil('.collapsible').last().parent().within(() => {
+      cy.get('.instruments-container').should('contain', 'Spies / Stubs (1)')
+      cy.get('.instruments-container').should('contain', 'Routes (1)')
+      cy.get('.runnable-err').should('contain', 'AssertionError')
+    })
+
+    cy.reporter().find(attemptTag(2)).click().parentsUntil('.collapsible').last().parent().within(() => {
+      cy.get('.instruments-container').should('contain', 'Spies / Stubs (2)')
+      cy.get('.instruments-container').should('contain', 'Routes (2)')
+      cy.get('.runnable-err').should('contain', 'AssertionError')
+    })
+
+    cy.reporter().find(attemptTag(3)).parentsUntil('.collapsible').last().parent().within(() => {
+      cy.get('.instruments-container').should('contain', 'Spies / Stubs (2)')
+      cy.get('.instruments-container').should('contain', 'Routes (2)')
+      cy.get('.runnable-err').should('not.exist')
+    })
+  })
+
+  describe('only', () => {
+    it('test retry with [only]', () => {
+      loadSpec({
+        filePath: 'retries/only.retries.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('test 2')
+      cy.reporter().contains('test 1').should('not.exist')
+      cy.reporter().contains('test 3').should('not.exist')
+    })
+  })
+
+  describe('beforeAll', () => {
+    it('tests do not retry when beforeAll fails', () => {
+      loadSpec({
+        filePath: 'retries/before-all-failure.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      cy.reporter().contains('Although you have test retries')
+    })
+
+    it('before all hooks are not run on the second attempt when fails outside of beforeAll', () => {
+      loadSpec({
+        filePath: 'retries/before-all-called-once.retries.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('test')
+      cy.reporter().contains('after all')
+      cy.reporter().contains('before all').should('not.exist')
+    })
+  })
+
+  describe('beforeEach', () => {
+    it('beforeEach hooks retry on failure, but only run same-level afterEach hooks', { viewportHeight: 1550 }, () => {
+      loadSpec({
+        filePath: 'retries/before-each-failure.retries.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('Attempt 1').click()
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(before each)').find('.command-state-failed')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(before each (2))').should('not.exist')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(test body)').should('not.exist')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(after each)').should('not.exist')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(after all)').should('not.exist')
+
+      cy.reporter().contains('Attempt 2').click()
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(before each)')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(before each (2))')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(before each (3))').find('.command-state-failed')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(test body)').should('not.exist')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each)')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after all)').should('not.exist')
+
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(before each)')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(before each (2))')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(before each (3))')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(before each (4))')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(test body)')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(after each)')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(after all)')
+    })
+
+    it('beforeEach retried tests skip remaining tests in suite', () => {
+      loadSpec({
+        filePath: 'retries/before-each-skip.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+        pendingCount: 0,
+      })
+
+      // ensure the page is loaded before taking snapshot
+      cy.reporter().contains('skips this')
+    })
+  })
+
+  describe('afterEach', () => {
+    it('afterEach hooks retry on failure, but only run higher-level afterEach hooks', () => {
+      const shouldBeOpen = ($el) => cy.wrap($el).parentsUntil('.collapsible').last().parent().should('have.class', 'is-open')
+
+      loadSpec({
+        filePath: 'retries/after-each-failure.retries.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('Attempt 1')
+      .click()
+      .then(shouldBeOpen)
+
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(after each (1))').find('.command-state-failed')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(after each (2))')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(after each (3))').should('not.exist')
+      cy.reporter().find('.attempt-1 .hook-item .collapsible:contains(after all)').should('not.exist')
+
+      cy.reporter().contains('Attempt 2').click()
+      .then(shouldBeOpen)
+
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each (1))')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each (2))')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each (3))').find('.command-state-failed')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after all)').should('not.exist')
+
+      cy.reporter().find('.attempt-tag').should('have.length', 3)
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each (1))')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each (2))')
+      cy.reporter().find('.attempt-2 .hook-item .collapsible:contains(after each (3))')
+      cy.reporter().find('.attempt-3 .hook-item .collapsible:contains(after all)')
+    })
+
+    it('afterEach retried tests skip remaining tests in suite', () => {
+      loadSpec({
+        filePath: 'retries/after-each-skip.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+        pendingCount: 0,
+      })
+    })
+  })
+
+  describe('afterAll', () => {
+    it('only run afterAll hook on last attempt', () => {
+      loadSpec({
+        filePath: 'retries/after-all-once.retries.cy.js',
+        passCount: 3,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('test 3').click()
+      getAttemptTag('test 3').first().click()
+      cy.reporter().contains('.attempt-1', 'after all').should('not.exist')
+      cy.reporter().contains('.attempt-2', 'after all')
+    })
+
+    it('tests do not retry when afterAll fails', () => {
+      loadSpec({
+        filePath: 'retries/after-all-failure.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      cy.window().then((win) => {
+        cy.spy(win.console, 'error').as('console_error')
+      })
+
+      cy.reporter().contains('Although you have test retries')
+      cy.reporter().find('.runnable-err-print').click()
+      cy.get('@console_error').its('lastCall').should('be.calledWithMatch', 'Error')
+    })
+  })
+
+  describe('can configure retries', () => {
+    after(() => {
+      // @ts-expect-error - window.top may be null, and it does not declare the test-only __cySkipValidateConfig flag
+      window.top.__cySkipValidateConfig = false
+    })
+
+    const haveCorrectError = ($el) => {
+      return (
+        cy.wrap($el).last().parentsUntil('.collapsible').last().parent()
+        .find('.runnable-err').should('contain', 'Unspecified AssertionError')
+      )
+    }
+
+    const containText = (text) => {
+      return (($el) => {
+        expect($el[0]).property('innerText').contain(text)
+      })
+    }
+
+    // @ts-expect-error - window.top may be null, and it does not declare the test-only __cySkipValidateConfig flag
+    window.top.__cySkipValidateConfig = true
+
+    it('via config value', () => {
+      loadSpec({
+        filePath: 'retries/configure-retries.retries.cy.js',
+        passCount: 0,
+        failCount: 7,
+      })
+
+      getAttemptTag('[no retry]').should('have.length', 1).then(haveCorrectError)
+      getAttemptTag('[1 retry]').should('have.length', 2).then(haveCorrectError)
+      getAttemptTag('[2 retries]').should('have.length', 3).then(haveCorrectError)
+      getAttemptTag('[open mode, no retry]').should('have.length', 1).then(haveCorrectError)
+      getAttemptTag('[run mode, retry]').should('have.length', 2).then(haveCorrectError)
+      getAttemptTag('[open mode, 2 retries]').should('have.length', 3).then(haveCorrectError)
+      getAttemptTag('[set retries on suite]').should('have.length', 2).then(haveCorrectError)
+    })
+
+    it('throws when set via this.retries in test', () => {
+      loadSpec({
+        filePath: 'retries/configure-in-test.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      cy.reporter().find('.runnable-err')
+      .should(containText(`it('tries to set mocha retries', { retries: 2 }, () => `))
+    })
+
+    it('throws when set via this.retries in hook', () => {
+      loadSpec({
+        filePath: 'retries/configure-in-hook.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      cy.reporter().find('.runnable-err')
+      .should(containText(`describe('suite 1', { retries: 0 }, () => `))
+    })
+
+    it('throws when set via this.retries in suite', () => {
+      loadSpec({
+        filePath: 'retries/configure-in-suite.retries.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      cy.reporter().find('.runnable-err')
+      .should(containText(`describe('suite 1', { retries: 3 }, () => `))
+    })
+  })
+})

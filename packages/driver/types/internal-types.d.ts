@@ -1,90 +1,170 @@
 // NOTE: this is for internal Cypress types that we don't want exposed in the public API but want for development
 // TODO: find a better place for this
+/// <reference path="./internal-types-lite.d.ts" />
+/// <reference path="./spec-types.d.ts" />
+/// <reference path="./cypress/log.d.ts" />
+
+interface InternalWindowLoadDetails {
+  type: 'same:origin' | 'cross:origin' | 'cross:origin:failure'
+  error?: Error
+  window?: AUTWindow
+}
+
+interface InternalTypeOptions extends Partial<Cypress.TypeOptions> {
+  _log?: Log
+  $el: JQuery
+  ensure?: object
+  verify: boolean
+  interval?: number
+}
+
+interface InternalClearOptions extends Partial<Cypress.CheckClearOptions> {
+  _log?: Log
+  ensure?: object
+  interval?: number
+}
+
+interface InternalCheckOptions extends Partial<Cypress.CheckClearOptions> {
+  interval?: number
+}
+
+// `Cypress.Keyboard` is published with only the documented `defaults()` and
+// `Keys`, so internal callers cast to this. Merging it onto `Cypress.Cypress`
+// does not work: a duplicate member needs an identical type, and the mismatch
+// is an error inside a .d.ts, which `skipLibCheck` drops.
+type InternalKeyboard = typeof import('../src/cy/keyboard').default
+
+// `Cypress.Screenshot` is published with only the documented `defaults()`, so
+// internal callers cast to this for the same reason.
+type InternalScreenshot = typeof import('../src/cypress/screenshot').default
 
 declare namespace Cypress {
-  interface Actions {
-    (action: 'net:stubbing:event', frame: any)
-    (action: 'request:event', data: any)
-  }
-
-  interface cy {
-    /**
-     * If `as` is chained to the current command, return the alias name used.
-     */
-    getNextAlias: () => string | undefined
-    noop: <T>(v: T) => Cypress.Chainable<T>
-    queue: any
-    retry: (fn: () => any, opts: any) => any
-    state: State
-    pauseTimers: <T>(shouldPause: boolean) => Cypress.Chainable<T>
-    // TODO: this function refers to clearTimeout at cy/timeouts.ts, which doesn't have any argument.
-    // But in many cases like cy/commands/screenshot.ts, it's called with a timeout id string.
-    // We should decide whether calling with id is correct or not.
-    clearTimeout: <T>(timeoutId?: string) => Cypress.Chainable<T>
+  // Checks that `$ensure` exposes for internal callers only
+  interface Ensure {
+    commandCanCommunicateWithAUT: typeof import('../src/cypress/ensure').default.commandCanCommunicateWithAUT
+    isStrictlyVisible: typeof import('../src/cypress/ensure').default.isStrictlyVisible
   }
 
   interface Cypress {
+    browserMajorVersion: () => number
     backend: (eventName: string, ...args: any[]) => Promise<any>
     // TODO: how to pull this from proxy-logging.ts? can't import in a d.ts file...
     ProxyLogging: any
-    // TODO: how to pull these from resolvers.ts? can't import in a d.ts file...
-    resolveWindowReference: any
-    resolveLocationReference: any
     routes: {
       [routeId: string]: any
     }
     sinon: sinon.SinonApi
     utils: CypressUtils
-    state: State
+    events: Events
+    specBridgeCommunicator: import('../src/cross-origin/communicator').SpecBridgeCommunicator
+    handleCrossOriginSocketEvent?: typeof handleCrossOriginSocketEvent
+    mocha: $Mocha
+    configure: (config: Cypress.ObjectLike) => void
+    isCrossOriginSpecBridge: boolean
+    originalConfig: Cypress.ObjectLike
+    cy: $Cy
+    Chainer: typeof import('../src/cypress/chainer').$Chainer
+    Location: {
+      create: (url: string) => ({ domain: string, superDomain: string })
+    }
+    Log: typeof import('../src/cypress/log').LogUtils
+    $Cypress: {
+      $: JQueryStatic
+    }
+  }
+
+  interface Chainable {
+    // Invokes a command by name rather than by property access, so that specs can
+    // exercise commands whose names are not valid identifiers or not yet registered.
+    command(name: string, ...args: any[]): Chainable<any>
+  }
+
+  interface cy {
+    isStopped: () => boolean
   }
 
   interface CypressUtils {
+    addTwentyYears: () => number
+    encodeBase64Unicode: (str: string) => string
+    getDistanceBetween: (point1: { x: number, y: number }, point2: { x: number, y: number }) => number
+    isInstanceOf: (instance: any, constructor: any) => boolean
+    locExisting: () => ReturnType<Cypress['Location']['create']>
+    locHref: (url: string, win: Window) => void
+    locReload: (forceReload: boolean, win: Window) => void
+    log: (...msgs: any[]) => void
     throwErrByPath: (path: string, obj?: { args: object }) => void
     warnByPath: (path: string, obj?: { args: object }) => void
     warning: (message: string) => void
   }
 
-  type Log = ReturnType<Cypress.log>
-
-  interface LogConfig {
-    message: any[]
-    instrument?: 'route'
-    isStubbed?: boolean
-    alias?: string
-    aliasType?: 'route'
-    commandName?: string
-    type?: 'parent'
-    event?: boolean
-    method?: string
-    url?: string
-    status?: number
-    numResponses?: number
-    response?: string | object
-    renderProps?: () => {
-      indicator?: 'aborted' | 'pending' | 'successful' | 'bad'
-      message?: string
-    }
-    browserPreRequest?: any
+  interface InternalConfig {
+    (k: keyof ResolvedConfigOptions, v?: any): any
   }
 
-  interface State {
-    (k: '$autIframe', v?: JQuery<HTMLIFrameElement>): JQuery<HTMLIFrameElement> | undefined
-    (k: 'routes', v?: RouteMap): RouteMap
-    (k: 'aliasedRequests', v?: AliasedRequest[]): AliasedRequest[]
-    (k: 'document', v?: Document): Document
-    (k: 'window', v?: Window): Window
-    (k: string, v?: any): any
-    state: Cypress.state
+  interface TestConfigOverrides extends Cypress.TestConfigOverrides {
+    isDefaultProtocolEnabled?: boolean
   }
 
-  // Extend Cypress.state properties here
   interface ResolvedConfigOptions {
     $autIframe: JQuery<HTMLIFrameElement>
     document: Document
+    projectRoot?: string
+  }
+
+  interface Actions {
+    (action: 'set:cookie', fn: (cookie: SerializableAutomationCookie) => void)
+    (action: 'clear:cookie', fn: (name: string) => void)
+    (action: 'clear:cookies', fn: () => void)
+    (action: 'cross:origin:cookies', fn: (cookies: SerializableAutomationCookie[]) => void)
+    (action: 'before:stability:release', fn: () => void)
+    (action: '_log:added', fn: (attributes: ObjectLike, log: Cypress.Log) => void): Cypress
+    (action: '_log:changed', fn: (attributes: ObjectLike, log: Cypress.Log) => void): Cypress
+    (action: 'resume:all', fn: () => void)
+  }
+
+  interface Backend {
+    (task: 'cross:origin:cookies:received'): Promise<void>
+    (task: 'get:rendered:html:origins'): Promise<string[]>
+  }
+}
+
+declare namespace InternalCypress {
+  interface Cypress extends Cypress.Cypress, NodeEventEmitter {
+    sourceMapProjectRoot: string
+    backend: (eventName: string, ...args: any[]) => Promise<any>
+  }
+
+  interface LocalStorage extends Cypress.LocalStorage {
+    setStorages: (local, remote) => LocalStorage
+    unsetStorages: () => LocalStorage
   }
 }
 
 type AliasedRequest = {
   alias: string
   request: any
+}
+
+// utility types
+type PartialBy<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>
+
+interface SpecWindow extends Window {
+  cy: $Cy
+}
+
+interface CypressRunnable extends Mocha.Runnable {
+  type: null | 'hook' | 'suite' | 'test'
+  hookId: any
+  hookName: string
+  id: any
+  err: any
+  // Added by Cypress to Tests in order to calculate continue conditions for retries
+  calculateTestStatus?: () => {
+    strategy: 'detect-flake-and-pass-on-threshold' | 'detect-flake-but-always-fail' | undefined
+    shouldAttemptsContinue: boolean
+    attempts: number
+    outerStatus: 'passed' | failed
+  }
+  // Added by Cypress to Tests in order to determine if the experimentalRetries test run passed so we can leverage in the retry logic.
+  hasAttemptPassed?: boolean
 }

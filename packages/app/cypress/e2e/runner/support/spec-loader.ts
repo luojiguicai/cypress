@@ -1,0 +1,120 @@
+import type { ProjectFixtureDir } from '@tooling/system-tests/lib/fixtureDirs'
+import type { ExpectedResults } from '../../support/execute-spec'
+
+export const shouldHaveTestResults = ({ passCount, failCount, pendingCount }: ExpectedResults) => {
+  passCount = passCount || '--'
+  failCount = failCount || '--'
+
+  cy.reporter({ timeout: 30000 }).find('button.restart', { timeout: 30000 }).should('be.visible') // ensure tests are finished running
+
+  cy.reporter().find('.stats', { timeout: 10000 }).within(() => {
+    cy.get('.passed .num', { timeout: 40000 }).should('have.text', `${passCount}`)
+    cy.get('.failed .num', { timeout: 40000 }).should('have.text', `${failCount}`)
+
+    if (pendingCount) {
+      cy.get('.pending .num', { timeout: 20000 }).should('have.text', `${pendingCount}`)
+    }
+  })
+
+  // For the no-tests case (both counts are 0 → '--'), the stats assertions
+  // above match BOTH the pre-run state and the no-tests final state, so they
+  // can pass before the reporter has rendered. Explicitly wait for the
+  // reporter to exit its Loading state (runnablesStore.isReady === true) so
+  // downstream assertions (e.g. on the empty-state copy) don't race.
+  if (passCount === '--' && failCount === '--') {
+    cy.reporter().find('.runnable-loading', { timeout: 30000 }).should('not.exist')
+  }
+}
+
+type ExperimentalRetriesProjects = 'detect-flake-and-pass-on-threshold' | 'detect-flake-but-always-fail' | 'detect-flake-but-always-fail-stop-any-passed'
+
+export type LoadSpecOptions = {
+  filePath: string
+  setup?: () => void
+  passCount?: number | string
+  failCount?: number | string
+  pendingCount?: number | string
+  hasPreferredIde?: boolean
+  projectName?: 'runner-e2e-specs' | 'runner-e2e-specs-new-sourcemap-root' | 'runner-ct-specs' | 'session-and-origin-e2e-specs' | ExperimentalRetriesProjects
+  mode?: 'e2e' | 'component'
+  configFile?: string
+  scaffold?: boolean
+}
+
+export function loadSpec (options: LoadSpecOptions) {
+  const {
+    filePath,
+    setup,
+    passCount = '--',
+    failCount = '--',
+    hasPreferredIde = false,
+    pendingCount,
+    mode = 'e2e',
+    configFile = 'cypress.config.js',
+    projectName = 'runner-e2e-specs',
+    scaffold = true,
+  } = options
+
+  if (scaffold) {
+    cy.scaffoldProject(projectName)
+  }
+
+  if (mode === 'component') {
+    cy.openProject(projectName, ['--config-file', configFile, '--component'])
+  } else {
+    cy.openProject(projectName, ['--config-file', configFile])
+  }
+
+  cy.startAppServer(mode)
+
+  cy.withCtx((ctx, options) => {
+    ctx.update((coreData) => {
+      if (options.hasPreferredIde) {
+        // set preferred editor to bypass IDE selection dialog
+        coreData.localSettings.availableEditors = [
+          ...ctx.coreData.localSettings.availableEditors,
+          {
+            id: 'test-editor',
+            binary: '/usr/bin/test-editor',
+            name: 'Test editor',
+          },
+        ]
+
+        coreData.localSettings.preferences.preferredEditorBinary = '/usr/bin/test-editor'
+      }
+
+      coreData.localSettings.preferences.isSpecsListOpen = false
+    })
+  }, { hasPreferredIde })
+
+  cy.visitApp(`specs/runner?file=cypress/e2e/${filePath}`)
+
+  cy.reporter().find('[data-cy="runnable-header"]', { timeout: 30000 }).should('contain', Cypress._.last(filePath.split('/')))
+
+  if (setup) {
+    setup()
+  }
+
+  // Wait for specs to complete
+  shouldHaveTestResults({ passCount, failCount, pendingCount })
+}
+
+export function runSpec ({ fileName, projectName }: { fileName: string, projectName?: ProjectFixtureDir }) {
+  projectName = projectName || 'runner-e2e-specs'
+  cy.scaffoldProject(projectName)
+  cy.openProject(projectName)
+  cy.startAppServer()
+
+  cy.visitApp(`specs/runner?file=cypress/e2e/runner/${fileName}`)
+
+  // Spec navigation within the app remounts the reporter iframe. Wait for the
+  // new spec's file name to show in the runnable header so queries can't
+  // anchor to the outgoing spec's reporter.
+  cy.reporter({ timeout: 30000 }).find('[data-cy="runnable-header"]', { timeout: 30000 }).should('contain', Cypress._.last(fileName.split('/')))
+
+  // First ensure the test is loaded
+  cy.reporter().find('.passed > .num').should('contain', '--')
+  cy.reporter().find('.failed > .num').should('contain', '--')
+
+  return cy.window()
+}

@@ -1,4 +1,4 @@
-// checking types passed to cypress/plugins/index.js file
+// checking types passed through setupNodeEvents
 
 // does nothing
 const pluginConfig: Cypress.PluginConfig = (on, config) => {}
@@ -6,22 +6,32 @@ const pluginConfig: Cypress.PluginConfig = (on, config) => {}
 // allows synchronous returns
 const pluginConfig2: Cypress.PluginConfig = (on, config) => {
   config // $ExpectType PluginConfigOptions
-  config.baseUrl // $ExpectType: string
-  config.configFile // $ExpectType: string | false
-  config.fixturesFolder // $ExpectType: string | false
-  config.pluginsFile // $ExpectType: string | false
-  config.screenshotsFolder // $ExpectType: string | false
-  config.videoCompression // $ExpectType: number | false
-  config.projectRoot // $ExpectType: string
-  config.version // $ExpectType: string
-  config.testingType // $ExpectType: TestingType
+  config.configFile // $ExpectType string
+  config.fixturesFolder // $ExpectType string | false
+  config.screenshotsFolder // $ExpectType string | false
+  config.videoCompression // $ExpectType number | boolean
+  config.projectRoot // $ExpectType string
+  config.version // $ExpectType string
+  config.testingType // $ExpectType TestingType
+  config.browsers // $ExpectType Browser[]
+
+  // https://github.com/cypress-io/cypress/issues/30420
+  on('before:run', (details) => {
+    details.config // $ExpectType PluginConfigOptions
+    details.config.projectRoot // $ExpectType string
+    details.config.configFile // $ExpectType string
+    details.config.testingType // $ExpectType TestingType
+    details.config.browsers // $ExpectType Browser[]
+  })
 
   on('before:browser:launch', (browser, options) => {
     browser.displayName // $ExpectType string
     options.extensions // $ExpectType string[]
     options.args // $ExpectType string[]
+    options.env // $ExpectType { [key: string]: any; }
 
     console.log('launching browser', browser.displayName)
+
     return options
   })
 
@@ -60,13 +70,15 @@ const pluginConfig2: Cypress.PluginConfig = (on, config) => {
   })
 
   on('task', {
-    foo() {
+    foo () {
       return true
-    }
+    },
   })
 
   return {
-    baseUrl: 'http://localhost:3000'
+    e2e: {
+      baseUrl: 'http://localhost:3000',
+    },
   }
 }
 
@@ -99,19 +111,21 @@ const pluginConfig4: Cypress.PluginConfig = (on, config) => {
   })
 
   on('task', {
-    foo() {
+    foo () {
       return Promise.resolve([])
-    }
+    },
   })
 
   return Promise.resolve({
-    baseUrl: 'http://localhost:3000'
+    e2e: {
+      baseUrl: 'http://localhost:3000',
+    },
   })
 }
 
 // does not allow returning unknown properties
 const pluginConfig5: Cypress.PluginConfig = (on, config) => { // $ExpectError
   return {
-    unknownKey: 42
+    unknownKey: 42,
   }
 }

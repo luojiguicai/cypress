@@ -1,12 +1,18 @@
 {
   "compilerOptions": {
-    "target": "es2015",
-    "module": "commonjs",
-    "allowJs": true,
-    "allowSyntheticDefaultImports": true,
+    "moduleResolution": "node",
+    "strict": true,
+    "noImplicitAny": true,
     "esModuleInterop": true,
-    "noImplicitAny": false,
-    "importHelpers": true,
-    "strict": false
-  }
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": [
+      "node"
+    ]
+  },
+  "exclude": [
+    "node_modules",
+    "eslint.config.ts"
+  ]
 }

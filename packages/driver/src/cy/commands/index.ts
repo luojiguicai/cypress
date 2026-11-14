@@ -4,8 +4,6 @@ import * as Agents from './agents'
 
 import * as Aliasing from './aliasing'
 
-import * as Angular from './angular'
-
 import * as Asserting from './asserting'
 
 import * as Clock from './clock'
@@ -18,17 +16,21 @@ import * as Cookies from './cookies'
 
 import * as Debugging from './debugging'
 
+import * as Env from './env'
+
 import * as Exec from './exec'
 
 import * as Files from './files'
 
 import * as Fixtures from './fixtures'
 
-import LocalStorage from './local_storage'
+import Storage from './storage'
 
 import * as Location from './location'
 
 import * as Misc from './misc'
+
+import * as Origin from './origin'
 
 import * as Popups from './popups'
 
@@ -52,26 +54,30 @@ import Window from './window'
 
 import * as Xhr from './xhr'
 
+import * as Prompt from './prompt'
+
 export const allCommands = {
   ...Actions,
   Agents,
   Aliasing,
-  Angular,
   Asserting,
   Clock,
   Commands,
   Connectors,
   Cookies,
   Debugging,
+  Env,
   Exec,
   Files,
   Fixtures,
-  LocalStorage,
+  Storage,
   Location,
   Misc,
+  Origin,
   Popups,
+  Prompt,
   Navigation,
-  Querying,
+  ...Querying,
   Request,
   Sessions,
   Screenshot,

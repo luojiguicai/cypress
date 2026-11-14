@@ -22,8 +22,8 @@ const onServer = function (app) {
   app.get('/slow', (req, res) => {
     return setTimeout(() => {
       return res.send('<html><h1>slow</h1></html>')
-    }
-    , 2000)
+    },
+     2000)
   })
 
   app.get('/form', (req, res) => {
@@ -78,7 +78,8 @@ describe('e2e page_loading', () => {
   // set we send an XHR which should not inject because its requested for JSON
   // but that another XHR which is requested for html should inject
   systemTests.it('passes', {
-    spec: 'page_loading_spec.js',
+    browser: '!webkit', // TODO(webkit): fix+unskip (related to document.cookie issue?)
+    spec: 'page_loading.cy.js',
     snapshot: true,
   })
 })

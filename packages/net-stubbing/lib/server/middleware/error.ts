@@ -1,9 +1,9 @@
 import Debug from 'debug'
 
 import type { ErrorMiddleware } from '@packages/proxy'
-import type { CyHttpMessages } from '../../types'
+import type { CyHttpMessages } from '@packages/network-interception'
 import _ from 'lodash'
-import errors from '@packages/server/lib/errors'
+import errors from '@packages/errors'
 
 const debug = Debug('cypress:net-stubbing:server:intercept-error')
 
@@ -22,7 +22,7 @@ export const InterceptError: ErrorMiddleware = async function () {
   await request.handleSubscriptions<CyHttpMessages.NetworkError>({
     eventName: 'network:error',
     data: {
-      error: errors.clone(this.error),
+      error: errors.cloneErr(this.error),
     },
     mergeChanges: _.noop,
   })

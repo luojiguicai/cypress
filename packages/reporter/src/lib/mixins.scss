@@ -1,38 +1,108 @@
-@mixin runnable-state-active {
-    @extend .#{$fa-css-prefix}-sync-alt;
-    @extend .#{$fa-css-prefix}-spin;
+@mixin inner-header {
+  background: $gray-1100;
+  display: block;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue",
+    sans-serif;
+  font-size: 14px;
+  line-height: 24px;
+  overflow-wrap: break-word;
+  padding: 16px;
+  position: sticky;
+  top: 0;
+  width: 100%;
+  z-index: 1;
+
+  &:before,
+  &:after {
+    background-color: $gray-900;
+    content: "";
+    left: 16px;
+    position: absolute;
+    width: calc(100% - 32px);
+    height: 1px;
+  }
+
+  &:before {
+    top: 0;
+  }
+
+  &:after {
+    bottom: 0;
+  }
 }
 
-@mixin runnable-state-processing {
-    @extend .far;
-    @extend .#{$fa-css-prefix}-square;
-    color: #888;
-
-    // @extend .far overrides line-height, and so do many other specific selectors.
-    line-height: 18px !important;
+@mixin gutter-alignment {
+  flex-shrink: 0;
+  height: 28px; // because some numbers are empty
+  padding-top: 4px;
+  padding-bottom: 4px;
+  width: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-@mixin runnable-state-skipped {
-    @extend .#{$fa-css-prefix}-ban;
-    color: #888;
+@mixin command-info-padding {
+  padding-top: 4px;
+  padding-bottom: 4px;
+  align-self: center;
 }
 
-@mixin runnable-state-failed {
-    @extend .#{$fa-css-prefix}-times;
-    color: $fail;
+@mixin group-indent-width {
+  width: 18px;
+  min-width: 18px;
+  max-width: 18px;
 }
 
-@mixin runnable-state-passed {
-    @extend .#{$fa-css-prefix}-check;
-    color: $pass;
+@mixin new-test-button {
+  opacity: 0;
+  position: absolute;
+  top: 0;
+  right: 0;
+  gap: 4px;
+  color: $gray-300;
+  background: inherit;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  z-index: 1;
+
+  &:hover,
+  &:focus-visible {
+    opacity: 1 !important;
+
+    + .button-hover-shadow {
+      opacity: 1 !important;
+    }
+  }
 }
 
-@mixin runnable-state-pending {
-    @extend .#{$fa-css-prefix}-circle-notch;
-    color: lighten($pending, 20%);
+
+@mixin button-hover-shadow($linear-gradient: linear-gradient(90deg, rgba(37, 40, 60, 0) -9.8%, $gray-950 19.52%), $width: 130px) {
+  opacity: 0;
+  position: absolute;
+  width: $width;
+  height: 100%;
+  top: 0;
+  right: 0;
+  background: $linear-gradient;
+  z-index: 0;
 }
 
-@mixin studio-state-passed {
-    @extend .#{$fa-css-prefix}-magic;
-    color: #3386d4;
+@mixin sticky-header-with-shadow {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background-color: $gray-1100;
+
+  &.shadow-active::after {
+    content: "";
+    position: absolute;
+    top: 101%;
+    left: 0;
+    right: 0;
+    height: 16px;
+    background: linear-gradient(to bottom, $gray-1100 0%, rgba(22, 24, 39, 0.3) 100%);
+    pointer-events: none;
+  }
 }

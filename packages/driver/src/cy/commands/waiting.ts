@@ -5,11 +5,27 @@ import { isDynamicAliasingPossible } from '../net-stubbing/aliasing'
 import ordinal from 'ordinal'
 
 import $errUtils from '../../cypress/error_utils'
+import type { CypressError, InternalCypressError } from '../../cypress/error_utils'
+import type { $Cy } from '../../cypress/cy'
+import type { StateFunc } from '../../cypress/state'
+import type { Log } from '../../cypress/log'
 
-const getNumRequests = (state, alias) => {
-  const requests = state('aliasRequests') || {}
+type waitOptions = {
+  _log?: Cypress.Log
+  _runnableTimeout?: number
+  error?: CypressError | InternalCypressError
+  isCrossOriginSpecBridge?: boolean
+  log: boolean
+  requestTimeout?: number
+  responseTimeout?: number
+  timeout: number
+  type?: 'request' | 'response'
+}
 
-  requests[alias] = requests[alias] || 0
+const getNumRequests = (state: StateFunc, alias: string) => {
+  const requests = state('aliasRequests') ?? {}
+
+  requests[alias] = requests[alias] ?? 0
 
   const index = requests[alias]
 
@@ -17,54 +33,58 @@ const getNumRequests = (state, alias) => {
 
   state('aliasRequests', requests)
 
-  return [index, ordinal(requests[alias])]
+  return [index, ordinal(requests[alias])] as const
 }
 
-const throwErr = (arg) => {
+const throwErr = (arg: string) => {
   $errUtils.throwErrByPath('wait.invalid_1st_arg', { args: { arg } })
 }
 
-type Alias = {
-  name: string
-  cardinal: number
-  ordinal: number
-}
-
-export default (Commands, Cypress, cy, state) => {
-  const waitNumber = (subject, ms, options) => {
+export default (Commands: Cypress.Commands, Cypress: Cypress.Cypress, cy: $Cy, state: StateFunc) => {
+  const waitNumber = (subject: unknown, ms: number, options: waitOptions) => {
     // increase the timeout by the delta
-    cy.timeout(ms, true, 'wait')
+    cy.timeout(ms, true)
 
-    if (options.log !== false) {
-      options._log = Cypress.log({
-        timeout: ms,
-        consoleProps () {
-          return {
-            'Waited For': `${ms}ms before continuing`,
-            'Yielded': subject,
-          }
-        },
-      })
-    }
+    options._log = Cypress.log({
+      hidden: options.log === false,
+      timeout: ms,
+      consoleProps () {
+        return {
+          'Waited For': `${ms}ms before continuing`,
+          'Yielded': subject,
+        }
+      },
+    })
 
     return Promise
     .delay(ms, 'wait')
     .return(subject)
   }
 
-  const waitString = (subject, str, options) => {
-    let log
+  const waitString = async (str: string | string[], options: waitOptions) => {
+    // if this came from the spec bridge, we need to set a few additional properties to ensure the log displays correctly
+    // otherwise, these props will be pulled from the current command which will be cy.origin on the primary
+    const log = options._log = Cypress.log({
+      hidden: options.log === false,
+      type: 'parent',
+      aliasType: 'route',
+      // avoid circular reference
+      options: _.omit(options, '_log'),
+    })
 
-    if (options.log !== false) {
-      log = options._log = Cypress.log({
-        type: 'parent',
-        aliasType: 'route',
-        // avoid circular reference
-        options: _.omit(options, '_log'),
+    if (options.isCrossOriginSpecBridge) {
+      log?.set({
+        name: 'wait',
+        message: '',
       })
     }
 
-    const checkForXhr = async function (alias, type, index, num, options) {
+    const checkForXhr = async function (
+      alias: string,
+      type: 'request' | 'response',
+      num: string,
+      options: waitOptions,
+    ) {
       options.error = $errUtils.errByPath('wait.timed_out', {
         timeout: options.timeout,
         alias,
@@ -78,26 +98,23 @@ export default (Commands, Cypress, cy, state) => {
       const req = waitForRoute(alias, state, type)
 
       if (req) {
+        // Attach alias to request to ensure driver access to
+        // dynamic aliases. See #24653
+        req.request.alias = alias
+
         return req
       }
 
-      // append .type to the alias
-      const xhr = cy.getIndexedXhrByAlias(`${alias}.${type}`, index)
-
-      // return our xhr object
-      if (xhr) {
-        return xhr
-      }
-
-      const args: [any, any, any, any, any] = [alias, type, index, num, options]
-
       return cy.retry(() => {
-        return checkForXhr.apply(window, args)
-      }, options)
+        return checkForXhr.apply(window, [alias, type, num, options])
+      },
+      // TODO: What should `_log`'s type be?
+      // @ts-expect-error - waitOptions is not assignable to retryOptions
+      options)
     }
 
-    const waitForXhr = function (str, options) {
-      let specifier
+    const waitForXhr = async function (str: string, options: Omit<waitOptions, 'error'>) {
+      let specifier: string | null | undefined
 
       // we always want to strip everything after the last '.'
       // since we support alias property 'request'
@@ -117,7 +134,7 @@ export default (Commands, Cypress, cy, state) => {
         }
       }
 
-      let aliasObj
+      let aliasObj: { alias: string, command?: unknown }
 
       try {
         aliasObj = cy.getAlias(str, 'wait', log)
@@ -152,8 +169,8 @@ export default (Commands, Cypress, cy, state) => {
       // build up an array of referencesAlias
       // because wait can reference an array of aliases
       if (log) {
-        const referencesAlias = log.get('referencesAlias') || []
-        const aliases: Array<Alias> = [].concat(referencesAlias)
+        const referencesAlias = log.get('referencesAlias') ?? []
+        const aliases = [...referencesAlias]
 
         if (str) {
           aliases.push({
@@ -173,31 +190,16 @@ export default (Commands, Cypress, cy, state) => {
         return commandsThatCreateNetworkIntercepts.includes(commandName)
       }
 
-      const findInterceptAlias = (alias) => {
-        const routes = cy.state('routes') || {}
+      const findInterceptAlias = (alias: string) => {
+        const routes = cy.state('routes') ?? {}
 
         return _.find(_.values(routes), { alias })
       }
 
-      const isInterceptAlias = (alias) => Boolean(findInterceptAlias(alias))
-
-      const isRouteAlias = (alias) => {
-        // has all aliases saved using cy.as() command
-        const aliases = cy.state('aliases') || {}
-
-        const aliasObject = aliases[alias]
-
-        if (!aliasObject) {
-          return false
-        }
-
-        // cy.route aliases have subject that has all XHR properties
-        // let's check one of them
-        return aliasObj.subject && Boolean(aliasObject.subject.xhrUrl)
-      }
+      const isInterceptAlias = (alias: string) => Boolean(findInterceptAlias(alias))
 
       if (command && !isNetworkInterceptCommand(command)) {
-        if (!isInterceptAlias(alias) && !isRouteAlias(alias)) {
+        if (!isInterceptAlias(alias)) {
           $errUtils.throwErrByPath('wait.invalid_alias', {
             onFail: options._log,
             args: { alias },
@@ -209,29 +211,35 @@ export default (Commands, Cypress, cy, state) => {
       // but slice out the error since we may set
       // the error related to a previous xhr
       const { timeout } = options
+      // TODO: If `options.requestTimeout` and `options.responseTimeout` are
+      // `0`, is this code going to work the way it was intended to?
       const requestTimeout = options.requestTimeout || timeout
       const responseTimeout = options.responseTimeout || timeout
 
       const waitForRequest = () => {
         options = _.omit(options, '_runnableTimeout')
+        // TODO: If `requestTimeout` is `0`, is this code going to work the way
+        // it was intended to?
         options.timeout = requestTimeout || Cypress.config('requestTimeout')
 
         if (log) {
           log.set('timeout', options.timeout)
         }
 
-        return checkForXhr(alias, 'request', index, num, options)
+        return checkForXhr(alias, 'request', num, options)
       }
 
       const waitForResponse = () => {
         options = _.omit(options, '_runnableTimeout')
+        // TODO: If `responseTimeout` is `0`, is this code going to work the way
+        // it was intended to?
         options.timeout = responseTimeout || Cypress.config('responseTimeout')
 
         if (log) {
           log.set('timeout', options.timeout)
         }
 
-        return checkForXhr(alias, 'response', index, num, options)
+        return checkForXhr(alias, 'response', num, options)
       }
 
       // if we were only waiting for the request
@@ -243,17 +251,44 @@ export default (Commands, Cypress, cy, state) => {
       return waitForRequest().then(waitForResponse)
     }
 
-    return Promise
-    .map([].concat(str), (str) => {
+    return Promise.map(([] as string[]).concat(str), (str) => {
       // we may get back an xhr value instead
       // of a promise, so we have to wrap this
       // in another promise :-(
       return waitForXhr(str, _.omit(options, 'error'))
     })
     .then((responses) => {
+      // cy.retry may resolve with undefined when the runnable has already
+      // ended (canceled or transitioned). Bail out rather than dereferencing
+      // undefined entries below.
+      if (responses.some((r) => r == null)) {
+        return
+      }
+
       // if we only asked to wait for one alias
       // then return that, else return the array of xhr responses
-      const ret = responses.length === 1 ? responses[0] : responses
+      const ret = responses.length === 1 ? responses[0] : ((resp) => {
+        const respMap = new Map()
+        const respSeq = resp.map((r) => r.routeId)
+
+        // responses are sorted in the order the user specified them. if there are multiples of the same
+        // alias awaited, they're sorted in execution order
+        resp.sort((a, b) => {
+          if (!a.browserRequestId || !b.browserRequestId) {
+            return 0
+          }
+
+          // sort responses based on browser request ID
+          const requestIdSuffixA = a.browserRequestId.split('.').length > 1 ? a.browserRequestId.split('.')[1] : a.browserRequestId
+          const requestIdSuffixB = b.browserRequestId.split('.').length > 1 ? b.browserRequestId.split('.')[1] : b.browserRequestId
+
+          return parseInt(requestIdSuffixA) < parseInt(requestIdSuffixB) ? -1 : 1
+        }).forEach((r) => {
+          respMap.get(r.routeId)?.push(r) ?? respMap.set(r.routeId, [r])
+        })
+
+        return respSeq.map((routeId) => respMap.get(routeId)?.shift())
+      })(responses)
 
       if (log) {
         log.set('consoleProps', () => {
@@ -270,8 +305,56 @@ export default (Commands, Cypress, cy, state) => {
     })
   }
 
+  Cypress.primaryOriginCommunicator.on(
+    'wait:for:xhr',
+    (
+      { args: [str, options] }: { args: [string | string[], waitOptions] },
+      { origin },
+    ) => {
+      options.isCrossOriginSpecBridge = true
+      waitString(str, options).then((responses) => {
+        Cypress.primaryOriginCommunicator.toSpecBridge(origin, 'wait:for:xhr:end', responses)
+      }).catch((err) => {
+        options._log?.error(err)
+        err.hasSpecBridgeError = true
+        Cypress.primaryOriginCommunicator.toSpecBridge(origin, 'wait:for:xhr:end', err)
+      })
+    },
+  )
+
+  const delegateToPrimaryOrigin = (str: string | string[], options: waitOptions) => {
+    return new Promise((resolve, reject) => {
+      Cypress.specBridgeCommunicator.once('wait:for:xhr:end', (responsesOrErr) => {
+        // determine if this is an error by checking if there is a spec bridge error
+        if (responsesOrErr?.hasSpecBridgeError) {
+          delete responsesOrErr.hasSpecBridgeError
+          if (options.log) {
+            // skip this 'wait' log since it was already added through the primary
+            Cypress.state('onBeforeLog', (log: Log) => {
+              if (log.get('name') === 'wait') {
+                // unbind this function so we don't impact any other logs
+                cy.state('onBeforeLog', null)
+
+                return false
+              }
+
+              return true
+            })
+          }
+
+          reject(responsesOrErr)
+        }
+
+        resolve(responsesOrErr)
+      })
+
+      // subject is not needed when waiting on aliased requests since the request/response will be yielded
+      Cypress.specBridgeCommunicator.toPrimary('wait:for:xhr', { args: [str, options] })
+    })
+  }
+
   Commands.addAll({ prevSubject: 'optional' }, {
-    wait (subject, msOrAlias, options = {}) {
+    wait (subject: unknown, msOrAlias: number | string | string[], options: waitOptions) {
       // check to ensure options is an object
       // if its a string the user most likely is trying
       // to wait on multiple aliases and forget to make this
@@ -285,19 +368,18 @@ export default (Commands, Cypress, cy, state) => {
       }
 
       options = _.defaults({}, options, { log: true })
-      const args: any = [subject, msOrAlias, options]
 
       try {
-        if (_.isFinite(msOrAlias)) {
-          return waitNumber.apply(window, args)
+        if (typeof msOrAlias === 'number' && _.isFinite(msOrAlias)) {
+          return waitNumber.apply(window, [subject, msOrAlias, options])
         }
 
-        if (_.isString(msOrAlias)) {
-          return waitString.apply(window, args)
-        }
+        if (_.isString(msOrAlias) || (_.isArray(msOrAlias) && !_.isEmpty(msOrAlias))) {
+          if (Cypress.isCrossOriginSpecBridge) {
+            return delegateToPrimaryOrigin(msOrAlias, options)
+          }
 
-        if (_.isArray(msOrAlias) && !_.isEmpty(msOrAlias)) {
-          return waitString.apply(window, args)
+          return waitString.apply(window, [msOrAlias, options])
         }
 
         // figure out why this error failed
@@ -313,7 +395,7 @@ export default (Commands, Cypress, cy, state) => {
           throwErr(msOrAlias.toString())
         }
 
-        let arg
+        let arg: string
 
         try {
           arg = JSON.stringify(msOrAlias)
@@ -322,7 +404,7 @@ export default (Commands, Cypress, cy, state) => {
         }
 
         return throwErr(arg)
-      } catch (err: any) {
+      } catch (err) {
         if (err.name === 'CypressError') {
           throw err
         } else {

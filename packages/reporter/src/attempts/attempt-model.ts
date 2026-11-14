@@ -1,30 +1,37 @@
 import _ from 'lodash'
-import { action, computed, observable } from 'mobx'
+import { action, computed, observable, makeObservable } from 'mobx'
 
-import Agent, { AgentProps } from '../agents/agent-model'
-import Command, { CommandProps } from '../commands/command-model'
+import type { AgentProps } from '../agents/agent-model'
+import Agent from '../agents/agent-model'
+import type { CommandProps } from '../commands/command-model'
+import Command from '../commands/command-model'
 import Err from '../errors/err-model'
-import Route, { RouteProps } from '../routes/route-model'
-import Test, { UpdatableTestProps, TestProps, TestState } from '../test/test-model'
-import Hook, { HookName } from '../hooks/hook-model'
-import { FileDetails } from '@packages/ui-components'
-import { LogProps } from '../runnables/runnables-store'
-import Log from '../instruments/instrument-model'
-import Session, { SessionProps } from '../sessions/sessions-model'
+import type { RouteProps } from '../routes/route-model'
+import Route from '../routes/route-model'
+import type Test from '../test/test-model'
+import type { UpdatableTestProps, TestProps } from '../test/test-model'
+import type { TestState, FileDetails } from '@packages/types'
+import type { HookName } from '../hooks/hook-model'
+import Hook from '../hooks/hook-model'
+import type { LogProps } from '../runnables/runnables-store'
+import type Log from '../instruments/instrument-model'
+import type { SessionProps } from '../sessions/sessions-model'
+import Session from '../sessions/sessions-model'
 
 export default class Attempt {
-  @observable agents: Agent[] = []
-  @observable sessions: Record<string, Session> = {}
-  @observable commands: Command[] = []
-  @observable err = new Err({})
-  @observable hooks: Hook[] = []
+  agents: Agent[] = []
+  sessions: Record<string, Session> = {}
+  commands: Command[] = []
+  err?: Err = undefined
+  hooks: Hook[] = []
   // TODO: make this an enum with states: 'QUEUED, ACTIVE, INACTIVE'
-  @observable isActive: boolean | null = null
-  @observable routes: Route[] = []
-  @observable _state?: TestState | null = null
-  @observable _invocationCount: number = 0
-  @observable invocationDetails?: FileDetails
-  @observable hookCount: { [name in HookName]: number } = {
+  isActive: boolean | null = null
+  routes: Route[] = []
+  _state?: TestState | null = null
+  _testOuterStatus?: TestState = undefined
+  _invocationCount: number = 0
+  invocationDetails?: FileDetails
+  hookCount: { [name in HookName]: number } = {
     'before all': 0,
     'before each': 0,
     'after all': 0,
@@ -32,23 +39,56 @@ export default class Attempt {
     'test body': 0,
     'studio commands': 0,
   }
-  @observable _isOpen: boolean|null = null
 
-  @observable isOpenWhenLast: boolean | null = null
-  _callbackAfterUpdate: Function | null = null
+  _isOpen: boolean | null = null
+
+  isOpenWhenLast: boolean | null = null
+  _callbackAfterUpdate: (() => void) | null = null
   testId: string
 
-  @observable id: number
+  id: number
   test: Test
 
-  _logs: {[key: string]: Log} = {}
+  _logs: { [key: string]: Log } = {}
 
   constructor (props: TestProps, test: Test) {
+    makeObservable(this, {
+      agents: observable,
+      sessions: observable,
+      commands: observable,
+      err: observable,
+      hooks: observable,
+      isActive: observable,
+      routes: observable,
+      _state: observable,
+      _testOuterStatus: observable,
+      _invocationCount: observable,
+      invocationDetails: observable,
+      hookCount: observable,
+      _isOpen: observable,
+      isOpenWhenLast: observable,
+      id: observable,
+      hasCommands: computed,
+      isLongRunning: computed,
+      _hasLongRunningCommand: computed,
+      state: computed,
+      error: computed,
+      isLast: computed,
+      isOpen: computed,
+      start: action,
+      update: action,
+      setIsOpen: action,
+      finish: action,
+    })
+
     this.testId = props.id
     this.id = props.currentRetry || 0
     this.test = test
     this._state = props.state
-    this.err.update(props.err)
+
+    if (props.err) {
+      this.err = new Err(props.err)
+    }
 
     this.invocationDetails = props.invocationDetails
 
@@ -59,29 +99,39 @@ export default class Attempt {
     _.each(props.routes, this.addLog)
   }
 
-  @computed get hasCommands () {
+  get hasCommands () {
     return !!this.commands.length
   }
 
-  @computed get isLongRunning () {
+  get isLongRunning () {
     return this.isActive && this._hasLongRunningCommand
   }
 
-  @computed get _hasLongRunningCommand () {
+  get _hasLongRunningCommand () {
     return _.some(this.commands, (command) => {
       return command.isLongRunning
     })
   }
 
-  @computed get state () {
+  get state () {
     return this._state || (this.isActive ? 'active' : 'processing')
   }
 
-  @computed get isLast () {
+  get error () {
+    const command = this.err?.isCommandErr ? this.commandMatchingErr() : undefined
+
+    return {
+      err: this.err,
+      testId: command?.testId,
+      commandId: command?.id,
+    }
+  }
+
+  get isLast () {
     return this.id === this.test.lastAttempt.id
   }
 
-  @computed get isOpen () {
+  get isOpen () {
     if (this._isOpen !== null) {
       return this._isOpen
     }
@@ -90,13 +140,13 @@ export default class Attempt {
     return this.test.isActive || this.isLast
   }
 
-  @computed get studioIsNotEmpty () {
-    return _.some(this.hooks, (hook) => hook.isStudio && hook.commands.length)
-  }
-
   addLog = (props: LogProps) => {
     switch (props.instrument) {
       case 'command': {
+        if ((props as CommandProps).sessionInfo) {
+          this._addSession(props as unknown as SessionProps) // add sessionInstrumentPanel details
+        }
+
         return this._addCommand(props as CommandProps)
       }
       case 'agent': {
@@ -115,6 +165,10 @@ export default class Attempt {
     const log = this._logs[props.id]
 
     if (log) {
+      if ('sessionInfo' in props && props.sessionInfo) {
+        this._updateOrAddSession(props as unknown as SessionProps) // update sessionInstrumentPanel details
+      }
+
       log.update(props)
     }
   }
@@ -130,25 +184,41 @@ export default class Attempt {
     }
   }
 
-  commandMatchingErr () {
+  commandMatchingErr (): Command | undefined {
+    const err = this.err
+
+    if (!err) {
+      return undefined
+    }
+
     return _(this.hooks)
     .map((hook) => {
-      return hook.commandMatchingErr(this.err)
+      return hook.commandMatchingErr(err)
     })
     .compact()
     .last()
   }
 
-  @action start () {
+  start () {
     this.isActive = true
   }
 
-  @action update (props: UpdatableTestProps) {
+  update (props: UpdatableTestProps) {
     if (props.state) {
       this._state = props.state
     }
 
-    this.err.update(props.err)
+    if (props._cypressTestStatusInfo?.outerStatus) {
+      this._testOuterStatus = props._cypressTestStatusInfo.outerStatus
+    }
+
+    if (props.err) {
+      if (this.err) {
+        this.err.update(props.err)
+      } else {
+        this.err = new Err(props.err)
+      }
+    }
 
     if (props.failedFromHookId) {
       const hook = _.find(this.hooks, { hookId: props.failedFromHookId })
@@ -163,9 +233,27 @@ export default class Attempt {
     }
   }
 
-  @action finish (props: UpdatableTestProps) {
+  setIsOpen (isOpen: boolean) {
+    this._isOpen = isOpen
+  }
+
+  finish (props: UpdatableTestProps, isInteractive: boolean) {
     this.update(props)
     this.isActive = false
+
+    // if the test is not open and we aren't in interactive mode, clear out the attempt details
+    if (!this.test.isOpen && !isInteractive) {
+      this._clear()
+    }
+  }
+
+  _clear () {
+    this.commands = []
+    this.routes = []
+    this.agents = []
+    this.hooks = []
+    this._logs = {}
+    this.sessions = {}
   }
 
   _addAgent (props: AgentProps) {
@@ -180,7 +268,19 @@ export default class Attempt {
   _addSession (props: SessionProps) {
     const session = new Session(props)
 
-    this.sessions[props.sessionInfo.id] = session
+    this.sessions[props.id] = session
+  }
+
+  _updateOrAddSession (props: SessionProps) {
+    const session = this.sessions[props.id]
+
+    if (session) {
+      session.update(props)
+
+      return
+    }
+
+    this._addSession(props)
   }
 
   _addRoute (props: RouteProps) {

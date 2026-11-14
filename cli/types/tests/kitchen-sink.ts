@@ -4,41 +4,28 @@
 // and should not repeat them
 
 // extra code that is not in the kitchensink that type checks edge cases
-cy.wrap('foo').then(subject => {
+cy.wrap('foo').then((subject) => {
   subject // $ExpectType string
+
   return cy.wrap(subject)
-}).then(subject => {
+}).then((subject) => {
   subject // $ExpectType string
 })
 
 const result = Cypress.minimatch('/users/1/comments', '/users/*/comments', {
   matchBase: true,
 })
+
 result // $ExpectType boolean
 
 Cypress.minimatch('/users/1/comments', '/users/*/comments') // $ExpectType boolean
 
-// check if cy.server() yields default server options
-cy.server().should((server) => {
-  server // $ExpectType ServerOptions
-  expect(server.delay).to.eq(0)
-  expect(server.method).to.eq('GET')
-  expect(server.status).to.eq(200)
-})
-
 cy.visit('https://www.acme.com/', {
   auth: {
     username: 'wile',
-    password: 'coyote'
-  }
+    password: 'coyote',
+  },
 })
-
-const serverOptions: Partial<Cypress.ServerOptions> = {
-  delay: 100,
-  ignore: () => true
-}
-
-cy.server(serverOptions)
 
 Cypress.spec.name // $ExpectType string
 Cypress.spec.relative // $ExpectType string
@@ -58,13 +45,15 @@ cy.on('window:alert', cy.stub())
 
 // sinon-chai example
 const stub = cy.stub()
+
 expect(stub).to.not.have.been.called
 stub()
 expect(stub).to.have.been.calledOnce
 cy.wrap(stub).should('have.been.calledOnce')
 cy.wrap(stub).should('be.calledOnce')
 
-namespace EventInterfaceTests {
+// EventInterfaceTests
+{
   // window:confirm stubbing
   Cypress.on('window:confirm', () => { })
   Cypress.on('window:confirm', cy.spy())
@@ -81,9 +70,9 @@ namespace EventInterfaceTests {
 
 // specifying HTTP method directly in the options object
 cy.request({
-  url: "http://localhost:3000/myressource",
-  method: "POST",
-  body: {}
+  url: 'http://localhost:3000/myressource',
+  method: 'POST',
+  body: {},
 }).then((resp) => {
   resp // $ExpectType Response<any>
   resp.redirectedToUrl // $ExpectType string | undefined
@@ -94,10 +83,10 @@ cy.request({
 // specify query parameters
 // https://github.com/cypress-io/cypress/issues/2305
 cy.request({
-  url: "http://localhost:3000/myressource",
+  url: 'http://localhost:3000/myressource',
   qs: {
-    param: 'someValue'
-  }
+    param: 'someValue',
+  },
 })
 
 // Users can specify body type.
@@ -119,7 +108,7 @@ cy.request<ResBody>('post', 'http://goooooogle.com', {})
 
 cy.request<ResBody>({
   url: 'http://goooooogle.com',
-  body: {}
+  body: {},
 }).then((resp) => {
   resp // $ExpectType Response<ResBody>
 })
@@ -128,36 +117,39 @@ cy.request<ResBody>({
 // otherwise TSC does not cast string "POST" as HttpMethod
 // https://github.com/cypress-io/cypress/issues/2093
 const opts: Partial<Cypress.RequestOptions> = {
-  url: "http://localhost:3000/myressource",
-  method: "POST",
-  body: {}
+  url: 'http://localhost:3000/myressource',
+  method: 'POST',
+  body: {},
 }
+
 cy.request(opts)
 
 // you can cast just the "method" property
 const opts2 = {
-  url: "http://localhost:3000/myressource",
-  method: "POST" as Cypress.HttpMethod,
-  body: {}
+  url: 'http://localhost:3000/myressource',
+  method: 'POST' as Cypress.HttpMethod,
+  body: {},
 }
+
 cy.request(opts2)
 
 const obj = {
-  foo: () => { }
+  foo: () => { },
 }
+
 cy.spy(obj, 'foo').as('my-spy')
 
 // use path-based access for nested structures
 cy.wrap({
   foo: {
-    bar: 1
-  }
+    bar: 1,
+  },
 }).its('foo.bar')
 
 cy.wrap({
   foo: {
-    quux: () => 2
-  }
+    quux: () => 2,
+  },
 }).invoke('foo.quux')
 
 // different clearLocalStorage signatures
@@ -166,19 +158,29 @@ cy.clearLocalStorage('todos')
 cy.clearLocalStorage('todos', { log: false })
 cy.clearLocalStorage({ log: false })
 
-namespace BlobTests {
+// BlobTests
+{
   Cypress.Blob.imgSrcToDataURL('/some/path', undefined, 'anonymous')
     .then((dateUrl) => {
       dateUrl // $ExpectType string
   })
 }
 
-cy.window().then(window => {
+// BufferTests
+{
+  const buffer = Cypress.Buffer.from('sometext')
+
+  Cypress.Buffer.isBuffer(buffer)
+  buffer.length
+}
+
+cy.window().then((window) => {
   window // $ExpectType AUTWindow
 
   window.eval('1')
 })
 
 const a = 1
+
 // $ExpectError
-a.should("be.visible")
+a.should('be.visible')

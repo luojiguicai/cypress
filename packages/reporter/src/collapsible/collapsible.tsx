@@ -1,86 +1,94 @@
 import cs from 'classnames'
-import React, { Component, CSSProperties, MouseEvent, ReactNode, RefObject } from 'react'
-
+import type { CSSProperties, MouseEvent, ReactNode, RefObject } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { onEnterOrSpace } from '../lib/util'
+import DocumentBlankIcon from '@packages/frontend-shared/src/assets/icons/document-blank_x16.svg'
+import { IconChevronDownSmall } from '@cypress-design/react-icon'
 
-interface Props {
+export interface CollapsibleHeaderComponentProps {
+  isOpen: boolean
+}
+
+interface CollapsibleProps {
   isOpen?: boolean
   headerClass?: string
   headerStyle?: CSSProperties
   header?: ReactNode
+  HeaderComponent?: React.FunctionComponent<CollapsibleHeaderComponentProps>
   headerExtras?: ReactNode
   containerRef?: RefObject<HTMLDivElement>
   contentClass?: string
+  hideExpander?: boolean
+  children?: ReactNode
+  onOpenStateChangeRequested?: (isOpen: boolean) => void
 }
 
-interface State {
-  isOpen: boolean
-}
+const Collapsible: React.FC<CollapsibleProps> = ({ isOpen: isOpenAsProp = false, header, headerClass = '', headerStyle = {}, headerExtras, contentClass = '', hideExpander = false, containerRef = null, onOpenStateChangeRequested, children, HeaderComponent }) => {
+  const [isOpenState, setIsOpenState] = useState(isOpenAsProp)
+  const headerRef = useRef<HTMLDivElement>(null)
+  const fixedElementRef = useRef<HTMLDivElement>(null)
 
-class Collapsible extends Component<Props, State> {
-  static defaultProps = {
-    isOpen: false,
-    headerClass: '',
-    headerStyle: {},
-    contentClass: '',
-  }
-
-  constructor (props: Props) {
-    super(props)
-
-    this.state = { isOpen: props.isOpen || false }
-  }
-
-  componentDidUpdate (prevProps: Props) {
-    if (this.props.isOpen != null && this.props.isOpen !== prevProps.isOpen) {
-      this.setState({ isOpen: this.props.isOpen })
+  const toggleOpenState = useCallback((e?: MouseEvent) => {
+    e?.stopPropagation()
+    if (onOpenStateChangeRequested) {
+      onOpenStateChangeRequested(!isOpen)
+    } else {
+      setIsOpenState(!isOpen)
     }
+  }, [isOpenState, onOpenStateChangeRequested])
+
+  const isOpen = onOpenStateChangeRequested ? isOpenAsProp : isOpenState
+
+  const toggleHeaderShadow = (entries) => {
+    const [entry] = entries
+
+    headerRef.current?.classList.toggle('shadow-active', !entry.isIntersecting)
   }
 
-  render () {
-    return (
-      <div className={cs('collapsible', { 'is-open': this.state.isOpen })} ref={this.props.containerRef}>
-        <div className={cs('collapsible-header-wrapper', this.props.headerClass)}>
+  useEffect(() => {
+    if (!fixedElementRef?.current) return
+
+    const observer = new IntersectionObserver(toggleHeaderShadow)
+
+    observer.observe(fixedElementRef.current)
+
+    return () => observer.disconnect()
+  }, [])
+
+  return (
+    <div className={cs('collapsible', { 'is-open': isOpen })} ref={containerRef}>
+      {/* This empty div acts as an intersection observer target to toggle the header shadow based on scroll position */}
+      <div ref={fixedElementRef}/>
+      <div className={cs('collapsible-header-wrapper', headerClass)} ref={headerRef}>
+        <div
+          aria-expanded={isOpen}
+          className='collapsible-header'
+          onClick={toggleOpenState}
+          onKeyUp={onEnterOrSpace(toggleOpenState)}
+          role='button'
+          tabIndex={0}
+        >
           <div
-            aria-expanded={this.state.isOpen}
-            className='collapsible-header'
-            onClick={this._onClick}
-            onKeyPress={onEnterOrSpace(this._onKeyPress)}
-            role='button'
-            tabIndex={0}
+            className='collapsible-header-inner'
+            style={headerStyle}
+            tabIndex={-1}
           >
-            <div
-              className='collapsible-header-inner'
-              style={this.props.headerStyle}
-              tabIndex={-1}
-            >
-              <i className='collapsible-indicator fa-fw fas' />
-              <span className='collapsible-header-text'>
-                {this.props.header}
-              </span>
-            </div>
+            {!hideExpander && headerClass === 'hook-header' && <IconChevronDownSmall size='16' strokeColor='gray-800' className='collapsible-indicator' />}
+            {!hideExpander && headerClass !== 'hook-header' && <DocumentBlankIcon className='collapsible-indicator' />}
+            <span className='collapsible-header-text'>
+              {HeaderComponent ? <HeaderComponent isOpen={isOpen} /> : header}
+            </span>
           </div>
-          {this.props.headerExtras}
         </div>
-        <div className={cs('collapsible-content', this.props.contentClass)}>
-          {this.state.isOpen && this.props.children}
-        </div>
+        {headerExtras}
       </div>
-    )
-  }
-
-  _toggleOpen = () => {
-    this.setState({ isOpen: !this.state.isOpen })
-  }
-
-  _onClick = (e: MouseEvent) => {
-    e.stopPropagation()
-    this._toggleOpen()
-  }
-
-  _onKeyPress = () => {
-    this._toggleOpen()
-  }
+      {isOpen && (
+        <div className={cs('collapsible-content', contentClass)}>
+          {children}
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default Collapsible

@@ -4,7 +4,7 @@ import $document from '../document'
 import $jquery from '../jquery'
 import { getTagName } from './elementHelpers'
 import { isWithinShadowRoot, getShadowElementFromPoint } from './shadow'
-import { normalizeWhitespaces, escapeQuotes } from './utils'
+import { normalizeWhitespaces } from './utils'
 
 /**
  * Find Parents relative to an initial element
@@ -61,7 +61,7 @@ export const findParent = (el, condition) => {
   return collectParent(el)
 }
 
-export const getFirstParentWithTagName = ($el, tagName) => {
+export const getFirstParentWithTagName = ($el: JQuery, tagName: string) => {
   if (isUndefinedOrHTMLBodyDoc($el) || !tagName) {
     return null
   }
@@ -119,7 +119,7 @@ const priorityElement = 'input[type=\'submit\'], button, a, label'
 export const getFirstDeepestElement = ($el: JQuery, index = 0) => {
   // iterate through all of the elements in pairs
   // and check if the next item in the array is a
-  // descedent of the current. if it is continue
+  // descendent of the current. if it is continue
   // to recurse. if not, or there is no next item
   // then return the current
   const $current = $el.slice(index, index + 1)
@@ -160,9 +160,9 @@ export const getFirstDeepestElement = ($el: JQuery, index = 0) => {
 /**
  * By XY Coordinate
  */
-export const elementFromPoint = (doc, x, y) => {
+export const elementFromPoint = (doc, x, y): HTMLElement => {
   // first try the native elementFromPoint method
-  let elFromPoint = doc.elementFromPoint(x, y)
+  const elFromPoint = doc.elementFromPoint(x, y)
 
   return getShadowElementFromPoint(elFromPoint, x, y)
 }
@@ -171,31 +171,40 @@ export const elementFromPoint = (doc, x, y) => {
  * By DOM Hierarchy
  * Compares two elements to see what their relationship is
  */
-export const isAncestor = ($el, $maybeAncestor) => {
+export const isAncestor = ($el: JQuery<HTMLElement>, $maybeAncestor: JQuery<HTMLElement>) => {
   return $jquery.wrap(getAllParents($el[0])).index($maybeAncestor) >= 0
 }
 
-export const isChild = ($el, $maybeChild) => {
-  return $el.children().index($maybeChild) >= 0
+export const isChild = ($el: JQuery<HTMLElement>, $maybeChild: JQuery<HTMLElement>) => {
+  const children = $el.children()
+
+  if (children.length && children[0].nodeName === 'SHADOW-ROOT') {
+    return isDescendent($el, $maybeChild)
+  }
+
+  return children.index($maybeChild) >= 0
 }
 
-export const isDescendent = ($el1, $el2) => {
-  if (!$el2) {
+export const isDescendent = (elOrJquery1: HTMLElement | JQuery<HTMLElement>, elOrJquery2?: HTMLElement | JQuery<HTMLElement>) => {
+  if (!elOrJquery2) {
     return false
   }
 
+  const el1 = $jquery.isJquery(elOrJquery1) ? elOrJquery1.get(0) : elOrJquery1
+  const el2 = $jquery.isJquery(elOrJquery2) ? elOrJquery2.get(0) : elOrJquery2
+
   // if they are equal, consider them a descendent
-  if ($el1.get(0) === $el2.get(0)) {
+  if (el1 === el2) {
     return true
   }
 
   // walk up the tree until we find a parent which
   // equals the descendent, if ever
-  return findParent($el2.get(0), (node) => {
-    if (node === $el1.get(0)) {
+  return findParent(el2, (node) => {
+    if (node === el1) {
       return node
     }
-  }) === $el1.get(0)
+  }) === el1
 }
 
 // mostly useful when traversing up parent nodes and wanting to
@@ -223,64 +232,97 @@ export const getElements = ($el) => {
   return els
 }
 
+/*
+ * We add three custom pseudo-selectors to jquery via `$.expr.pseudos`, the
+ * canonical extension point for the selector engine. These let us use custom
+ * logic around case sensitivity, and match strings or regular expressions.
+ *
+ * `$.expr.createPseudo` builds a pseudo-selector that captures its argument
+ * (the text inside the parentheses) when the selector is compiled.
+ *
+ * These custom expressions are used exclusively by cy.contains; see
+ * `getContainsSelector` below.
+ */
+
+// Example:
+// button:cy-contains("Login")
+$.expr.pseudos['cy-contains'] = $.expr.createPseudo((text) => {
+  text = JSON.parse(`"${ text }"`)
+
+  return function (elem) {
+    const testText = normalizeWhitespaces(elem)
+
+    return testText.includes(text)
+  }
+})
+
+// Example:
+// .login-button:cy-contains-insensitive("login")
+$.expr.pseudos['cy-contains-insensitive'] = $.expr.createPseudo((text) => {
+  text = JSON.parse(`"${ text }"`)
+
+  return function (elem) {
+    let testText = normalizeWhitespaces(elem)
+
+    testText = testText.toLowerCase()
+    text = text.toLowerCase()
+
+    return testText.includes(text)
+  }
+})
+
+function isSubmit (elem: Element): elem is HTMLInputElement {
+  return elem.tagName === 'INPUT' && (elem as HTMLInputElement).type === 'submit'
+}
+
+// Example:
+// #login>li:first:cy-contains-regex('/asdf 1/i')
+$.expr.pseudos['cy-contains-regex'] = $.expr.createPseudo((text) => {
+  const lastSlash = text.lastIndexOf('/')
+  const regex = new RegExp(text.slice(1, lastSlash), text.slice(lastSlash + 1))
+
+  // taken from jquery's normal contains method
+  return function (elem) {
+    if (isSubmit(elem)) {
+      return regex.test(elem.value)
+    }
+
+    const testText = normalizeWhitespaces(elem)
+
+    return regex.test(testText)
+  }
+})
+
 export const getContainsSelector = (text, filter = '', options: {
   matchCase?: boolean
 } = {}) => {
-  const $expr = $.expr[':']
+  if (_.isRegExp(text) && options.matchCase === false && !text.flags.includes('i')) {
+    text = new RegExp(text.source, text.flags + 'i')
+  }
 
-  const escapedText = escapeQuotes(text)
+  const escapedText = _.isString(text) ? JSON.stringify(text).slice(1, -1) : text.toString()
 
   // they may have written the filter as
   // comma separated dom els, so we want to search all
   // https://github.com/cypress-io/cypress/issues/2407
   const filters = filter.trim().split(',')
 
-  let cyContainsSelector
-
-  if (_.isRegExp(text)) {
-    if (options.matchCase === false && !text.flags.includes('i')) {
-      text = new RegExp(text.source, text.flags + 'i') // eslint-disable-line prefer-template
-    }
-
-    // taken from jquery's normal contains method
-    cyContainsSelector = function (elem) {
-      const testText = normalizeWhitespaces(elem)
-
-      return text.test(testText)
-    }
-  } else if (_.isString(text)) {
-    cyContainsSelector = function (elem) {
-      let testText = normalizeWhitespaces(elem)
-
-      if (!options.matchCase) {
-        testText = testText.toLowerCase()
-        text = text.toLowerCase()
-      }
-
-      return testText.includes(text)
-    }
-  } else {
-    cyContainsSelector = $expr.contains
-  }
-
-  // we set the `cy-contains` jquery selector which will only be used
-  // in the context of cy.contains(...) command and selector playground.
-  $expr['cy-contains'] = cyContainsSelector
+  const expr = _.isRegExp(text) ? 'cy-contains-regex' : (options.matchCase ? 'cy-contains' : 'cy-contains-insensitive')
 
   const selectors = _.map(filters, (filter) => {
     // https://github.com/cypress-io/cypress/issues/8626
     // Sizzle cannot parse when \' is used inside [attribute~='value'] selector.
     // We need to use other type of quote characters.
-    const textToFind = escapedText.includes(`\'`) ? `"${escapedText}"` : `'${escapedText}'`
+    const textToFind = escapedText.includes(`'`) ? `"${escapedText}"` : `'${escapedText}'`
 
     // use custom cy-contains selector that is registered above
-    return `${filter}:cy-contains(${textToFind}), ${filter}[type='submit'][value~=${textToFind}]`
+    return `${filter}:${expr}(${textToFind}), ${filter}[type='submit'][value~=${textToFind}]`
   })
 
   return selectors.join()
 }
 
-export const getInputFromLabel = ($el) => {
+export const getInputFromLabel = ($el: JQuery<HTMLElement>) => {
   if (!$el.is('label')) {
     return $([])
   }

@@ -1,18 +1,17 @@
+@import "../lib/mixins.scss";
+
 .reporter {
-  .collapsible-content {
-    display: none;
-  }
-
-  .is-open > .collapsible-content {
-    display: block;
-  }
-
   .collapsible-indicator {
-    @extend .#{$fa-css-prefix}-caret-right;
-    margin-right: 3px;
+    margin-right: 8px;
+    transform: rotate(-90deg);
+    transition: transform 150ms ease-out;
   }
 
   .is-open > .collapsible-header-wrapper > .collapsible-header > .collapsible-header-inner > .collapsible-indicator {
-    @extend .#{$fa-css-prefix}-caret-down;
+    transform: rotate(0);
+  }
+
+  .test > .is-open > .collapsible-header-wrapper {
+    @include sticky-header-with-shadow;
   }
 }

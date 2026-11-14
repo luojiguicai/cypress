@@ -1,8 +1,9 @@
-import { getCommonConfig, HtmlWebpackPlugin } from '@packages/web-config/webpack.config.base'
+import { getCommonConfig, HtmlWebpackPlugin, getCleanWebpackPlugin } from '@packages/web-config/webpack.config.base'
 import path from 'path'
 import type { Configuration } from 'webpack'
 
-// @ts-ignore
+const CleanWebpackPlugin = getCleanWebpackPlugin()
+
 const config: Configuration = {
   ...getCommonConfig(),
   entry: {
@@ -15,24 +16,19 @@ const config: Configuration = {
   },
 }
 
-// @ts-ignore
 config.plugins = [
-  // @ts-ignore
-  ...config.plugins,
+  ...(config.plugins ?? []),
   new HtmlWebpackPlugin({
     template: path.resolve(__dirname, 'static/index.html'),
     inject: false,
   }),
+  new CleanWebpackPlugin({ cleanStaleWebpackAssets: false }),
 ]
 
 config.resolve = {
   ...config.resolve,
   alias: {
     'lodash': require.resolve('lodash'),
-    'mobx': require.resolve('mobx'),
-    'mobx-react': require.resolve('mobx-react'),
-    'react': require.resolve('react'),
-    'react-dom': require.resolve('react-dom'),
   },
 }
 

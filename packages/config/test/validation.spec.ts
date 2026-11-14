@@ -1,0 +1,954 @@
+import { describe, it, expect } from 'vitest'
+import * as validation from '../src/validation'
+
+describe('config/src/validation', () => {
+  const mockKey = 'mockConfigKey'
+
+  describe('.validateAny', () => {
+    it('returns new validation function that accepts 2 arguments', () => {
+      const validate = validation.validateAny(() => true, () => false)
+
+      expect(validate).toBeInstanceOf(Function)
+      expect(validate.length).toEqual(2)
+    })
+
+    it('returned validation function will return true when any validations pass', () => {
+      const value = Date.now()
+      const key = `key_${value}`
+      const validatePass1 = validation.validateAny((k, v) => `${value}`, (k, v) => true)
+
+      expect(validatePass1(key, value)).toEqual(true)
+
+      const validatePass2 = validation.validateAny((k, v) => true, (k, v) => `${value}`)
+
+      expect(validatePass2(key, value)).toEqual(true)
+    })
+
+    it('returned validation function will return last failure result when all validations fail', () => {
+      const value = Date.now()
+      const key = `key_${value}`
+      const validateFail1 = validation.validateAny((k, v) => `${value}`, (k, v) => false)
+
+      expect(validateFail1(key, value)).toEqual(false)
+
+      const validateFail2 = validation.validateAny((k, v) => false, (k, v) => `${value}`)
+
+      expect(validateFail2(key, value)).toEqual(`${value}`)
+    })
+  })
+
+  describe('.isValidClientCertificatesSet', () => {
+    it('returns error message for certs not passed as an array array', () => {
+      const result = validation.isValidRetriesConfig(mockKey, '1')
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+
+    it('returns error message for certs object without url', () => {
+      const result = validation.isValidClientCertificatesSet(mockKey, [
+        { name: 'cert' },
+      ])
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+
+    it('returns error message for certs url not matching *', () => {
+      let result = validation.isValidClientCertificatesSet(mockKey, [
+        { url: 'http://url.com' },
+      ])
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('missing https protocol')
+
+      result = validation.isValidClientCertificatesSet(mockKey, [
+        { url: 'not *' },
+      ])
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('invalid url')
+    })
+
+    it('reports the correct certificate index for an absolute CA filepath', () => {
+      const result = validation.isValidClientCertificatesSet(mockKey, [
+        { url: 'https://a.com', certs: [], ca: ['relative/ca.pem'] },
+        { url: 'https://b.com', certs: [], ca: ['/absolute/ca.pem'] },
+      ])
+
+      expect(result).not.toBe(true)
+      expect((result as any).key).toEqual('clientCertificates[1].ca[0]')
+    })
+  })
+
+  describe('.isValidTrustedCertificates', () => {
+    const validSpki = 'FATqPodQyOdF/d9ZiS7za/C4uyu1X3a+xiWhG3DF0RY='
+
+    it('accepts an empty array', () => {
+      expect(validation.isValidTrustedCertificates(mockKey, [])).toBe(true)
+    })
+
+    it('accepts a filePath entry with a relative path', () => {
+      expect(validation.isValidTrustedCertificates(mockKey, [{ filePath: 'certs/leaf.pem' }])).toBe(true)
+    })
+
+    it('accepts a filePath entry with an absolute path', () => {
+      expect(validation.isValidTrustedCertificates(mockKey, [{ filePath: '/etc/certs/leaf.pem' }])).toBe(true)
+    })
+
+    it('accepts a pem entry', () => {
+      expect(validation.isValidTrustedCertificates(mockKey, [{ pem: '-----BEGIN CERTIFICATE-----' }])).toBe(true)
+    })
+
+    it('accepts a well-formed spki entry', () => {
+      expect(validation.isValidTrustedCertificates(mockKey, [{ spki: validSpki }])).toBe(true)
+    })
+
+    it('rejects a non-array value', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, { filePath: 'leaf.pem' })
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects a non-object entry', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, ['leaf.pem'])
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects an entry with zero keys', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, [{}])
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects an entry with more than one key', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, [{ filePath: 'leaf.pem', pem: 'x' }])
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects an entry with an unknown key', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, [{ url: 'https://a.com' }])
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects an empty string value', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, [{ filePath: '' }])
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects a non-string value', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, [{ pem: 123 }])
+
+      expect(result).not.toBe(true)
+    })
+
+    it('rejects a malformed spki', () => {
+      const result = validation.isValidTrustedCertificates(mockKey, [{ spki: 'not-a-fingerprint' }])
+
+      expect(result).not.toBe(true)
+    })
+  })
+
+  describe('.isValidBrowser', () => {
+    it('passes valid browsers and forms error messages for invalid ones', () => {
+      const browsers = [
+      // valid browser
+        {
+          name: 'Chrome',
+          displayName: 'Chrome Browser',
+          family: 'chromium',
+          path: '/path/to/chrome',
+          version: '1.2.3',
+          majorVersion: 1,
+        },
+        // another valid browser
+        {
+          name: 'FF',
+          displayName: 'Firefox',
+          family: 'firefox',
+          path: '/path/to/firefox',
+          version: '1.2.3',
+          majorVersion: '1',
+        },
+        // Electron is a valid browser
+        {
+          name: 'Electron',
+          displayName: 'Electron',
+          family: 'chromium',
+          path: '',
+          version: '99.101.3',
+          majorVersion: 99,
+        },
+        // invalid browser, missing displayName
+        {
+          name: 'No display name',
+          family: 'chromium',
+        },
+        {
+          name: 'bad family',
+          displayName: 'Bad family browser',
+          family: 'unknown family',
+        },
+      ]
+
+      for (const browser of browsers) {
+        const isValid = validation.isValidBrowser(browser)
+
+        expect({
+          browser,
+          isValid,
+        }).toMatchSnapshot(`isValidBrowser ${browser.name}`)
+      }
+    })
+  })
+
+  describe('.isValidBrowserList', () => {
+    it('does not allow empty or not browsers', () => {
+      expect(validation.isValidBrowserList('browsers', undefined)).toMatchSnapshot('undefined browsers')
+      expect(validation.isValidBrowserList('browsers', [])).toMatchSnapshot('empty list of browsers')
+      expect(validation.isValidBrowserList('browsers', ['foo'])).toMatchSnapshot('browsers list with a string')
+    })
+  })
+
+  describe('.isValidRetriesConfig', () => {
+    it('returns true for valid retry value', () => {
+      let result = validation.isValidRetriesConfig(mockKey, null)
+
+      expect(result).toBe(true)
+
+      result = validation.isValidRetriesConfig(mockKey, 2)
+      expect(result).toBe(true)
+
+      result = validation.isValidRetriesConfig(mockKey, 250)
+      expect(result).toBe(true)
+    })
+
+    it('returns true for valid retry objects', () => {
+      let result = validation.isValidRetriesConfig(mockKey, { runMode: 1 })
+
+      expect(result).toBe(true)
+
+      result = validation.isValidRetriesConfig(mockKey, { runMode: 250 })
+      expect(result).toBe(true)
+
+      result = validation.isValidRetriesConfig(mockKey, { openMode: 1 })
+      expect(result).toBe(true)
+
+      result = validation.isValidRetriesConfig(mockKey, { openMode: 250 })
+      expect(result).toBe(true)
+
+      result = validation.isValidRetriesConfig(mockKey, {
+        runMode: 3,
+        openMode: 0,
+      })
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message for invalid retry config', () => {
+      let result = validation.isValidRetriesConfig(mockKey, '1')
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('invalid retry value')
+
+      result = validation.isValidRetriesConfig(mockKey, { fakeMode: 1 })
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('invalid retry object')
+    })
+
+    it('returns error message for openMode as boolean without strategy', () => {
+      const result = validation.isValidRetriesConfig(mockKey, { openMode: true })
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+
+    it('returns error message for runMode as boolean without strategy', () => {
+      const result = validation.isValidRetriesConfig(mockKey, { runMode: true })
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+
+    it('returns true for valid retry object with experimental keys (default)', () => {
+      const result = validation.isValidRetriesConfig(mockKey, {
+        openMode: 0,
+        runMode: 0,
+        experimentalStrategy: undefined,
+        experimentalOptions: undefined,
+      })
+
+      expect(result).toBe(true)
+    })
+
+    describe('experimental options', () => {
+      describe('passes with', () => {
+        ['detect-flake-but-always-fail', 'detect-flake-and-pass-on-threshold'].forEach((strategy) => {
+          it(`experimentalStrategy is "${strategy}" with no "experimentalOptions" & valid runMode and openMode`, () => {
+            let result = validation.isValidRetriesConfig(mockKey, {
+              runMode: true,
+              openMode: false,
+              experimentalStrategy: strategy,
+            })
+
+            expect(result).toBe(true)
+
+            result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: strategy,
+            })
+
+            expect(result).toBe(true)
+          })
+
+          it(`experimentalStrategy is "${strategy}" with only "maxRetries" in "experimentalOptions"`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: strategy,
+              experimentalOptions: {
+                maxRetries: 4,
+              },
+            })
+
+            expect(result).not.toBe(true)
+          })
+        })
+
+        it('experimentalStrategy is "detect-flake-but-always-fail" and has option "stopIfAnyPassed"', () => {
+          let result = validation.isValidRetriesConfig(mockKey, {
+            runMode: true,
+            openMode: false,
+            experimentalStrategy: 'detect-flake-but-always-fail',
+            experimentalOptions: {
+              maxRetries: 1,
+              stopIfAnyPassed: true,
+            },
+          })
+
+          expect(result).toBe(true)
+
+          result = validation.isValidRetriesConfig(mockKey, {
+            experimentalStrategy: 'detect-flake-but-always-fail',
+            experimentalOptions: {
+              maxRetries: 4,
+              stopIfAnyPassed: false,
+            },
+          })
+
+          expect(result).toBe(true)
+        })
+
+        it('experimentalStrategy is "detect-flake-and-pass-on-threshold" and has option "passesRequired"', () => {
+          let result = validation.isValidRetriesConfig(mockKey, {
+            runMode: true,
+            openMode: false,
+            experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+            experimentalOptions: {
+              maxRetries: 1,
+              passesRequired: 1,
+            },
+          })
+
+          expect(result).toBe(true)
+
+          result = validation.isValidRetriesConfig(mockKey, {
+            experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+            experimentalOptions: {
+              maxRetries: 4,
+              passesRequired: 2,
+            },
+          })
+
+          expect(result).toBe(true)
+        })
+      })
+
+      describe('fails with', () => {
+        it('invalid strategy', () => {
+          const result = validation.isValidRetriesConfig(mockKey, {
+            experimentalStrategy: 'foo',
+          })
+
+          expect(result).not.toBe(true)
+          expect(result).toMatchSnapshot()
+        })
+
+        it('invalid strategy w/ other options (valid)', () => {
+          const result = validation.isValidRetriesConfig(mockKey, {
+            runMode: 1,
+            openMode: 2,
+            experimentalStrategy: 'bar',
+          })
+
+          expect(result).not.toBe(true)
+          expect(result).toMatchSnapshot()
+        })
+
+        it('detect-flake-and-pass-on-threshold: missing passesRequired reports the passesRequired value', () => {
+          const result = validation.isValidRetriesConfig(mockKey, {
+            experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+            experimentalOptions: {
+              maxRetries: 2,
+              stopIfAnyPassed: true,
+            },
+          })
+
+          expect(result).not.toBe(true)
+          expect((result as any).key).toEqual('mockConfigKey.experimentalOptions.passesRequired')
+          expect((result as any).value).toBeUndefined()
+        })
+
+        ;['detect-flake-but-always-fail', 'detect-flake-and-pass-on-threshold'].forEach((strategy) => {
+          it(`${strategy}: valid strategy w/ other invalid options with experiment`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              runMode: 1,
+              openMode: 0,
+              experimentalStrategy: strategy,
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it(`${strategy}: maxRetries is negative`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: strategy,
+              experimentalOptions: {
+                maxRetries: -2,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it(`${strategy}: maxRetries is 0`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: strategy,
+              experimentalOptions: {
+                maxRetries: 0,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it(`${strategy}: maxRetries is floating`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: strategy,
+              experimentalOptions: {
+                maxRetries: 3.5,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+        })
+
+        describe('detect-flake-and-pass-on-threshold', () => {
+          it(`passesRequired is negative`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+              experimentalOptions: {
+                maxRetries: 1,
+                passesRequired: -4,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it(`passesRequired is 0`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+              experimentalOptions: {
+                maxRetries: 1,
+                passesRequired: 0,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it(`passesRequired is floating`, () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+              experimentalOptions: {
+                maxRetries: 1,
+                passesRequired: 3.5,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it('provides passesRequired without maxRetries', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+              experimentalOptions: {
+                passesRequired: 3,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it('provides passesRequired that is greater than maxRetries', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+              experimentalOptions: {
+                maxRetries: 3,
+                passesRequired: 5,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it('provides stopIfAnyPassed option', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+              experimentalOptions: {
+                maxRetries: 3,
+                passesRequired: 2,
+                stopIfAnyPassed: true,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+        })
+
+        describe('detect-flake-but-always-fail', () => {
+          it('provides passesRequired option', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-but-always-fail',
+              experimentalOptions: {
+                maxRetries: 3,
+                passesRequired: 2,
+                stopIfAnyPassed: true,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it('provides stopIfAnyPassed without maxRetries', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-but-always-fail',
+              experimentalOptions: {
+                stopIfAnyPassed: false,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it('provides maxRetries without stopIfAnyPassed', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-but-always-fail',
+              experimentalOptions: {
+                maxRetries: 2,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+
+          it('stopIfAnyPassed is a number (0 and 1 do not work)', () => {
+            const result = validation.isValidRetriesConfig(mockKey, {
+              experimentalStrategy: 'detect-flake-but-always-fail',
+              experimentalOptions: {
+                maxRetries: 2,
+                stopIfAnyPassed: 1,
+              },
+            })
+
+            expect(result).not.toBe(true)
+            expect(result).toMatchSnapshot()
+          })
+        })
+      })
+    })
+  })
+
+  describe('.isPlainObject', () => {
+    it('returns true for value=null', () => {
+      const result = validation.isPlainObject(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=number', () => {
+      const result = validation.isPlainObject(mockKey, { foo: 'bar' })
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a not an object', () => {
+      const result = validation.isPlainObject(mockKey, 1)
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isNumber', () => {
+    it('returns true for value=null', () => {
+      const result = validation.isNumber(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=number', () => {
+      const result = validation.isNumber(mockKey, 1)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a not a number', () => {
+      const result = validation.isNumber(mockKey, 'string')
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isValidPort', () => {
+    it('returns true for null or a port browsers allow', () => {
+      expect(validation.isValidPort(mockKey, null)).toBe(true)
+      expect(validation.isValidPort(mockKey, 3000)).toBe(true)
+      expect(validation.isValidPort(mockKey, 65535)).toBe(true)
+    })
+
+    it('returns an error for a port browsers block', () => {
+      expect(validation.isValidPort(mockKey, 10080)).toMatchObject({ key: mockKey, value: 10080 })
+      expect(validation.isValidPort(mockKey, 4190)).toMatchObject({ key: mockKey, value: 4190 })
+      expect(validation.isValidPort(mockKey, 6679)).toMatchObject({ key: mockKey, value: 6679 })
+    })
+
+    it('returns an error for a value that is not a number', () => {
+      expect(validation.isValidPort(mockKey, '3000')).toMatchObject({ key: mockKey, value: '3000', type: 'a number' })
+    })
+  })
+
+  describe('.isNumberOrFalse', () => {
+    it('returns true for value=number', () => {
+      const result = validation.isNumberOrFalse(mockKey, 1)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=false', () => {
+      const result = validation.isNumberOrFalse(mockKey, false)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=null', () => {
+      const result = validation.isNumberOrFalse(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a not number or false', () => {
+      const result = validation.isNumberOrFalse(mockKey, 'string')
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isFullyQualifiedUrl', () => {
+    it('returns true for value=null', () => {
+      const result = validation.isFullyQualifiedUrl(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=qualified urls', () => {
+      let result = validation.isFullyQualifiedUrl(mockKey, 'https://url.com')
+
+      expect(result).toBe(true)
+      result = validation.isFullyQualifiedUrl(mockKey, 'http://url.com')
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a not qualified url', () => {
+      let result = validation.isFullyQualifiedUrl(mockKey, 'url.com')
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('not qualified url')
+
+      result = validation.isFullyQualifiedUrl(mockKey, '')
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('empty string')
+    })
+  })
+
+  describe('.isBoolean', () => {
+    it('returns true for value=null', () => {
+      const result = validation.isBoolean(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=true', () => {
+      const result = validation.isBoolean(mockKey, true)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=false', () => {
+      const result = validation.isBoolean(mockKey, false)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a not a string', () => {
+      const result = validation.isString(mockKey, 1)
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isString', () => {
+    it('returns true for value=null', () => {
+      const result = validation.isString(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=array', () => {
+      const result = validation.isString(mockKey, 'string')
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a not a string', () => {
+      const result = validation.isString(mockKey, 1)
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isArray', () => {
+    it('returns true for value=null', () => {
+      const result = validation.isArray(mockKey, null)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=array', () => {
+      const result = validation.isArray(mockKey, [1, 2, 3])
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is a non-array', () => {
+      const result = validation.isArray(mockKey, 1)
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isStringOrFalse', () => {
+    it('returns true for value=string', () => {
+      const result = validation.isStringOrFalse(mockKey, 'string')
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=false', () => {
+      const result = validation.isStringOrFalse(mockKey, false)
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is neither string nor false', () => {
+      const result = validation.isStringOrFalse(mockKey, null)
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot()
+    })
+  })
+
+  describe('.isStringOrArrayOfStrings', () => {
+    it('returns true for value=string', () => {
+      const result = validation.isStringOrArrayOfStrings(mockKey, 'string')
+
+      expect(result).toBe(true)
+    })
+
+    it('returns true for value=array of strings', () => {
+      const result = validation.isStringOrArrayOfStrings(mockKey, ['string', 'other'])
+
+      expect(result).toBe(true)
+    })
+
+    it('returns error message when value is neither string nor array of string', () => {
+      let result = validation.isStringOrArrayOfStrings(mockKey, null)
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('not string or array')
+
+      result = validation.isStringOrArrayOfStrings(mockKey, [1, 2, 3])
+
+      expect(result).not.toBe(true)
+      expect(result).toMatchSnapshot('array of non-strings')
+    })
+  })
+
+  describe('.isOneOf', () => {
+    it('validates a string', () => {
+      const validate = validation.isOneOf('foo', 'bar')
+
+      expect(validate).to.be.a('function')
+      expect(validate('test', 'foo')).toBe(true)
+      expect(validate('test', 'bar')).toBe(true)
+
+      // different value
+      let msg = validate('test', 'nope')
+
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('not one of the strings error message')
+
+      msg = validate('test', 42)
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('number instead of string')
+
+      msg = validate('test', null)
+      expect(msg).not.toBe(true)
+
+      expect(msg).toMatchSnapshot('null instead of string')
+    })
+
+    it('validates a number', () => {
+      const validate = validation.isOneOf(1, 2, 3)
+
+      expect(validate).to.be.a('function')
+      expect(validate('test', 1)).toBe(true)
+      expect(validate('test', 3)).toBe(true)
+
+      // different value
+      let msg = validate('test', 4)
+
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('not one of the numbers error message')
+
+      msg = validate('test', 'foo')
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('string instead of a number')
+
+      msg = validate('test', null)
+      expect(msg).not.toBe(true)
+
+      return expect(msg).toMatchSnapshot('null instead of a number')
+    })
+  })
+
+  describe('.isArrayIncludingAny', () => {
+    it('returns new validation function that accepts 2 arguments', () => {
+      const validate = validation.isArrayIncludingAny(true, false)
+
+      expect(validate).to.be.a.instanceof(Function)
+      expect(validate.length).toEqual(2)
+    })
+
+    it('returned validation function will return true when value is a subset of the provided values', () => {
+      const value = 'fakeValue'
+      const key = 'fakeKey'
+      const validatePass1 = validation.isArrayIncludingAny(true, false)
+
+      expect(validatePass1(key, [false])).toEqual(true)
+
+      const validatePass2 = validation.isArrayIncludingAny(value, value + 1, value + 2)
+
+      expect(validatePass2(key, [value])).toEqual(true)
+    })
+
+    it('returned validation function will fail if values is not an array', () => {
+      const value = 'fakeValue'
+      const key = 'fakeKey'
+      const validateFail = validation.isArrayIncludingAny(true, false)
+
+      const msg = validateFail(key, value)
+
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('not an array error message')
+    })
+
+    it('returned validation function will fail if any values are not present in the provided values', () => {
+      const value = 'fakeValue'
+      const key = 'fakeKey'
+      const validateFail = validation.isArrayIncludingAny(value, value + 1, value + 2)
+
+      let msg = validateFail(key, [null])
+
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('not a subset of error message')
+
+      msg = validateFail(key, [value, value + 1, value + 2, value + 3])
+
+      expect(msg).not.toBe(true)
+      expect(msg).toMatchSnapshot('not all in subset error message')
+    })
+  })
+
+  describe('.isValidCrfOrBoolean', () => {
+    it('validates booleans', () => {
+      const validate = validation.isValidCrfOrBoolean
+
+      expect(validate).toBeInstanceOf(Function)
+      expect(validate('test', false)).toBe(true)
+      expect(validate('test', true)).toBe(true)
+    })
+
+    it('validates any number between 0 and 51', () => {
+      const validate = validation.isValidCrfOrBoolean
+
+      const validConfigNumbers = [...Array(51).keys()]
+
+      validConfigNumbers.forEach((num) => {
+        expect(validate('test', num)).toBe(true)
+      })
+    })
+
+    it('invalidates lower bound', () => {
+      const validate = validation.isValidCrfOrBoolean
+
+      const lowerBoundMsg = validate('test', -1)
+
+      expect(lowerBoundMsg).not.toBe(true)
+
+      return expect(lowerBoundMsg).toMatchSnapshot('invalid lower bound')
+    })
+
+    it('invalidates upper bound', () => {
+      const validate = validation.isValidCrfOrBoolean
+
+      const upperBoundMsg = validate('test', 52)
+
+      expect(upperBoundMsg).not.toBe(true)
+
+      return expect(upperBoundMsg).toMatchSnapshot('invalid upper bound')
+    })
+  })
+})

@@ -1,0 +1,166 @@
+/**
+ * @vitest-environment jsdom
+ */
+import type { Mock, MockedObject } from 'vitest'
+import { vi, describe, it, expect, beforeEach } from 'vitest'
+
+import type { PressCommand } from '../../../../../src/cy/commands/actions/press'
+import addCommand from '../../../../../src/cy/commands/actions/press'
+import type { $Cy } from '../../../../../src/cypress/cy'
+import type { StateFunc } from '../../../../../src/cypress/state'
+import $errUtils from '../../../../../src/cypress/error_utils'
+import Keyboard from '../../../../../src/cy/keyboard'
+
+vi.mock('../../../../../src/cypress/error_utils', async () => {
+  const original = await vi.importActual<typeof import('../../../../../src/cypress/error_utils')>('../../../../../src/cypress/error_utils')
+
+  return {
+    default: {
+      ...original.default,
+      throwErr: vi.fn().mockImplementation(original.default.throwErr),
+      throwErrByPath: vi.fn().mockImplementation(original.default.throwErrByPath),
+    },
+  }
+})
+
+describe('cy/commands/actions/press', () => {
+  let automation: Mock<typeof Cypress['automation']>
+  let press: PressCommand
+  let Cypress: MockedObject<Cypress.Cypress>
+  let Commands: MockedObject<Cypress.Commands>
+  let cy: MockedObject<$Cy>
+  let state: MockedObject<StateFunc>
+  let config: any
+  let logReturnValue: Cypress.Log
+
+  beforeEach(() => {
+    automation = vi.fn<typeof Cypress['automation']>()
+
+    Cypress = {
+      // @ts-expect-error - <Cypress['log']> has a type conflict between Driver and CLI d.ts
+      log: vi.fn(),
+      automation,
+      // @ts-expect-error - partial Browser mock
+      browser: {
+        family: 'chromium',
+        name: 'Chrome',
+      },
+    }
+
+    Commands = {
+      // @ts-expect-error - this is a generic mock impl
+      addAll: vi.fn(),
+    }
+
+    // @ts-expect-error - partial $Cy mock
+    cy = {}
+
+    state = {
+      ...vi.fn<StateFunc>(),
+      // @ts-expect-error - this is a recursive definition, so we're only defining the mock one level deep
+      state: vi.fn<StateFunc>(),
+      reset: vi.fn<() => Record<string, any>>(),
+    }
+
+    config = {}
+
+    logReturnValue = {
+      id: 'log_id',
+      end: vi.fn(),
+      error: vi.fn(),
+      finish: vi.fn(),
+      get: vi.fn(),
+      set: vi.fn(),
+      snapshot: vi.fn(),
+      _hasInitiallyLogged: false,
+      groupEnd: vi.fn(),
+    }
+
+    Cypress.log.mockReturnValue(logReturnValue)
+
+    addCommand(Commands, Cypress, cy, state, config)
+
+    expect(Commands.addAll).toHaveBeenCalledOnce()
+
+    // @ts-expect-error - mock.calls is typed with the real addAll() parameters
+    const [[obj]]: [[{ press: PressCommand }]] = Commands.addAll.mock.calls
+
+    expect(typeof obj.press).toBe('function')
+
+    press = obj.press as PressCommand
+  })
+
+  describe('with a valid key', () => {
+    for (const key of Object.values(Keyboard.Keys)) {
+      it(`dispatches a key:press automation command for key: ${key}`, async () => {
+        await press(key)
+        expect(automation).toHaveBeenCalledWith('key:press', { key })
+      })
+    }
+
+    describe('with options', () => {
+      const key = 'Tab'
+      let options: Cypress.Loggable & Cypress.Timeoutable
+
+      beforeEach(() => {
+        options = {
+          log: false,
+          timeout: 2000,
+        }
+      })
+
+      it('sets timeout and hidden on the log', async () => {
+        await press(key, options)
+        expect(Cypress.log).toBeCalledWith({
+          timeout: options.timeout,
+          hidden: true,
+          message: [key, { timeout: 2000 }],
+          consoleProps: expect.any(Function),
+        })
+      })
+    })
+  })
+
+  describe('with an invalid key', () => {
+    it('throws an invalid key error', async () => {
+      const key = 'Foo'
+
+      await expect(press(key)).rejects.toThrow(`\`${key}\` is not supported by \`cy.press()\``)
+      expect($errUtils.throwErrByPath).toHaveBeenCalledWith('press.invalid_key', {
+        onFail: logReturnValue,
+        args: {
+          key,
+        },
+      })
+    })
+  })
+
+  describe('when in webkit', () => {
+    it('throws an unsupported browser error', async () => {
+      Cypress.browser.family = 'webkit'
+      await expect(press('Tab')).rejects.toThrow('`cy.press()` is not supported in webkit browsers.')
+      expect($errUtils.throwErrByPath).toHaveBeenCalledWith('press.unsupported_browser', {
+        onFail: logReturnValue,
+        args: {
+          family: Cypress.browser.family,
+        },
+      })
+    })
+  })
+
+  describe('when automation throws', () => {
+    it('throws via $errUtils, passing in the results from Cypress.log', async () => {
+      const thrown = new Error('Some error')
+
+      // @ts-expect-error async is not bluebird, but that's fine
+      Cypress.automation.mockImplementation(async () => {
+        throw thrown
+      })
+
+      await expect(press('Tab')).rejects.toThrow(thrown)
+      expect($errUtils.throwErr).toHaveBeenCalledWith(thrown, {
+        onFail: logReturnValue,
+      })
+    })
+  })
+})

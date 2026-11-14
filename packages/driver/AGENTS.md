@@ -1,0 +1,63 @@
+# @packages/driver
+
+The core JavaScript library loaded inside the browser that is responsible for executing Cypress commands and managing the test runtime. It implements the `cy` object, all built-in commands (`cy.get`, `cy.click`, `cy.intercept`, etc.), the Mocha integration, and the AUT lifecycle.
+
+## Key Commands
+
+```bash
+# NOTE: Full suite is slow (hundreds of tests); always target a specific file or grep pattern
+
+# Run a specific vitest unit test file
+yarn workspace @packages/driver test -- <path-to-spec>
+
+# Run vitest tests matching a glob pattern
+yarn workspace @packages/driver test -- "<glob-pattern>"
+
+# Run driver E2E tests against a specific spec
+yarn workspace @packages/driver cypress:run -- --spec <path-to-spec>
+
+# Type-check
+yarn workspace @packages/driver check-ts
+```
+
+## Architecture
+
+```
+src/
+  config/        Driver-level config helpers (reading resolved config inside the browser)
+  cross-origin/  Cross-origin iframe communication: spec bridge, postMessage protocol
+  cy/            Core cy object, command queue, stability waits, timeouts, chaining
+  cypress/       Top-level Cypress singleton, mocha integration, error handling
+  dom/           DOM utilities (selectors, traversal, visibility checks, screenshots)
+  util/          Shared browser utilities (events, timers, serialization helpers)
+  main.ts        Bundle entry point
+  cypress.ts     Public Cypress API surface
+```
+
+## Gotchas / Notes
+
+- The driver is consumed by `@packages/runner` (webpack bundle) and ultimately served to the browser. It is **not** built in isolation; changes are picked up by running `yarn watch` from the repo root or `yarn workspace @packages/runner watch`.
+- `workspaces.nohoist: ["*"]` is set so that all dependencies are installed locally inside `packages/driver/node_modules` rather than hoisted — this prevents version conflicts with browser-targeted packages.
+- Cypress tests for the driver itself use a local Express server (spawned automatically in `e2e.setupNodeEvents`) rather than a manually started dev server.
+- `postinstall` runs `patch-package` to apply local patches to dependencies. File an upstream issue for each patch and link it from a comment in the patch and from the PR, and note in the PR any way the patch makes Cypress behave differently from other tools built on the same library.
+- Elements and shadow roots in the AUT come from its iframe, a different realm from the driver, so `instanceof HTMLInputElement` or `instanceof ShadowRoot` is `false` for them. Check `element.localName` or the object's string tag instead, as `isShadowRoot` in `src/dom/elements/shadow.ts` does.
+- An `export {}` in a spec under `cypress/` is not only for TypeScript. The specs are bundled by webpack, which treats a file with an `import` or `export` as an ES module (strict mode) and one with neither as a script. Keep the marker in a spec with no imports, and don't swap it for a tsconfig `moduleDetection` setting: that changes type checking, not the bundle.
+- Cross-origin testing (`cy.origin`) relies on the `cross-origin/` spec bridge and a secondary `cypress.ts` bundle injected into cross-origin frames.
+
+## Regression tests for GitHub issues
+
+A regression test for a GitHub issue goes in the spec under `cypress/e2e/` for the command or behavior it exercises (`commands/actions/click.cy.ts`, `e2e/uncaught_errors.cy.ts`, and so on). Title it by the behavior it checks, not by the issue number, and put the issue URL as a comment directly above the test:
+
+```ts
+// https://github.com/cypress-io/cypress/issues/8279
+it('can click a button inside a large div with tabindex=0 without scrolling', () => {
+```
+
+The exception is a bug that exhausts the browser's memory. Reproducing it in a Cypress spec crashes the browser tab, which ends the whole spec instead of failing one test, so put that test in the vitest suite under `test/unit/` and run the code in a child Node process with a capped heap (`--max-old-space-size`), where running out of memory shows up as a non-zero exit. `decodes a large payload within a capped heap` in `test/unit/cypress/utils.spec.ts` is an example. A worker thread's `resourceLimits` is not enough: a large allocation can still abort the whole test process.
+
+## Integration Points
+
+- Runtime dependency of **@packages/runner** (bundled) and implicitly **@packages/app** (loaded via Module Federation).
+- Uses **@packages/net-stubbing** for the browser-side `cy.intercept()` implementation.
+- Uses **@packages/socket** for browser↔server real-time communication.
+- Uses **@packages/errors** for consistent error formatting.

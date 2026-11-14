@@ -1,11 +1,13 @@
-// @ts-nocheck
-
 import _ from 'lodash'
 
 import $utils from './utils'
 import $errUtils from './error_utils'
 
-const _reset = () => {
+// `clip` and `padding` are optional because only `defaults()` sets them; every
+// other option has a value to reset to.
+type ScreenshotDefaults = Omit<Cypress.ScreenshotDefaultsOptions, 'clip' | 'padding'> & Partial<Pick<Cypress.ScreenshotDefaultsOptions, 'clip' | 'padding'>>
+
+const _reset = (): ScreenshotDefaults => {
   return {
     capture: 'fullPage',
     scale: false,
@@ -13,8 +15,8 @@ const _reset = () => {
     screenshotOnRunFailure: true,
     blackout: [],
     overwrite: false,
-    onBeforeScreenshot () {},
-    onAfterScreenshot () {},
+    onBeforeScreenshot ($el) {},
+    onAfterScreenshot ($el, results) {},
   }
 }
 
@@ -111,8 +113,8 @@ const validateAndSetCallback = (props, values, cmd, log, option) => {
   values[option] = value
 }
 
-const validate = (props, cmd, log) => {
-  const values = {}
+const validate = (props, cmd, log?) => {
+  const values: Record<string, any> = {}
 
   if (!_.isPlainObject(props)) {
     $errUtils.throwErrByPath('screenshot.invalid_arg', {

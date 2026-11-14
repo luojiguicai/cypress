@@ -1,4 +1,4 @@
-import Promise from 'bluebird'
+import { promisify } from 'util'
 import express from 'express'
 import http from 'http'
 import https from 'https'
@@ -7,19 +7,22 @@ import { SocketIOServer } from '@packages/socket'
 import { allowDestroy } from '../../lib/allow-destroy'
 
 export interface AsyncServer {
-  closeAsync: () => Promise<void>
   destroyAsync: () => Promise<void>
   listenAsync: (port) => Promise<void>
 }
 
-function createExpressApp () {
+function createExpressApp (requestCallback: (req) => void) {
   const app: express.Application = express()
 
   app.get('/get', (req, res) => {
+    if (requestCallback) requestCallback(req)
+
     res.send('It worked!')
   })
 
   app.get('/empty-response', (req, res) => {
+    if (requestCallback) requestCallback(req)
+
     // ERR_EMPTY_RESPONSE in Chrome
     setTimeout(() => res.connection.destroy(), 100)
   })
@@ -27,9 +30,12 @@ function createExpressApp () {
   return app
 }
 
-function getLocalhostCertKeys () {
-  return CA.create()
-  .then((ca) => ca.generateServerCertificateKeys('localhost'))
+async function getCAInformation () {
+  const ca = await CA.create()
+
+  const [serverCertificateKeys, caCertificatePath] = await Promise.all([ca.generateServerCertificateKeys('localhost'), ca.getCACertPath()])
+
+  return { serverCertificateKeys, caCertificatePath }
 }
 
 function onWsConnection (socket) {
@@ -42,43 +48,51 @@ export class Servers {
   httpsServer: https.Server & AsyncServer
   wsServer: any
   wssServer: any
+  caCertificatePath: string
+  lastRequestHeaders: any
 
-  start (httpPort: number, httpsPort: number) {
-    return Promise.join(
-      createExpressApp(),
-      getLocalhostCertKeys(),
-    )
-    .spread((app: Express.Application, [cert, key]: string[]) => {
-      this.httpServer = Promise.promisifyAll(
-        allowDestroy(http.createServer(app)),
-      ) as http.Server & AsyncServer
+  async start (httpPort: number, httpsPort: number) {
+    const [app, { serverCertificateKeys, caCertificatePath }]: [Express.Application, { serverCertificateKeys: string[], caCertificatePath: string }] = await Promise.all([
+      createExpressApp((req) => this.lastRequestHeaders = req.headers),
+      getCAInformation(),
+    ])
 
-      this.wsServer = new SocketIOServer(this.httpServer)
+    const httpServer = allowDestroy(http.createServer(app))
 
-      this.https = { cert, key }
-      this.httpsServer = Promise.promisifyAll(
-        allowDestroy(https.createServer(this.https, <http.RequestListener>app)),
-      ) as https.Server & AsyncServer
+    this.httpServer = Object.assign(httpServer, {
+      destroyAsync: promisify(httpServer.destroy.bind(httpServer)),
+      listenAsync: promisify(httpServer.listen.bind(httpServer)),
+    }) as http.Server & AsyncServer
 
-      this.wssServer = new SocketIOServer(this.httpsServer)
+    this.wsServer = new SocketIOServer(this.httpServer)
 
-      ;[this.wsServer, this.wssServer].map((ws) => {
-        ws.on('connection', onWsConnection)
-      })
+    this.caCertificatePath = caCertificatePath
+    this.https = { cert: serverCertificateKeys[0], key: serverCertificateKeys[1] }
+    const httpsServer = allowDestroy(https.createServer(this.https, <http.RequestListener>app))
 
-      // @ts-skip
-      return Promise.join(
-        this.httpServer.listenAsync(httpPort),
-        this.httpsServer.listenAsync(httpsPort),
-      )
-      .return()
+    this.httpsServer = Object.assign(httpsServer, {
+      destroyAsync: promisify(httpsServer.destroy.bind(httpsServer)),
+      listenAsync: promisify(httpsServer.listen.bind(httpsServer)),
+    }) as https.Server & AsyncServer
+
+    this.wssServer = new SocketIOServer(this.httpsServer)
+
+    ;[this.wsServer, this.wssServer].map((ws) => {
+      ws.on('connection', onWsConnection)
     })
+
+    await Promise.all([
+      this.httpServer.listenAsync(httpPort),
+      this.httpsServer.listenAsync(httpsPort),
+    ])
+
+    return undefined
   }
 
-  stop () {
-    return Promise.join(
+  async stop () {
+    await Promise.all([
       this.httpServer.destroyAsync(),
       this.httpsServer.destroyAsync(),
-    )
+    ])
   }
 }

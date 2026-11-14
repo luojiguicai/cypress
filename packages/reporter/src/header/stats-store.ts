@@ -1,14 +1,8 @@
 import _ from 'lodash'
-import { action, computed, observable } from 'mobx'
-import { TestState } from '../test/test-model'
-import { IntervalID } from '../lib/types'
+import { action, computed, observable, makeObservable } from 'mobx'
+import type { IntervalID } from '../lib/types'
 
-export interface StatsStoreStartInfo {
-  startTime: string
-  numPassed?: number
-  numFailed?: number
-  numPending?: number
-}
+import type { StatsStoreStartInfo, TestState } from '@packages/types'
 
 const defaults = {
   numPassed: 0,
@@ -20,17 +14,29 @@ const defaults = {
 }
 
 class StatsStore {
-  @observable numPassed: number = defaults.numPassed
-  @observable numFailed: number = defaults.numFailed
-  @observable numPending: number = defaults.numPending
+  numPassed: number = defaults.numPassed
+  numFailed: number = defaults.numFailed
+  numPending: number = defaults.numPending
 
-  @observable _startTime: number | null = defaults._startTime
-  @observable _currentTime: number | null = defaults._startTime;
+  _startTime: number | null = defaults._startTime
+  _currentTime: number | null = defaults._startTime;
   [key: string]: any
 
-  private _interval?: IntervalID;
+  private _interval?: IntervalID
 
-  @computed get duration () {
+  constructor () {
+    makeObservable(this, {
+      numPassed: observable,
+      numFailed: observable,
+      numPending: observable,
+      _startTime: observable,
+      _currentTime: observable,
+      duration: computed,
+      incrementCount: action,
+    })
+  }
+
+  get duration () {
     if (!this._startTime) return 0
 
     if (!this._currentTime) {
@@ -65,7 +71,6 @@ class StatsStore {
     this._currentTime = Date.now()
   }
 
-  @action
   incrementCount (type: TestState) {
     const countKey = `num${_.capitalize(type)}`
 

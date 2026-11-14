@@ -1,96 +1,102 @@
 import Bluebird from 'bluebird'
 import Debug from 'debug'
+import EventEmitter from 'events'
 import _ from 'lodash'
-import { onNetStubbingEvent } from '@packages/net-stubbing'
+import { getCtx } from '@packages/data-context'
+import { handleRunnerGraphQLSocketRequest } from '@packages/data-context/graphql/makeGraphQLServer'
+import type { ForInterceptRegistration } from '@packages/network-interception'
 import * as socketIo from '@packages/socket'
-import firefoxUtil from './browsers/firefox-util'
-import errors from './errors'
-import exec from './exec'
-import files from './files'
-import fixture from './fixture'
-import task from './task'
+import { CDPSocketServer } from '@packages/socket'
+import type { SocketBroadcaster, Socket } from '@packages/socket'
+import * as errors from './errors'
+import { get as fixtureGet } from './fixture'
 import { ensureProp } from './util/class-helpers'
-import { getUserEditor, setUserEditor } from './util/editors'
-import { openFile } from './util/file-opener'
-import open from './util/open'
 import type { DestroyableHttpServer } from './util/server_destroy'
 import * as session from './session'
+import type { SameSiteContext, SerializableAutomationCookie } from './automation/cookie/jar'
+import { cookieJar, automationCookieToToughCookie } from './automation/cookie/jar'
+import runEvents from './plugins/run_events'
+import type { OTLPTraceExporterCloud } from '@packages/telemetry'
+import { getSpanNames, telemetry } from '@packages/telemetry'
+import type { Automation } from './automation'
+import { openExternal } from './gui/links'
+
+import type { RunState, CachedTestState, ProtocolManagerShape, AutomationCommands, SpecWithRelativeRoot } from '@packages/types'
+import { RUN_ALL_SPECS_KEY } from '@packages/types'
+import memory from './browsers/memory'
+import { privilegedCommandsManager } from './privileged-commands/privileged-commands-manager'
+import type { StudioInitOptions } from './types/studio'
 
 type StartListeningCallbacks = {
   onSocketConnection: (socket: any) => void
 }
 
-type RunnerEvent =
-  'reporter:restart:test:run'
-  | 'runnables:ready'
-  | 'run:start'
-  | 'test:before:run:async'
-  | 'reporter:log:add'
-  | 'reporter:log:state:changed'
-  | 'paused'
-  | 'test:after:hooks'
-  | 'run:end'
-
-const runnerEvents: RunnerEvent[] = [
-  'reporter:restart:test:run',
-  'runnables:ready',
-  'run:start',
-  'test:before:run:async',
-  'reporter:log:add',
-  'reporter:log:state:changed',
-  'paused',
-  'test:after:hooks',
-  'run:end',
-]
-
-type ReporterEvent =
-  'runner:restart'
-  | 'runner:abort'
-  | 'runner:console:log'
-  | 'runner:console:error'
-  | 'runner:show:snapshot'
-  | 'runner:hide:snapshot'
-  | 'reporter:restarted'
-
-const reporterEvents: ReporterEvent[] = [
-  // "go:to:file"
-  'runner:restart',
-  'runner:abort',
-  'runner:console:log',
-  'runner:console:error',
-  'runner:show:snapshot',
-  'runner:hide:snapshot',
-  'reporter:restarted',
-]
-
 const debug = Debug('cypress:server:socket-base')
+const debugTelemetry = Debug('cypress:server:telemetry')
+
+function getInterceptRegistration (options: StartListeningOptions): ForInterceptRegistration {
+  return options.interceptRegistration
+}
 
 const retry = (fn: (res: any) => void) => {
   return Bluebird.delay(25).then(fn)
 }
 
-export class SocketBase {
+type GenericHandler = { on: (event: string, listener: (...args: any[]) => void) => void }
+type ExtendedSocketIoServer = socketIo.SocketIOServer & GenericHandler
+type ExtendedSocketIoNamespace = socketIo.SocketIONamespace & GenericHandler
+
+type ExtendedCDPSocketServer = CDPSocketServer & GenericHandler
+
+export type StartListeningOptions = Record<string, any> & { isTrustedOrigin: (origin: string) => boolean }
+
+export class SocketBase implements SocketBroadcaster {
+  private _sendResetBrowserTabsForNextSpecMessage
+  private _sendResetBrowserStateMessage
+  private _isRunnerSocketConnected
+  private _sendFocusBrowserMessage
+  private _protocolManager?: ProtocolManagerShape
+
+  protected inRunMode: boolean
+  protected supportsRunEvents: boolean
   protected ended: boolean
-  protected _io?: socketIo.SocketIOServer
-  protected testsDir: string | null
+  protected _socketIo?: ExtendedSocketIoServer
+  protected _cdpIo?: ExtendedCDPSocketServer
+  localBus: EventEmitter
 
   constructor (config: Record<string, any>) {
+    this.inRunMode = config.isTextTerminal
+    this.supportsRunEvents = config.isTextTerminal || config.experimentalInteractiveRunEvents
     this.ended = false
-    this.testsDir = null
+    this.localBus = new EventEmitter()
   }
 
   protected ensureProp = ensureProp
 
-  get io () {
-    return this.ensureProp(this._io, 'startListening')
+  get socketIo () {
+    return this.ensureProp(this._socketIo, 'startListening')
   }
 
-  toReporter (event: string, data?: any) {
-    return this.io && this.io.to('reporter').emit(event, data)
+  get cdpIo () {
+    return this._cdpIo
+  }
+
+  onBeforeSave (config) {
+
+  }
+
+  onAfterSave (config, error) {
+
+  }
+
+  getIos () {
+    return [this._cdpIo, this._socketIo]
   }
 
   toRunner (event: string, data?: any) {
-    return this.io && this.io.to('runner').emit(event, data)
+    this.getIos().forEach((io) => {
+      io?.to('runner').emit(event, data)
+    })
   }
 
   isSocketConnected (socket) {
@@ -98,7 +104,9 @@ export class SocketBase {
   }
 
   toDriver (event, ...data) {
-    return this.io && this.io.emit(event, ...data)
+    this.getIos().forEach((io) => {
+      io?.emit(event, ...data)
+    })
   }
 
   onAutomation (socket, message, data, id) {
@@ -117,12 +125,18 @@ export class SocketBase {
     throw new Error(`Could not process '${message}'. No automation clients connected.`)
   }
 
-  createIo (server: DestroyableHttpServer, path: string, cookie: string | boolean) {
+  createCDPIo (socketIoRoute: string, isTrustedOrigin: (origin: string) => boolean) {
+    return new CDPSocketServer({
+      path: socketIoRoute,
+      isTrustedOrigin,
+      allowMainFrameChildren: !!process.env.CYPRESS_INTERNAL_E2E_TESTING_SELF,
+    })
+  }
+
+  createSocketIo (server: DestroyableHttpServer, path: string, cookie: string | boolean) {
     return new socketIo.SocketIOServer(server, {
       path,
-      cookie: {
-        name: cookie,
-      },
+      cookie: typeof cookie === 'string' ? { name: cookie } : cookie,
       destroyUpgrade: false,
       serveClient: false,
       transports: ['websocket'],
@@ -131,12 +145,12 @@ export class SocketBase {
 
   startListening (
     server: DestroyableHttpServer,
-    automation,
+    automation: Automation,
     config,
-    options,
+    options: StartListeningOptions,
     callbacks: StartListeningCallbacks,
   ) {
-    let existingState = null
+    let runState: RunState | undefined = undefined
 
     _.defaults(options, {
       socketId: null,
@@ -150,21 +164,28 @@ export class SocketBase {
       onSpecChanged () {},
       onChromiumRun () {},
       onReloadBrowser () {},
-      checkForAppErrors () {},
+      closeExtraTargets () {},
+      getSavedState () {},
       onSavedStateChanged () {},
       onTestFileChange () {},
       onCaptureVideoFrames () {},
+      onStudioInit () {},
+      onStudioDestroy () {},
+      onCyPromptReady () {},
     })
 
     let automationClient
+    let runnerSocket
 
     const { socketIoRoute, socketIoCookie } = config
 
-    this._io = this.createIo(server, socketIoRoute, socketIoCookie)
+    const socketIo = this._socketIo = this.createSocketIo(server, socketIoRoute, socketIoCookie) as ExtendedSocketIoServer
+    const cdpIo = this._cdpIo = this.createCDPIo(socketIoRoute, options.isTrustedOrigin)
 
     automation.use({
-      onPush: (message, data) => {
-        return this.io.emit('automation:push:message', message, data)
+      onPush: async (message, data) => {
+        socketIo.emit('automation:push:message', message, data)
+        cdpIo.emit('automation:push:message', message, data)
       },
     })
 
@@ -178,318 +199,557 @@ export class SocketBase {
       return this.onAutomation(automationClient, message, data, id)
     }
 
-    const automationRequest = (message: string, data: Record<string, unknown>) => {
+    const automationRequest = <T extends keyof AutomationCommands>(
+      message: T,
+      data: AutomationCommands[T]['dataType'],
+    ) => {
+      debug('request: %s', message)
+
       return automation.request(message, data, onAutomationClientRequestCallback)
     }
 
-    const getFixture = (path, opts) => fixture.get(config.fixturesFolder, path, opts)
+    const getFixture = (path, opts) => fixtureGet(config.fixturesFolder, path, opts)
 
-    this.io.on('connection', (socket: any) => {
-      debug('socket connected')
+    this.getIos().forEach((io) => {
+      io?.on('connection', (socket: Socket & { inReporterRoom?: boolean, inRunnerRoom?: boolean }) => {
+        debug('socket connected')
 
-      // cache the headers so we can access
-      // them at any time
-      const headers = socket.request?.headers ?? {}
+        socket.on('disconnecting', (reason) => {
+          debug(`socket-disconnecting ${reason}`)
+        })
 
-      socket.on('automation:client:connected', () => {
-        if (automationClient === socket) {
-          return
-        }
+        socket.on('disconnect', (reason) => {
+          debug(`socket-disconnect ${reason}`)
+        })
 
-        automationClient = socket
+        socket.on('error', (err) => {
+          debug(`socket-error ${err.message}`)
+        })
 
-        debug('automation:client connected')
+        socket.on('automation:client:connected', () => {
+          const connectedBrowser = getCtx().coreData.activeBrowser
 
-        // if our automation disconnects then we're
-        // in trouble and should probably bomb everything
-        automationClient.on('disconnect', () => {
-          // if we've stopped then don't do anything
-          if (this.ended) {
+          if (automationClient === socket) {
             return
           }
 
-          // if we are in headless mode then log out an error and maybe exit with process.exit(1)?
-          return Bluebird.delay(2000)
-          .then(() => {
-            // bail if we've swapped to a new automationClient
-            if (automationClient !== socket) {
+          automationClient = socket
+
+          debug('automation:client connected')
+
+          // only send the necessary config
+          automationClient.emit('automation:config', {})
+
+          // if our automation disconnects then we're
+          // in trouble and should probably bomb everything
+          automationClient.on('disconnect', () => {
+            const { activeBrowser } = getCtx().coreData
+
+            debug('automation client disconnected %o', { ended: this.ended, connectedBrowser: connectedBrowser?.path, activeBrowser: activeBrowser?.path })
+
+            // if we've stopped or if we've switched to another browser then don't do anything
+            if (this.ended || (connectedBrowser?.path !== activeBrowser?.path)) {
               return
             }
 
-            // give ourselves about 2000ms to reconnect
-            // and if we're connected its all good
-            if (automationClient.connected) {
-              return
+            const disconnectedAt = Date.now()
+
+            // if we are in headless mode then log out an error and maybe exit with process.exit(1)?
+            return Bluebird.delay(2000)
+            .then(() => {
+              // bail if we've swapped to a new automationClient
+              if (automationClient !== socket) {
+                debug('a different automation client connected %dms after the disconnect', Date.now() - disconnectedAt)
+
+                return
+              }
+
+              // give ourselves about 2000ms to reconnect
+              // and if we're connected its all good
+              if (automationClient.connected) {
+                debug('automation client socket is connected %dms after the disconnect', Date.now() - disconnectedAt)
+
+                return
+              }
+
+              // TODO: if all of our clients have also disconnected
+              // then don't warn anything
+              errors.warning('AUTOMATION_SERVER_DISCONNECTED')
+
+              // TODO: no longer emit this, just close the browser and display message in reporter
+              io?.emit('automation:disconnected')
+            })
+          })
+
+          socket.on('automation:push:request', async (
+            message: keyof AutomationCommands,
+            data: Record<string, unknown>,
+            cb: (...args: unknown[]) => any,
+          ) => {
+            await automation.push(message, data)
+
+            // just immediately callback because there
+            // is not really an 'ack' here
+            if (cb) {
+              return cb()
             }
+          })
 
-            // TODO: if all of our clients have also disconnected
-            // then don't warn anything
-            errors.warning('AUTOMATION_SERVER_DISCONNECTED')
+          socket.on('automation:response', automation.response)
+        })
 
-            // TODO: no longer emit this, just close the browser and display message in reporter
-            return this.io.emit('automation:disconnected')
+        socket.on('automation:request', (message: keyof AutomationCommands, data, cb) => {
+          debug('automation:request %s %o', message, data)
+
+          return automationRequest(message, data)
+          .then((resp) => {
+            return cb({ response: resp })
+          }).catch((err) => {
+            return cb({ error: errors.cloneErr(err) })
           })
         })
 
-        socket.on('automation:push:request', (
-          message: string,
-          data: Record<string, unknown>,
-          cb: (...args: unknown[]) => any,
-        ) => {
-          automation.push(message, data)
+        this._sendResetBrowserTabsForNextSpecMessage = async (shouldKeepTabOpen: boolean) => {
+          await automationRequest('reset:browser:tabs:for:next:spec', { shouldKeepTabOpen })
+        }
 
-          // just immediately callback because there
-          // is not really an 'ack' here
+        this._sendResetBrowserStateMessage = async () => {
+          await automationRequest('reset:browser:state', {})
+        }
+
+        this._sendFocusBrowserMessage = async () => {
+          await automationRequest('focus:browser:window', {})
+        }
+
+        this._isRunnerSocketConnected = () => {
+          return !!(runnerSocket && runnerSocket.connected)
+        }
+
+        socket.on('reporter:connected', () => {
+          if (socket.inReporterRoom) {
+            return
+          }
+
+          socket.inReporterRoom = true
+
+          return socket.join('reporter')
+        })
+
+        // TODO: what to do about reporter disconnections?
+
+        socket.on('runner:connected', () => {
+          if (socket.inRunnerRoom) {
+            return
+          }
+
+          runnerSocket = socket
+
+          socket.inRunnerRoom = true
+
+          return socket.join('runner')
+        })
+
+        // TODO: what to do about runner disconnections?
+        socket.on('spec:changed', (spec) => {
+          return options.onSpecChanged(spec)
+        })
+
+        socket.on('app:connect', (socketId) => {
+          return options.onConnect(socketId, socket)
+        })
+
+        socket.on('set:runnables:and:maybe:record:tests', async (runnables, cb) => {
+          return options.onTestsReceivedAndMaybeRecord(runnables, cb)
+        })
+
+        socket.on('mocha', (...args: unknown[]) => {
+          return options.onMocha(...args)
+        })
+
+        socket.on('recorder:frame', (data) => {
+          return options.onCaptureVideoFrames(data)
+        })
+
+        socket.on('reload:browser', (url: string, browser: any) => {
+          return options.onReloadBrowser(url, browser)
+        })
+
+        socket.on('focus:tests', () => {
+          return options.onFocusTests()
+        })
+
+        socket.on('is:automation:client:connected', (
+          data: Record<string, any>,
+          cb: (...args: unknown[]) => void,
+        ) => {
+          const isConnected = () => {
+            return automationRequest('is:automation:client:connected', data)
+          }
+
+          const tryConnected = () => {
+            return Bluebird
+            .try(isConnected)
+            .catch(() => {
+              return retry(tryConnected)
+            })
+          }
+
+          // retry for up to data.timeout or 1 second
+          return Bluebird
+          .try(tryConnected)
+          .timeout(data.timeout != null ? data.timeout : 1000)
+          .then(() => {
+            return cb(true)
+          }).catch(Bluebird.TimeoutError, (_err) => {
+            return cb(false)
+          })
+        })
+
+        const setCrossOriginCookie = ({ cookie, url, sameSiteContext }: { cookie: SerializableAutomationCookie, url: string, sameSiteContext: SameSiteContext }) => {
+          const { hostname } = new URL(url)
+
+          cookieJar.setCookie(automationCookieToToughCookie(cookie, hostname), url, sameSiteContext)
+        }
+
+        socket.on('dev-server:on-spec-update', async (spec: Cypress.Spec) => {
+          const ctx = await getCtx()
+          const devServer = await ctx._apis.projectApi.getDevServer()
+
+          if (spec.relative === RUN_ALL_SPECS_KEY) {
+            const specsToCompile = ctx.project.runAllSpecs.map((relPath) => {
+              return ctx.project.specs.find((s) => s.relative === relPath)
+            }).filter((s): s is SpecWithRelativeRoot => Boolean(s))
+
+            debug(`updating CT dev-server with ${specsToCompile.length} specs`)
+            await devServer.updateSpecs(specsToCompile, { neededForJustInTimeCompile: true })
+          } else {
+            // update the dev server with the spec running
+            debug(`updating CT dev-server with spec: ${spec.relative}`)
+            // @ts-expect-error - the socket payload is typed as Cypress.Spec, which lacks SpecWithRelativeRoot's fields
+            await devServer.updateSpecs([spec], { neededForJustInTimeCompile: true })
+          }
+
+          return socket.emit('dev-server:on-spec-updated')
+        })
+
+        getCtx().coreData.studioLifecycleManager?.registerStudioReadyListener((studio) => {
+          studio.addSocketListeners({
+            socket,
+            onBeforeSave: () => {
+              this.onBeforeSave(config)
+            },
+            onAfterSave: ({ error }) => {
+              this.onAfterSave(config, error)
+            },
+          })
+        })
+
+        getCtx().coreData.cyPromptLifecycleManager?.registerCyPromptReadyListener((cyPrompt) => {
+          cyPrompt.addSocketListeners({
+            socket,
+            onBeforeSave: () => {
+              this.onBeforeSave(config)
+            },
+            onAfterSave: ({ error }) => {
+              this.onAfterSave(config, error)
+            },
+          })
+        })
+
+        socket.on('studio:init', async (initOptions: StudioInitOptions, cb) => {
+          try {
+            const { canAccessStudioAI, cloudStudioSessionId } = await options.onStudioInit(initOptions)
+
+            cb({ canAccessStudioAI, cloudStudioSessionId })
+          } catch (error) {
+            cb({ error: errors.cloneErr(error) })
+          }
+        })
+
+        socket.on('studio:protocol:enabled', async (cb) => {
+          try {
+            const ctx = await getCtx()
+            const isStudioReady = ctx.coreData.studioLifecycleManager?.isStudioReady()
+
+            if (!isStudioReady) {
+              return cb({ studioProtocolEnabled: false })
+            }
+
+            const studio = await ctx.coreData.studioLifecycleManager?.getStudio()
+
+            cb({ studioProtocolEnabled: studio?.isProtocolEnabled })
+          } catch (error) {
+            cb({ error: errors.cloneErr(error) })
+          }
+        })
+
+        socket.on('studio:destroy', async (cb) => {
+          try {
+            await options.onStudioDestroy()
+
+            cb({})
+          } catch (error) {
+            cb({ error: errors.cloneErr(error) })
+          }
+        })
+
+        socket.on('prompt:reset', (cb) => {
+          try {
+            // If we have runState, then we shouldn't reset the full prompt manager because
+            // we are just changing top. We will clear the prompt manager for a specific test
+            // later.
+            if (!runState) {
+              getCtx().coreData.cyPromptLifecycleManager?.resetCyPrompt()
+            }
+          } finally {
+            cb()
+          }
+        })
+
+        socket.on('backend:request', (eventName: string, ...args) => {
+          const userAgent = socket.request?.headers['user-agent'] || getCtx().coreData.app.browserUserAgent
+
+          // cb is always the last argument
+          const cb = args.pop()
+
+          debug('backend:request %o', { eventName, args })
+
+          const backendRequest = () => {
+            switch (eventName) {
+              case 'preserve:run:state':
+                runState = args[0]
+
+                return null
+              case 'resolve:url': {
+                const [url, resolveOpts] = args
+
+                return options.onResolveUrl(url, userAgent, automationRequest, resolveOpts)
+              }
+              case 'http:request':
+                return options.onRequest(userAgent, automationRequest, args[0])
+              case 'reset:server:state':
+                return options.onResetServerState(args[0])
+              case 'get:fixture':
+                return getFixture(args[0], args[1])
+              case 'net':
+                return getInterceptRegistration(options).handleEvent({
+                  eventName: args[0],
+                  frame: args[1],
+                })
+              case 'save:session':
+                return session.saveSession(args[0])
+              case 'clear:sessions':
+                return session.clearSessions(args[0])
+              case 'get:session':
+                return session.getSession(args[0])
+              case 'reset:cached:test:state':
+                runState = undefined
+                cookieJar.removeAllCookies()
+                session.clearSessions()
+
+                return resetRenderedHTMLOrigins()
+              case 'get:rendered:html:origins':
+                return options.getRenderedHTMLOrigins()
+              case 'reset:rendered:html:origins':
+                return resetRenderedHTMLOrigins()
+              case 'cross:origin:cookies:received':
+                return this.localBus.emit('cross:origin:cookies:received')
+              case 'cross:origin:set:cookie':
+                return setCrossOriginCookie(args[0])
+              case 'request:sent:with:credentials':
+                return this.localBus.emit('request:sent:with:credentials', args[0])
+              case 'start:memory:profiling':
+                return memory.startProfiling(automation, args[0])
+              case 'end:memory:profiling':
+                return memory.endProfiling()
+              case 'check:memory:pressure':
+                return memory.checkMemoryPressure({ ...args[0], automation })
+              case 'protocol:test:before:run:async':
+                return this._protocolManager?.beforeTest(args[0])
+              case 'protocol:test:before:after:run:async':
+                return this._protocolManager?.preAfterTest(args[0], args[1])
+              case 'protocol:test:after:run:async':
+                return this._protocolManager?.afterTest(args[0])
+              case 'protocol:command:log:added':
+                return this._protocolManager?.commandLogAdded(args[0])
+              case 'protocol:command:log:changed':
+                return this._protocolManager?.commandLogChanged(args[0])
+              case 'protocol:viewport:changed':
+                return this._protocolManager?.viewportChanged(args[0])
+              case 'protocol:url:changed':
+                return this._protocolManager?.urlChanged(args[0])
+              case 'protocol:page:loading':
+                return this._protocolManager?.pageLoading(args[0])
+              case 'run:privileged':
+                return privilegedCommandsManager.runPrivilegedCommand(config, args[0])
+              case 'telemetry':
+                if (debugTelemetry.enabled) {
+                  debugTelemetry('exporting spans from the browser: %s', getSpanNames(args[0]).join(', '))
+                }
+
+                return (telemetry.exporter() as OTLPTraceExporterCloud)?.send(args[0], () => {}, (err) => {
+                  debugTelemetry('error exporting telemetry data from browser %s', err)
+                })
+              case 'close:extra:targets':
+                return options.closeExtraTargets()
+              case 'wait:for:prompt:ready': {
+                const cyPromptLifecycleManager = getCtx().coreData.cyPromptLifecycleManager
+
+                // The manager is not initialized when cy.prompt cannot possibly
+                // run, so report it as unavailable rather than returning nothing.
+                if (!cyPromptLifecycleManager) {
+                  return { success: false }
+                }
+
+                return cyPromptLifecycleManager.getCyPrompt().then(async (cyPrompt) => {
+                  if (cyPrompt.cyPromptManager) {
+                    await options.onCyPromptReady(cyPrompt.cyPromptManager)
+                  }
+
+                  return {
+                    success: cyPrompt.cyPromptManager && cyPrompt.cyPromptManager.status === 'INITIALIZED',
+                    error: cyPrompt.error ? errors.cloneErr(cyPrompt.error) : undefined,
+                  }
+                })
+              }
+              default:
+                throw new Error(`You requested a backend event we cannot handle: ${eventName}`)
+            }
+          }
+
+          return Bluebird.try(backendRequest)
+          .then((resp) => {
+            return cb({ response: resp })
+          }).catch((err) => {
+            return cb({ error: errors.cloneErr(err) })
+          })
+        })
+
+        socket.on('get:cached:test:state', async (cb: (runState: RunState | null, testState: CachedTestState) => void) => {
+          const s = runState
+
+          const cachedTestState: CachedTestState = {
+            activeSessions: session.getActiveSessions(),
+          }
+
+          if (s) {
+            runState = undefined
+
+            // if we have cached test state, then we need to reset
+            // the test state on the protocol manager and prompt manager
+            if (s.currentId) {
+              const testId = s.currentId
+              const currentRetry = s.currentRetry ?? undefined
+
+              this._protocolManager?.resetTest(testId, currentRetry)
+
+              try {
+                const cyPrompt = await getCtx().coreData.cyPromptLifecycleManager?.getCyPrompt()
+
+                // reset the prompt manager for the current test to clear any
+                // cached state when top changes for the current test
+                cyPrompt?.cyPromptManager?.reset(testId)
+              } catch (error) {
+                debug('error resetting prompt manager', error)
+              }
+            }
+          }
+
+          return cb(s || {}, cachedTestState)
+        })
+
+        socket.on('get:app:state', async (opts, cb) => {
+          try {
+            const state = await options.getSavedState(opts)
+
+            cb({ data: state })
+          } catch (error) {
+            cb({ error: errors.cloneErr(error) })
+          }
+        })
+
+        socket.on('save:app:state', (state, cb) => {
+          const opts = state.__options
+          const stateWithoutOptions = _.omit(state, '__options')
+
+          options.onSavedStateChanged(stateWithoutOptions, opts)
+
+          // we only use the 'ack' here in tests
           if (cb) {
             return cb()
           }
         })
 
-        socket.on('automation:response', automation.response)
-      })
+        socket.on('external:open', (url: string) => {
+          debug('received external:open %o', { url })
 
-      socket.on('automation:request', (message, data, cb) => {
-        debug('automation:request %s %o', message, data)
-
-        return automationRequest(message, data)
-        .then((resp) => {
-          return cb({ response: resp })
-        }).catch((err) => {
-          return cb({ error: errors.clone(err) })
+          openExternal(url).catch((err) => {
+            debug('failed to open %s: %o', url, err)
+          })
         })
-      })
 
-      socket.on('reporter:connected', () => {
-        if (socket.inReporterRoom) {
-          return
-        }
+        socket.on('open:file', async (fileDetails: { file: string, line: number, column: number }) => {
+          debug('opening file %o', fileDetails)
 
-        socket.inReporterRoom = true
+          try {
+            const ctx = getCtx()
 
-        return socket.join('reporter')
-      })
-
-      // TODO: what to do about reporter disconnections?
-
-      socket.on('runner:connected', () => {
-        if (socket.inRunnerRoom) {
-          return
-        }
-
-        socket.inRunnerRoom = true
-
-        return socket.join('runner')
-      })
-
-      // TODO: what to do about runner disconnections?
-
-      socket.on('spec:changed', (spec) => {
-        return options.onSpecChanged(spec)
-      })
-
-      socket.on('app:connect', (socketId) => {
-        return options.onConnect(socketId, socket)
-      })
-
-      socket.on('set:runnables:and:maybe:record:tests', async (runnables, cb) => {
-        return options.onTestsReceivedAndMaybeRecord(runnables, cb)
-      })
-
-      socket.on('mocha', (...args: unknown[]) => {
-        return options.onMocha.apply(options, args)
-      })
-
-      socket.on('open:finder', (p, cb = function () {}) => {
-        return open.opn(p)
-        .then(() => {
-          return cb()
+            if (await ctx.actions.localSettings.getLaunchableEditor()) {
+              await ctx.actions.file.openFile(fileDetails.file, fileDetails.line, fileDetails.column)
+            } else {
+              ctx.actions.electron.showItemInFolder(fileDetails.file)
+            }
+          } catch (err) {
+            debug('failed to open file %o', err)
+          }
         })
-      })
 
-      socket.on('recorder:frame', (data) => {
-        return options.onCaptureVideoFrames(data)
-      })
+        if (this.supportsRunEvents) {
+          socket.on('plugins:before:spec', (spec, cb) => {
+            // When `runState` is set, the runner is reloading `top` because cy.visit()
+            // navigated to a different origin. before:spec has already fired for this spec
+            // run and must not fire again.
+            if (runState) {
+              return cb()
+            }
 
-      socket.on('reload:browser', (url: string, browser: any) => {
-        return options.onReloadBrowser(url, browser)
-      })
+            const beforeSpecSpan = telemetry.startSpan({ name: 'lifecycle:before:spec' })
 
-      socket.on('focus:tests', () => {
-        return options.onFocusTests()
-      })
+            beforeSpecSpan?.setAttributes({ spec })
 
-      socket.on('is:automation:client:connected', (
-        data: Record<string, any>,
-        cb: (...args: unknown[]) => void,
-      ) => {
-        const isConnected = () => {
-          return automationRequest('is:automation:client:connected', data)
-        }
+            runEvents.execute('before:spec', spec)
+            .then(cb)
+            .catch((error) => {
+              if (this.inRunMode) {
+                socket.disconnect()
+                throw error
+              }
 
-        const tryConnected = () => {
-          return Bluebird
-          .try(isConnected)
-          .catch(() => {
-            return retry(tryConnected)
+              // surfacing the error to the app in open mode
+              cb({ error })
+            })
+            .finally(() => {
+              beforeSpecSpan?.end()
+            })
           })
         }
 
-        // retry for up to data.timeout
-        // or 1 second
-        return Bluebird
-        .try(tryConnected)
-        .timeout(data.timeout != null ? data.timeout : 1000)
-        .then(() => {
-          return cb(true)
-        }).catch(Bluebird.TimeoutError, (_err) => {
-          return cb(false)
-        })
+        callbacks.onSocketConnection(socket)
+
+        return
       })
-
-      socket.on('backend:request', (eventName: string, ...args) => {
-        // cb is always the last argument
-        const cb = args.pop()
-
-        debug('backend:request %o', { eventName, args })
-
-        const backendRequest = () => {
-          switch (eventName) {
-            case 'preserve:run:state':
-              existingState = args[0]
-
-              return null
-            case 'resolve:url': {
-              const [url, resolveOpts] = args
-
-              return options.onResolveUrl(url, headers, automationRequest, resolveOpts)
-            }
-            case 'http:request':
-              return options.onRequest(headers, automationRequest, args[0])
-            case 'reset:server:state':
-              return options.onResetServerState()
-            case 'log:memory:pressure':
-              return firefoxUtil.log()
-            case 'firefox:force:gc':
-              return firefoxUtil.collectGarbage()
-            case 'firefox:window:focus':
-              return firefoxUtil.windowFocus()
-            case 'get:fixture':
-              return getFixture(args[0], args[1])
-            case 'read:file':
-              return files.readFile(config.projectRoot, args[0], args[1])
-            case 'write:file':
-              return files.writeFile(config.projectRoot, args[0], args[1], args[2])
-            case 'net':
-              return onNetStubbingEvent({
-                eventName: args[0],
-                frame: args[1],
-                state: options.netStubbingState,
-                socket: this,
-                getFixture,
-                args,
-              })
-            case 'exec':
-              return exec.run(config.projectRoot, args[0])
-            case 'task':
-              return task.run(config.pluginsFile, args[0])
-            case 'save:session':
-              return session.saveSession(args[0])
-            case 'clear:session':
-              return session.clearSessions()
-            case 'get:session':
-              return session.getSession(args[0])
-            case 'reset:session:state':
-              session.clearSessions()
-              resetRenderedHTMLOrigins()
-
-              return
-            case 'get:rendered:html:origins':
-              return options.getRenderedHTMLOrigins()
-            case 'reset:rendered:html:origins': {
-              resetRenderedHTMLOrigins()
-
-              return
-            }
-            default:
-              throw new Error(
-                `You requested a backend event we cannot handle: ${eventName}`,
-              )
-          }
-        }
-
-        return Bluebird.try(backendRequest)
-        .then((resp) => {
-          return cb({ response: resp })
-        }).catch((err) => {
-          return cb({ error: errors.clone(err) })
-        })
-      })
-
-      socket.on('get:existing:run:state', (cb) => {
-        const s = existingState
-
-        if (s) {
-          existingState = null
-
-          return cb(s)
-        }
-
-        return cb()
-      })
-
-      socket.on('save:app:state', (state, cb) => {
-        options.onSavedStateChanged(state)
-
-        // we only use the 'ack' here in tests
-        if (cb) {
-          return cb()
-        }
-      })
-
-      socket.on('external:open', (url: string) => {
-        debug('received external:open %o', { url })
-        // using this instead of require('electron').shell.openExternal
-        // because CT runner does not spawn an electron shell
-        // if we eventually decide to exclusively launch CT from
-        // the desktop-gui electron shell, we should update this to use
-        // electron.shell.openExternal.
-
-        // cross platform way to open a new tab in default browser, or a new browser window
-        // if one does not already exist for the user's default browser.
-        const start = (process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open')
-
-        return require('child_process').exec(`${start} ${url}`)
-      })
-
-      socket.on('get:user:editor', (cb) => {
-        getUserEditor(false)
-        .then(cb)
-      })
-
-      socket.on('set:user:editor', (editor) => {
-        setUserEditor(editor)
-      })
-
-      socket.on('open:file', (fileDetails) => {
-        openFile(fileDetails)
-      })
-
-      reporterEvents.forEach((event) => {
-        socket.on(event, (data) => {
-          this.toRunner(event, data)
-        })
-      })
-
-      runnerEvents.forEach((event) => {
-        socket.on(event, (data) => {
-          this.toReporter(event, data)
-        })
-      })
-
-      callbacks.onSocketConnection(socket)
     })
 
-    return this.io
+    this.getIos().forEach((io) => {
+      (io?.of('/data-context') as ExtendedSocketIoNamespace).on('connection', (socket: Socket) => {
+        socket.on('graphql:request', handleRunnerGraphQLSocketRequest)
+      })
+    })
+
+    return {
+      cdpIo: this._cdpIo,
+      socketIo: this._socketIo,
+    }
   }
 
   end () {
@@ -497,18 +757,51 @@ export class SocketBase {
 
     // TODO: we need an 'ack' from this end
     // event from the other side
-    return this.io.emit('tests:finished')
+    this.getIos().forEach((io) => {
+      io?.emit('tests:finished')
+    })
   }
 
-  changeToUrl (url) {
-    return this.toRunner('change:to:url', url)
+  async resetBrowserTabsForNextSpec (shouldKeepTabOpen: boolean) {
+    if (this._sendResetBrowserTabsForNextSpecMessage) {
+      await this._sendResetBrowserTabsForNextSpecMessage(shouldKeepTabOpen)
+    }
+  }
+
+  async resetBrowserState () {
+    if (this._sendResetBrowserStateMessage) {
+      await this._sendResetBrowserStateMessage()
+    }
+  }
+
+  isRunnerSocketConnected () {
+    if (this._isRunnerSocketConnected) {
+      return this._isRunnerSocketConnected()
+    }
+  }
+
+  async sendFocusBrowserMessage () {
+    await this._sendFocusBrowserMessage()
   }
 
   close () {
-    return this.io.close()
+    this.getIos().forEach((io) => io?.close())
   }
 
-  sendSpecList (specs, testingType: Cypress.TestingType) {
-    this.toRunner('specs:changed', { specs, testingType })
+  changeToUrl (url: string) {
+    return this.toRunner('change:to:url', url)
+  }
+
+  /**
+   * Sends the new telemetry context to the browser
+   * @param context - telemetry context string
+   * @returns
+   */
+  updateTelemetryContext (context: string) {
+    return this.toRunner('update:telemetry:context', context)
+  }
+
+  setProtocolManager (protocolManager: ProtocolManagerShape | undefined) {
+    this._protocolManager = protocolManager
   }
 }

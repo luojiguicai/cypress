@@ -1,0 +1,68 @@
+import chalk from 'chalk'
+
+let logs: string[] = []
+
+const logLevel = (): string => {
+  return (process.env.npm_config_loglevel || 'notice')
+}
+
+const error = (...messages: any[]): void => {
+  logs.push(messages.join(' '))
+  console.log(chalk.red(...messages))
+}
+
+const errorToStderr = (...messages: any[]): void => {
+  logs.push(messages.join(' '))
+  console.error(chalk.red(...messages))
+}
+
+const warn = (...messages: any[]): void => {
+  if (logLevel() === 'silent') return
+
+  logs.push(messages.join(' '))
+  console.log(chalk.yellow(...messages))
+}
+
+const log = (...messages: any[]): void => {
+  if (logLevel() === 'silent' || logLevel() === 'warn') return
+
+  logs.push(messages.join(' '))
+  console.log(...messages)
+}
+
+const always = (...messages: any[]): void => {
+  logs.push(messages.join(' '))
+  console.log(...messages)
+}
+
+// splits long text into lines and calls log()
+// on each one to allow easy unit testing for specific message
+const logLines = (text: string): void => {
+  const lines = text.split('\n')
+
+  for (const line of lines) {
+    log(line)
+  }
+}
+
+const print = (): string => {
+  return logs.join('\n')
+}
+
+const reset = (): void => {
+  logs = []
+}
+
+const loggerModule = {
+  log,
+  warn,
+  error,
+  errorToStderr,
+  always,
+  logLines,
+  print,
+  reset,
+  logLevel,
+}
+
+export default loggerModule

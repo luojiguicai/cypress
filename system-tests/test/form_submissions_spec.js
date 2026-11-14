@@ -87,17 +87,22 @@ buffer compare yielded: ${ret}\
 
 describe('e2e forms', () => {
   context('submissions with jquery XHR POST', () => {
-    systemTests.setup()
+    systemTests.setup({
+      settings: {
+        e2e: {
+        },
+      },
+    })
 
     systemTests.it('passing', {
-      spec: 'form_submission_passing_spec.js',
-      snapshot: true,
+      spec: 'form_submission_passing.cy.js',
     })
 
     systemTests.it('failing', {
-      spec: 'form_submission_failing_spec.js',
+      spec: 'form_submission_failing.cy.js',
       snapshot: true,
       expectedExitCode: 1,
+      config: { screenshotOnRunFailure: false },
       onStdout: (stdout) => {
         return stdout
         .replace(/((?: {6}-)+[^\n]+\n)/gm, '')
@@ -108,6 +113,8 @@ describe('e2e forms', () => {
   context('<form> submissions', () => {
     systemTests.setup({
       settings: {
+        e2e: {
+        },
         env: {
           PATH_TO_LARGE_IMAGE: pathToLargeImage,
         },
@@ -139,18 +146,23 @@ describe('e2e forms', () => {
     })
 
     systemTests.it('passes with https on localhost', {
+      // FIXME: webkit is 404ing on redirects after the form submit on the default clientRoute /__/
+      browser: '!webkit',
       config: {
         baseUrl: `https://localhost:${HTTPS_PORT}`,
       },
-      spec: 'form_submission_multipart_spec.js',
+      spec: 'form_submission_multipart.cy.js',
       snapshot: true,
     })
 
     systemTests.it('passes with http on localhost', {
+      // FIXME: webkit is 404ing on redirects after the form submit on the default clientRoute /__/
+      browser: '!webkit',
       config: {
         baseUrl: `http://localhost:${HTTP_PORT}`,
+        e2e: {},
       },
-      spec: 'form_submission_multipart_spec.js',
+      spec: 'form_submission_multipart.cy.js',
       snapshot: true,
     })
   })

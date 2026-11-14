@@ -1,25 +1,38 @@
 import _ from 'lodash'
 import Bluebird from 'bluebird'
+import EventEmitter from 'events'
 import fs from 'fs-extra'
 import Debug from 'debug'
 import getPort from 'get-port'
 import path from 'path'
 import urlUtil from 'url'
-import { launch } from '@packages/launcher/lib/browsers'
+import { debug as launcherDebug } from '@packages/launcher/lib/browsers'
+import { doubleEscape } from '@packages/launcher/lib/windows'
 import FirefoxProfile from 'firefox-profile'
+import * as errors from '../errors'
 import firefoxUtil from './firefox-util'
 import utils from './utils'
-import * as launcherDebug from '@packages/launcher/lib/log'
-import type { Browser, BrowserInstance } from './types'
-import { EventEmitter } from 'events'
+import type { Browser, BrowserInstance, GracefulShutdownOptions } from './types'
 import os from 'os'
-import treeKill from 'tree-kill'
 import mimeDb from 'mime-db'
-import { getRemoteDebuggingPort } from './protocol'
-
-const errors = require('../errors')
+import type { BidiAutomation } from './bidi_automation'
+import type { Automation } from '../automation'
+import { getCtx } from '@packages/data-context'
+import type { CypressError } from '@packages/errors'
+import { getError } from '@packages/errors'
+import type { BrowserLaunchOpts, BrowserNewTabOpts, RunModeVideoApi } from '@packages/types'
+import type { Client as WebDriverClient, RemoteConfig } from 'webdriver'
+import type { GeckodriverParameters } from 'geckodriver'
+import { WebDriver } from './webdriver'
 
 const debug = Debug('cypress:server:browsers:firefox')
+const debugVerbose = Debug('cypress-verbose:server:browsers:firefox')
+
+// These debug variables have an impact on the 3rd-party webdriver and geckodriver
+// packages. To see verbose logs from Firefox, set both of these options to the
+// DEBUG variable.
+const WEBDRIVER_DEBUG_NAMESPACE_VERBOSE = 'cypress-verbose:server:browsers:webdriver'
+const GECKODRIVER_DEBUG_NAMESPACE_VERBOSE = 'cypress-verbose:server:browsers:geckodriver'
 
 // used to prevent the download prompt for the specified file types.
 // this should cover most/all file types, but if it's necessary to
@@ -82,6 +95,9 @@ const defaultPreferences = {
   'browser.startup.homepage_override.mstone': 'ignore',
   // Start with a blank page about:blank
   'browser.startup.page': 0,
+  // Disable notification banners related to session restoration.
+  // Any presented banners can result in incorrectly sized screenshots.
+  'browser.startup.couldRestoreSession.count': 0,
 
   // Do not allow background tabs to be zombified on Android: otherwise for
   // tests that open additional tabs: the test harness tab itself might get
@@ -91,6 +107,9 @@ const defaultPreferences = {
   'browser.tabs.warnOnCloseOtherTabs': false,
   // Do not warn when multiple tabs will be opened
   'browser.tabs.warnOnOpen': false,
+
+  // Do not offer to translate the page under test
+  'browser.translations.enable': false,
 
   // Disable the UI tour.
   'browser.uitour.enabled': false,
@@ -234,15 +253,6 @@ const defaultPreferences = {
 
   'network.proxy.type': 1,
 
-  // necessary for adding extensions
-  'devtools.debugger.remote-enabled': true,
-  // bind foxdriver to 127.0.0.1
-  'devtools.debugger.remote-host': '127.0.0.1',
-  // devtools.debugger.remote-port is set per-launch
-
-  'devtools.debugger.prompt-connection': false,
-  // "devtools.debugger.remote-websocket": true
-  'devtools.chrome.enabled': true,
   'app.update.auto': false,
   'app.update.enabled': false,
   'browser.displayedE10SNotice': 4,
@@ -296,10 +306,10 @@ const defaultPreferences = {
   'dom.timeout.enable_budget_timer_throttling': false,
 
   // allow getUserMedia APIs on insecure domains
-  'media.devices.insecure.enabled':	true,
+  'media.devices.insecure.enabled': true,
   'media.getusermedia.insecure.enabled': true,
 
-  'marionette.log.level': launcherDebug.log.enabled ? 'Debug' : undefined,
+  'marionette.log.level': launcherDebug.enabled ? 'Debug' : undefined,
 
   // where to download files
   // 0: desktop
@@ -309,6 +319,20 @@ const defaultPreferences = {
   // prevents the download prompt for the specified types of files
   'browser.helperApps.neverAsk.saveToDisk': downloadMimeTypes,
 }
+
+// CDP was deprecated in Firefox 129 and up and was removed in Firefox 141.
+// To enable BiDi (without CDP), we need to set
+//    remote.active-protocol=1
+// Cypress no longer supports CDP within Firefox. However, it can be enabled if needed (but only on Firefox 141 and lower) by setting
+//    remote.active-protocol=2
+// both can be enabled via
+//    remote.active-protocol=3
+// @see https://fxdx.dev/deprecating-cdp-support-in-firefox-embracing-the-future-with-webdriver-bidi/
+// @see https://fxdx.dev/webdriver-bidi-becomes-the-default-for-cypress-in-firefox/
+// @see https://github.com/cypress-io/cypress/issues/29713
+const ACTIVE_PROTOCOLS = Object.freeze({
+  BIDI: 1,
+})
 
 const FIREFOX_HEADED_USERCSS = `\
 #urlbar:not(.megabar), #urlbar.megabar > #urlbar-background, #searchbar {
@@ -338,54 +362,197 @@ toolbar {
   overflow: hidden !important;
   display: none;
 }
-
+toolbox {
+  height: 0px !important;
+  min-height: 0px !important;
+  overflow: hidden !important;
+  border: none !important;
+}
 `
 
-export function _createDetachedInstance (browserInstance: BrowserInstance): BrowserInstance {
-  const detachedInstance: BrowserInstance = new EventEmitter() as BrowserInstance
+let browserBidiClient: BidiAutomation | undefined
 
-  detachedInstance.pid = browserInstance.pid
+const DELETE_FAILED_SESSION_TIMEOUT = 10000
 
-  // kill the entire process tree, from the spawned instance up
-  detachedInstance.kill = (): void => {
-    treeKill(browserInstance.pid, (err?, result?) => {
-      debug('force-exit of process tree complete %o', { err, result })
-      detachedInstance.emit('exit')
-    })
-  }
+// the next launch reuses the profile directory, so it waits for a failed launch's session to finish closing
+let failedLaunchCleanup: Promise<void> = Promise.resolve()
 
-  return detachedInstance
+function deleteFailedSession (session: WebDriverClient, killBrowserAndDriver: () => unknown): Promise<void> {
+  return Bluebird.resolve(session.deleteSession())
+  .timeout(DELETE_FAILED_SESSION_TIMEOUT)
+  .then(() => undefined, async (deleteSessionErr) => {
+    debug('error deleting webdriver session after failed launch, killing firefox and geckodriver: %o', deleteSessionErr)
+
+    try {
+      killBrowserAndDriver()
+    } catch (killErr) {
+      debug('error killing firefox and geckodriver after failed launch: %o', killErr)
+    }
+
+    // a killed geckodriver can't remove its copy of the profile, which the next launch would encode into its own
+    const sessionProfile = session.capabilities['moz:profile']
+
+    if (typeof sessionProfile === 'string') {
+      // the killed processes can briefly keep handles open on Windows, failing the first attempt with EPERM or EBUSY
+      await fs.promises.rm(sessionProfile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch((removeErr) => {
+        debug('error removing profile of failed webdriver session: %o', removeErr)
+      })
+    }
+  })
 }
 
-export async function open (browser: Browser, url, options: any = {}, automation): Promise<BrowserInstance> {
-  // see revision comment here https://wiki.mozilla.org/index.php?title=WebDriver/RemoteProtocol&oldid=1234946
-  const hasCdp = browser.majorVersion >= 86
+const profileDirsToRemoveOnExit = new Set<string>()
+let isExitListenerRegistered = false
+
+export function _removeProfileDirsOnExit () {
+  const dirs = [...profileDirsToRemoveOnExit]
+
+  profileDirsToRemoveOnExit.clear()
+
+  for (const dir of dirs) {
+    try {
+      // On Windows, Firefox's processes can still hold handles in the profile for a moment after
+      // they are killed, which fails the first attempt with EPERM or EBUSY, so retry before giving up.
+      // eslint-disable-next-line no-restricted-syntax -- 'exit' listeners cannot await
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch (err) {
+      // A leftover run profile can be removed by the profile cleaner when a later run starts
+      debug('could not remove firefox profile %s on exit: %o', dir, err)
+    }
+  }
+}
+
+function removeProfileDirOnExit (dir: string) {
+  if (!isExitListenerRegistered) {
+    process.once('exit', _removeProfileDirsOnExit)
+    isExitListenerRegistered = true
+  }
+
+  profileDirsToRemoveOnExit.add(dir)
+}
+
+// firefox-profile adds an 'exit' and a 'SIGINT' listener for every profile it creates. Cypress removes the
+// profile itself and GracefulExit handles SIGINT, so drop them rather than let them pile up on each relaunch.
+function removeFirefoxProfileProcessListeners (profile: FirefoxProfile) {
+  for (const [event, key] of [['exit', 'onExit'], ['SIGINT', 'onSigInt']] as const) {
+    const listener = Reflect.get(profile, key)
+
+    if (typeof listener === 'function') {
+      process.removeListener(event, listener)
+    }
+  }
+}
+
+/**
+* Clear instance state for the chrome instance, this is normally called in on kill or on exit.
+*/
+export function clearInstanceState (options: GracefulShutdownOptions = {}) {
+  debug('clearing instance state')
+
+  if (browserBidiClient) {
+    debug('unbinding bidi client events')
+    browserBidiClient.close()
+    browserBidiClient = undefined
+  }
+}
+
+export async function connectToNewSpec (browser: Browser, options: BrowserNewTabOpts, automation: Automation) {
+  debug('connectToNewSpec bidi')
+
+  // the browser is reused between specs in run mode, so we need to re-establish the video
+  // recording controller for each new spec. Without this, the per-spec videoRecording object
+  // created in run mode never gets its controller set, and video compression fails with
+  // "Cannot read properties of undefined (reading 'postProcessFfmpegOptions')".
+  //
+  // The controller must be created *before* navigation so that videoRecording.controller is set in
+  // time — a fast spec can otherwise finish (and start compression) before the async ffmpeg
+  // controller is ready. But frame capture must only begin *after* navigation: the previous spec's
+  // page and its in-browser MediaRecorder stay alive until navigation unloads them, and any
+  // trailing frames would otherwise bleed into this spec's video stream. So we create the
+  // controller, navigate, then subscribe to frames.
+  // @see https://github.com/cypress-io/cypress/issues/18415
+  const video = options.videoApi ? await createVideoController(options.videoApi) : undefined
+
+  try {
+    await firefoxUtil.connectToNewSpecBiDi(options, automation, browserBidiClient!)
+  } catch (err) {
+    // if navigation/BiDi setup fails, tear down the ffmpeg encoder we just started so it isn't
+    // left orphaned (and so a retry doesn't start a second one alongside it).
+    await video?.controller.endVideoCapture(false).catch((endVideoCaptureErr) => {
+      debug('error ending video capture during BiDi connect failure teardown: %o', endVideoCaptureErr)
+    })
+
+    throw err
+  }
+
+  video?.startCapturingFrames()
+}
+
+export function connectToExisting () {
+  getCtx().onWarning(getError('UNEXPECTED_INTERNAL_ERROR', new Error('Attempting to connect to existing browser for Cypress in Cypress which is not yet implemented for firefox')))
+}
+
+export function connectProtocolToBrowser (): Promise<void> {
+  throw new Error('Protocol is not yet supported in firefox.')
+}
+
+export function connectCyPromptToBrowser (): Promise<void> {
+  return Promise.resolve()
+}
+
+export function connectStudioToBrowser (): Promise<void> {
+  return Promise.resolve()
+}
+
+export function closeProtocolConnection (): Promise<void> {
+  throw new Error('Protocol is not yet supported in firefox.')
+}
+
+async function recordVideo (videoApi: RunModeVideoApi) {
+  const { writeVideoFrame } = await videoApi.useFfmpegVideoController({ webmInput: true })
+
+  videoApi.onProjectCaptureVideoFrames(writeVideoFrame)
+}
+
+// Creates the ffmpeg video controller for a spec without yet subscribing to frames. Splitting this
+// out lets us create the controller *before* navigation (so the per-spec videoRecording object has
+// its controller set in time for compression) while deferring frame capture until *after*
+// navigation (so trailing frames from the previous spec don't bleed into this spec's video).
+// @see https://github.com/cypress-io/cypress/issues/18415
+async function createVideoController (videoApi: RunModeVideoApi) {
+  const controller = await videoApi.useFfmpegVideoController({ webmInput: true })
+
+  return {
+    controller,
+    startCapturingFrames: () => videoApi.onProjectCaptureVideoFrames(controller.writeVideoFrame),
+  }
+}
+
+export async function open (browser: Browser, url: string, options: BrowserLaunchOpts, automation: Automation): Promise<BrowserInstance> {
   const defaultLaunchOptions = utils.getDefaultLaunchOptions({
     extensions: [] as string[],
     preferences: _.extend({}, defaultPreferences),
     args: [
-      '-marionette',
       '-new-instance',
-      '-foreground',
-      '-start-debugger-server', // uses the port+host defined in devtools.debugger.remote
+      // if testing against older versions of Firefox to determine when a regression may have been introduced, uncomment the '-allow-downgrade' flag.
+      // '-allow-downgrade',
       '-no-remote', // @see https://github.com/cypress-io/cypress/issues/6380
     ],
   })
 
-  let remotePort
-
-  if (hasCdp) {
-    remotePort = await getRemoteDebuggingPort()
-
-    defaultLaunchOptions.args.push(`--remote-debugging-port=${remotePort}`)
-  }
+  defaultLaunchOptions.preferences['remote.active-protocols'] = ACTIVE_PROTOCOLS.BIDI
 
   if (browser.isHeadless) {
     defaultLaunchOptions.args.push('-headless')
     // we don't need to specify width/height since MOZ_HEADLESS_ env vars will be set
     // and the browser will spawn maximized. The user may still supply these args to override
-    // defaultLaunchOptions.args.push('--width=1920')
-    // defaultLaunchOptions.args.push('--height=1081')
+    // defaultLaunchOptions.args.push('-width=1920')
+    // defaultLaunchOptions.args.push('-height=1081')
+  } else if (os.platform() === 'win32' || os.platform() === 'darwin') {
+    // lets the browser come into focus. Only works on Windows or Mac
+    // this argument is added automatically to the linux geckodriver,
+    // so adding it is unnecessary and actually causes the browser to fail to launch.
+    defaultLaunchOptions.args.push('-foreground')
   }
 
   debug('firefox open %o', options)
@@ -393,7 +560,9 @@ export async function open (browser: Browser, url, options: any = {}, automation
   const ps = options.proxyServer
 
   if (ps) {
-    let { hostname, port, protocol } = urlUtil.parse(ps)
+    const parsedProxy = urlUtil.parse(ps)
+    const { hostname, protocol } = parsedProxy
+    let { port } = parsedProxy
 
     if (port == null) {
       port = protocol === 'https:' ? '443' : '80'
@@ -401,12 +570,13 @@ export async function open (browser: Browser, url, options: any = {}, automation
 
     _.extend(defaultLaunchOptions.preferences, {
       'network.proxy.allow_hijacking_localhost': true,
+      'network.proxy.testing_localhost_is_secure_when_hijacked': true,
       'network.proxy.http': hostname,
       'network.proxy.ssl': hostname,
       'network.proxy.http_port': +port,
       'network.proxy.ssl_port': +port,
       'network.proxy.no_proxies_on': '',
-      'browser.download.dir': options.downloadsFolder,
+      'browser.download.dir': os.platform() === 'win32' ? doubleEscape(options.downloadsFolder) : options.downloadsFolder,
     })
   }
 
@@ -417,23 +587,42 @@ export async function open (browser: Browser, url, options: any = {}, automation
   }
 
   const [
-    foxdriverPort,
     marionettePort,
-  ] = await Bluebird.all([getPort(), getPort()])
+    webDriverBiDiPort,
+  ] = await Promise.all([getPort(), getPort()])
 
-  defaultLaunchOptions.preferences['devtools.debugger.remote-port'] = foxdriverPort
   defaultLaunchOptions.preferences['marionette.port'] = marionettePort
 
-  debug('available ports: %o', { foxdriverPort, marionettePort })
+  // NOTE: we get the BiDi port and set it inside of geckodriver, but BiDi is not currently enabled (see remote.active-protocols above).
+  // this is so the BiDi websocket port does not get set to 0, which is the default for the geckodriver package.
+  debug('available ports: %o', { marionettePort, webDriverBiDiPort })
+
+  const profileDir = utils.getProfileDir(browser, options.isTextTerminal)
+
+  await failedLaunchCleanup
+
+  // Delete the legacy profile directory if in open mode.
+  // Cypress does this because profiles are sourced and created differently with geckodriver/webdriver.
+  // the profile creation method before 13.15.0 will no longer work with geckodriver/webdriver
+  // and actually corrupts the profile directory from being able to be encoded. Hence, we delete it to prevent any conflicts.
+  // This is critical to make sure different Cypress versions do not corrupt the firefox profile, which can fail silently.
+  if (!options.isTextTerminal) {
+    const doesPathExist = await fs.pathExists(profileDir)
+
+    if (doesPathExist) {
+      await fs.remove(profileDir)
+    }
+  }
 
   const [
     cacheDir,
     extensionDest,
     launchOptions,
-  ] = await Bluebird.all([
+  ] = await Promise.all([
     utils.ensureCleanCache(browser, options.isTextTerminal),
     utils.writeExtension(browser, options.isTextTerminal, options.proxyUrl, options.socketIoRoute),
     utils.executeBeforeBrowserLaunch(browser, defaultLaunchOptions, options),
+    options.videoApi && recordVideo(options.videoApi),
   ])
 
   if (Array.isArray(launchOptions.extensions)) {
@@ -442,35 +631,16 @@ export async function open (browser: Browser, url, options: any = {}, automation
     launchOptions.extensions = [extensionDest]
   }
 
-  const profileDir = utils.getProfileDir(browser, options.isTextTerminal)
-
   const profile = new FirefoxProfile({
     destinationDirectory: profileDir,
   })
 
+  removeFirefoxProfileProcessListeners(profile)
+  removeProfileDirOnExit(profileDir)
+
   debug('firefox directories %o', { path: profile.path(), cacheDir, extensionDest })
 
-  const xulStorePath = path.join(profile.path(), 'xulstore.json')
-
-  // if user has set custom window.sizemode pref or it's the first time launching on this profile, write to xulStore.
-  if (!await fs.pathExists(xulStorePath)) {
-    // this causes the browser to launch maximized, which chrome does by default
-    // otherwise an arbitrary size will be picked for the window size
-    // this will not have an effect after first launch in 'interactive' mode
-    const sizemode = 'maximized'
-
-    await fs.writeJSON(xulStorePath, { 'chrome://browser/content/browser.xhtml': { 'main-window': { 'width': 1280, 'height': 1024, sizemode } } })
-  }
-
   launchOptions.preferences['browser.cache.disk.parent_directory'] = cacheDir
-  for (const pref in launchOptions.preferences) {
-    const value = launchOptions.preferences[pref]
-
-    profile.setPreference(pref, value)
-  }
-
-  // TODO: fix this - synchronous FS operation
-  profile.updatePreferences()
 
   const userCSSPath = path.join(profileDir, 'chrome')
 
@@ -495,31 +665,196 @@ export async function open (browser: Browser, url, options: any = {}, automation
     await fs.writeFile(path.join(profileDir, 'chrome', 'userChrome.css'), userCss)
   }
 
-  launchOptions.args = launchOptions.args.concat([
-    '-profile',
-    profile.path(),
-  ])
+  // resolution of exactly 1280x720
+  const BROWSER_ENVS = {
+    MOZ_REMOTE_SETTINGS_DEVTOOLS: '1',
+    MOZ_HEADLESS_WIDTH: '1280',
+    MOZ_HEADLESS_HEIGHT: '720',
+    ...launchOptions.env,
+  }
+
+  debug('launching geckodriver with browser envs %o', BROWSER_ENVS)
 
   debug('launch in firefox', { url, args: launchOptions.args })
 
-  const browserInstance = await launch(browser, 'about:blank', launchOptions.args, {
-    // sets headless resolution to 1280x720 by default
-    // user can overwrite this default with these env vars or --height, --width arguments
-    MOZ_HEADLESS_WIDTH: '1280',
-    MOZ_HEADLESS_HEIGHT: '721',
-  })
+  const launchEnvs = process.env
+
+  const geckoDriverOptions: GeckodriverParameters = {
+    host: '127.0.0.1',
+    // geckodriver port is assigned under the hood by @wdio/utils
+    // @see https://github.com/webdriverio/webdriverio/blob/v9.1.1/packages/wdio-utils/src/node/startWebDriver.ts#L65
+    marionetteHost: '127.0.0.1',
+    marionettePort,
+    websocketPort: webDriverBiDiPort,
+    profileRoot: profile.path(),
+    // To pass env variables into the firefox process, we CANNOT do it through capabilities when starting the browser.
+    // Since geckodriver spawns the firefox process, we can pass the env variables directly to geckodriver, which in turn will
+    // pass them to the firefox process
+    // @see https://bugzilla.mozilla.org/show_bug.cgi?id=1604723#c20 for more details
+    spawnOpts: {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...BROWSER_ENVS,
+        ...launchEnvs,
+      },
+    },
+    jsdebugger: Debug.enabled(GECKODRIVER_DEBUG_NAMESPACE_VERBOSE) || false,
+    log: Debug.enabled(GECKODRIVER_DEBUG_NAMESPACE_VERBOSE) ? 'debug' : 'error',
+    logNoTruncate: Debug.enabled(GECKODRIVER_DEBUG_NAMESPACE_VERBOSE),
+  }
+
+  // since we no longer directly control the browser with webdriver, we need to make the browserInstance
+  // a simulated wrapper that kills the process IDs that come back from webdriver
+  // @ts-expect-error - a bare EventEmitter lacks BrowserInstance's kill until it is assigned below
+  const browserInstanceWrapper: BrowserInstance = new EventEmitter()
+
+  browserInstanceWrapper.kill = () => undefined
+
+  let launchedSession: WebDriverClient | undefined
 
   try {
-    await firefoxUtil.setup({ automation, extensions: launchOptions.extensions, url, foxdriverPort, marionettePort, remotePort, onError: options.onError })
-  } catch (err) {
-    errors.throw('FIREFOX_COULD_NOT_CONNECT', err)
+  /**
+   * To set the profile, we use the profile capabilities in firefoxOptions which
+   * requires the profile to be base64 encoded. The profile will be copied over to whatever
+   * profile is created by geckodriver stemming from the root profile path.
+   *
+   * For example, if the profileRoot in geckodriver is /usr/foo/firefox-stable/run-12345, the new webdriver session
+   * will take the base64 encoded profile contents we created in /usr/foo/firefox-stable/run-12345/* (via firefox-profile npm package) and
+   * copy it to a profile created in the profile root, which would look something like /usr/foo/firefox-stable/run-12345/rust_mozprofile<HASH>/*
+   * @see https://developer.mozilla.org/en-US/docs/Web/WebDriver/Capabilities/firefoxOptions
+   */
+    const base64EncodedProfile = await new Promise<string>((resolve, reject) => {
+      profile.encoded(function (err, encodedProfile) {
+        err ? reject(err) : resolve(encodedProfile)
+      })
+    })
+
+    const newSessionCapabilities: RemoteConfig = {
+      logLevel: Debug.enabled(WEBDRIVER_DEBUG_NAMESPACE_VERBOSE) ? 'info' : 'silent',
+      capabilities: {
+        alwaysMatch: {
+          browserName: 'firefox',
+          acceptInsecureCerts: true,
+          webSocketUrl: true,
+          // @see https://developer.mozilla.org/en-US/docs/Web/WebDriver/Capabilities/firefoxOptions
+          'moz:firefoxOptions': {
+            profile: base64EncodedProfile,
+            binary: browser.path,
+            args: launchOptions.args,
+            prefs: launchOptions.preferences,
+          },
+          // @see https://webdriver.io/docs/capabilities/#wdiogeckodriveroptions
+          // webdriver starts geckodriver with the correct options on behalf of Cypress
+          'wdio:geckodriverOptions': geckoDriverOptions,
+        },
+        firstMatch: [],
+      },
+    }
+
+    debugVerbose(`creating session with capabilities %s`, JSON.stringify(newSessionCapabilities.capabilities))
+
+    const WD = WebDriver.getWebDriverPackage()
+
+    // this command starts the webdriver session and actually opens the browser
+    // to debug geckodriver, set the DEBUG=cypress-verbose:server:browsers:geckodriver (debugs a third-party patched package geckodriver to enable console output)
+    // to debug webdriver, set the DEBUG=cypress-verbose:server:browsers:webdriver (debugs a third-party patched package webdriver to enable console output)
+    // @see ./firefox_automation.md
+    const webdriverClient = await WD.newSession(newSessionCapabilities)
+
+    launchedSession = webdriverClient
+
+    debugVerbose(`received capabilities %o`, webdriverClient.capabilities)
+
+    const browserPID: number = webdriverClient.capabilities['moz:processID']
+
+    debug(`firefox running on pid: ${browserPID}`)
+
+    const driverPID: number = webdriverClient.capabilities['wdio:driverPID'] as number
+
+    debug(`webdriver running on pid: ${driverPID}`)
+
+    // now that we have the driverPID and browser PID
+    browserInstanceWrapper.kill = (...args) => {
+      // Do nothing on failure here since we're shutting down anyway
+
+      clearInstanceState({ gracefulShutdown: true })
+
+      debug('closing firefox')
+
+      let browserReturnStatus = true
+      let browserKillError: unknown
+
+      try {
+        browserReturnStatus = process.kill(browserPID)
+      } catch (error: unknown) {
+        if ((error as CypressError)?.code === 'ESRCH') {
+          debugVerbose('browser process no longer exists. continuing...')
+        } else {
+          browserKillError = error
+        }
+      }
+
+      debug('closing geckodriver and webdriver')
+
+      let driverReturnStatus = true
+
+      try {
+        driverReturnStatus = process.kill(driverPID)
+      } catch (error: unknown) {
+        if ((error as CypressError)?.code === 'ESRCH') {
+          debugVerbose('geckodriver/webdriver process no longer exists. continuing...')
+        } else {
+          throw error
+        }
+      }
+
+      if (browserKillError) {
+        throw browserKillError
+      }
+
+      // needed for closing the browser when switching browsers in open mode to signal
+      // the browser is done closing
+      browserInstanceWrapper.emit('exit')
+
+      return browserReturnStatus || driverReturnStatus
+    }
+
+    // maximize the window if running headful and no width or height args are provided.
+    // NOTE: We used to do this with xulstore.json, but this is no longer possible with geckodriver
+    // as firefox will create the profile under the profile root that we cannot control and we cannot consistently provide
+    // a base 64 encoded profile.
+    if (!browser.isHeadless && (!launchOptions.args.includes('-width') || !launchOptions.args.includes('-height'))) {
+      await webdriverClient.maximizeWindow()
+    }
+
+    // install the browser extensions
+    await Promise.all(_.map(launchOptions.extensions, async (path) => {
+      debug(`installing extension at path: ${path}`)
+      const id = await webdriverClient.installAddOn(path, true)
+
+      debug(`extension with id ${id} installed!`)
+
+      return
+    }))
+
+    debug('setting up firefox utils')
+    browserBidiClient = await firefoxUtil.setup({ automation, url, webdriverClient })
+  } catch (err: unknown) {
+    // delete the session so it doesn't leak into the next launch
+    if (launchedSession) {
+      failedLaunchCleanup = deleteFailedSession(launchedSession, browserInstanceWrapper.kill)
+      await failedLaunchCleanup
+    }
+
+    errors.throwErr('FIREFOX_COULD_NOT_CONNECT', err as Error)
   }
 
-  if (os.platform() === 'win32') {
-    // override the .kill method for Windows so that the detached Firefox process closes between specs
-    // @see https://github.com/cypress-io/cypress/issues/6392
-    return _createDetachedInstance(browserInstance)
-  }
+  return browserInstanceWrapper
+}
 
-  return browserInstance
+export async function closeExtraTargets () {
+  // we're currently holding off on implementing Firefox support in order
+  // to release Chromium support as soon as possible and may add Firefox
+  // support in the future
+  debug('Closing extra targets is not currently supported in Firefox')
 }

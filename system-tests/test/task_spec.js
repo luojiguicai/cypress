@@ -5,9 +5,10 @@ describe('e2e task', () => {
 
   it('handles undefined return and includes stack trace in error', function () {
     return systemTests.exec(this, {
-      spec: 'task_spec.js',
+      spec: 'task.cy.js',
       snapshot: true,
       expectedExitCode: 2,
+      config: { screenshotOnRunFailure: false },
     })
     .then(({ stdout }) => {
       // should include a stack trace from plugins file
@@ -22,7 +23,7 @@ describe('e2e task', () => {
   it('merges task events on subsequent registrations and logs warning for conflicts', function () {
     return systemTests.exec(this, {
       project: 'multiple-task-registrations',
-      spec: 'multiple_task_registrations_spec.js',
+      spec: 'multiple_task_registrations.cy.js',
       sanitizeScreenshotDimensions: true,
       snapshot: true,
     })

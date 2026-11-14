@@ -1,37 +1,120 @@
 import Bluebird from 'bluebird'
-import { v4 as uuidv4 } from 'uuid'
-import { Cookies } from './cookies'
+import { randomUUID } from 'crypto'
+import { Cookies, getCookieUrl } from './cookie/automation'
 import { Screenshot } from './screenshot'
 import type { BrowserPreRequest } from '@packages/proxy'
+import type { AutomationCommands, AutomationMiddleware, OnRequestEvent, OnServiceWorkerClientSideRegistrationUpdated, OnServiceWorkerRegistrationUpdated, OnServiceWorkerVersionUpdated } from '@packages/types'
+import type { SerializableAutomationCookie } from './cookie/jar'
+import { automationCookieToToughCookie, cookieJar } from './cookie/jar'
+import type { ServiceWorkerEventHandler } from '@packages/proxy/lib/http/util/service-worker-manager'
+import Debug from 'debug'
+import { AutomationNotImplemented } from './automation_not_implemented'
 
-type NullableMiddlewareHook = (() => void) | null
+const debug = Debug('cypress:server:automation')
 
-export type OnBrowserPreRequest = (browserPreRequest: BrowserPreRequest) => void
+type OnBrowserPreRequest = (browserPreRequest: BrowserPreRequest) => Promise<void>
 
-export type OnRequestEvent = (eventName: string, data: any) => void
+type AutomationOptions = {
+  cyNamespace?: string
+  cookieNamespace?: string
+  screenshotsFolder?: string | false
+  onBrowserPreRequest?: OnBrowserPreRequest
+  onRequestEvent?: OnRequestEvent
+  onRemoveBrowserPreRequest?: (requestId: string) => void
+  onDownloadLinkClicked?: (downloadUrl: string) => void
+  onServiceWorkerRegistrationUpdated?: OnServiceWorkerRegistrationUpdated
+  onServiceWorkerVersionUpdated?: OnServiceWorkerVersionUpdated
+  onServiceWorkerClientSideRegistrationUpdated?: OnServiceWorkerClientSideRegistrationUpdated
+  onServiceWorkerClientEvent: ServiceWorkerEventHandler
+}
 
-export interface AutomationMiddleware {
-  onPush?: NullableMiddlewareHook
-  onBeforeRequest?: OnRequestEvent | null
-  onRequest?: OnRequestEvent | null
-  onResponse?: NullableMiddlewareHook
-  onAfterResponse?: NullableMiddlewareHook
+// `cy.request()` and `cy.setCookie()` reach the browser without passing through the
+// proxy, so the jar never sees the new value on its own. A stale copy there wins over
+// the browser's on the next AUT frame navigation, since jar cookies take precedence
+// when both carry the same name.
+// See https://github.com/cypress-io/cypress/issues/34891
+const syncSetCookieToJar = (cookie: SerializableAutomationCookie) => {
+  // resolved the same way `Cookies.setCookie` resolves the url it hands the browser,
+  // so the jar ends up holding the cookie the browser was actually told to set
+  const url = cookie.url ?? getCookieUrl(cookie)
+
+  try {
+    const { hostname, pathname } = new URL(url)
+
+    // refresh only a cookie the jar already tracks. seeding one it has never held would
+    // shadow a same-origin `document.cookie` write, which reaches the browser but not
+    // the jar. the lookup goes over https so it is not scheme-restricted: `getCookies`
+    // withholds a Secure cookie from an http url, and this url's scheme follows the
+    // cookie's own `secure` flag, which `cy.setCookie()` leaves false by default
+    if (!cookieJar.getCookies(`https://${hostname}${pathname}`).some(({ key }) => key === cookie.name)) {
+      return
+    }
+
+    // tough-cookie's store keys on the dot-stripped domain and `getCookies` only searches
+    // those keys, so a `.example.com` domain — which `cy.setCookie()` forwards verbatim —
+    // would write to a key nothing reads. `getCookieUrl` strips the dot for the same reason
+    const toughCookie = automationCookieToToughCookie({ ...cookie, domain: cookie.domain?.replace(/^\./, '') }, hostname)
+
+    // a set:cookie payload carries no maxAge, which the conversion turns into
+    // 'Infinity'. tough-cookie reads maxAge ahead of expires, so the jar copy would
+    // outlive the one the browser holds. Infinity is its sentinel for "never expires",
+    // and expiryTime() throws on undefined
+    if (cookie.maxAge == null) {
+      // null is tough-cookie's own default for a cookie without Max-Age, and every
+      // read of maxAge guards with `!= null`, but its types do not admit it
+      // @ts-expect-error - tough-cookie types maxAge as number | 'Infinity' | '-Infinity', without null
+      toughCookie.maxAge = null
+      toughCookie.expires = toughCookie.expires ?? Infinity
+    }
+
+    // browsers treat an unspecified SameSite as Lax, which is what `CookieJar.parse`
+    // applies to cookies arriving on a response. `cy.setCookie()` also accepts the
+    // extension vocabulary's literal 'unspecified', which means the same thing but
+    // which tough-cookie does not recognise and so treats as None. without this the
+    // jar copy is attached to cross-site requests the browser would withhold it from
+    if (!toughCookie.sameSite || cookie.sameSite === 'unspecified') {
+      toughCookie.sameSite = 'lax'
+    }
+
+    // no request drives this write, so there is no same-site context to apply
+    cookieJar.setCookie(toughCookie, url, undefined)
+  } catch (err) {
+    debug('adding cookie to jar failed %o', { cookie, err })
+  }
 }
 
 export class Automation {
   private requests: Record<number, (any) => void>
   private middleware: AutomationMiddleware
+  private preferredMiddleware?: AutomationMiddleware
   private cookies: Cookies
   private screenshot: { capture: (data: any, automate: any) => any }
+  public onBrowserPreRequest: OnBrowserPreRequest | undefined
+  public onRequestEvent: OnRequestEvent | undefined
+  public onRemoveBrowserPreRequest: ((requestId: string) => void) | undefined
+  public onDownloadLinkClicked: ((downloadUrl: string) => void) | undefined
+  public onServiceWorkerRegistrationUpdated: OnServiceWorkerRegistrationUpdated | undefined
+  public onServiceWorkerVersionUpdated: OnServiceWorkerVersionUpdated | undefined
+  public onServiceWorkerClientSideRegistrationUpdated: OnServiceWorkerClientSideRegistrationUpdated | undefined
+  public onServiceWorkerClientEvent: ServiceWorkerEventHandler
 
-  constructor (cyNamespace?: string, cookieNamespace?: string, screenshotsFolder?: string | false, public onBrowserPreRequest?: OnBrowserPreRequest, public onRequestEvent?: OnRequestEvent) {
+  constructor (options: AutomationOptions) {
+    this.onBrowserPreRequest = options.onBrowserPreRequest
+    this.onRequestEvent = options.onRequestEvent
+    this.onRemoveBrowserPreRequest = options.onRemoveBrowserPreRequest
+    this.onDownloadLinkClicked = options.onDownloadLinkClicked
+    this.onServiceWorkerRegistrationUpdated = options.onServiceWorkerRegistrationUpdated
+    this.onServiceWorkerVersionUpdated = options.onServiceWorkerVersionUpdated
+    this.onServiceWorkerClientSideRegistrationUpdated = options.onServiceWorkerClientSideRegistrationUpdated
+    this.onServiceWorkerClientEvent = options.onServiceWorkerClientEvent
+
     this.requests = {}
 
     // set the middleware
     this.middleware = this.initializeMiddleware()
 
-    this.cookies = new Cookies(cyNamespace, cookieNamespace)
-    this.screenshot = Screenshot(screenshotsFolder)
+    this.cookies = new Cookies(options.cyNamespace, options.cookieNamespace)
+    this.screenshot = Screenshot(options.screenshotsFolder)
   }
 
   initializeMiddleware = (): AutomationMiddleware => {
@@ -48,31 +131,37 @@ export class Automation {
     this.middleware = this.initializeMiddleware()
   }
 
-  automationValve (message, fn) {
-    return (msg, data) => {
-      // enable us to omit message
-      // argument
-      if (!data) {
-        data = msg
-        msg = message
-      }
+  automationValve<T extends keyof AutomationCommands> (message: T, fn: (...args: any) => any) {
+    return (
+      msg: T | AutomationCommands[T]['dataType'],
+      data: T extends keyof AutomationCommands ? AutomationCommands[T]['dataType'] : never,
+    ): Bluebird<AutomationCommands[T]['returnType']> => {
+      const resolvedData = data ?? msg as AutomationCommands[T]['dataType']
+      const resolvedMessage = data ? msg : message
 
       const onReq = this.get('onRequest')
 
-      // if we have an onRequest function
-      // then just invoke that
       if (onReq) {
-        return Bluebird.resolve(onReq(msg, data))
+        debug('Middleware `onRequest` fn found, attempting middleware exec for message: %s', message)
+
+        return Bluebird.try(() => {
+          return onReq(resolvedMessage, resolvedData)
+        }).catch((e) => {
+          if (AutomationNotImplemented.isAutomationNotImplementedErr(e)) {
+            return this.requestAutomationResponse(resolvedMessage, resolvedData, fn)
+          }
+
+          throw e
+        })
       }
 
-      // do the default
-      return Bluebird.resolve(this.requestAutomationResponse(msg, data, fn))
+      return this.requestAutomationResponse(resolvedMessage, resolvedData, fn)
     }
   }
 
-  requestAutomationResponse (message, data, fn) {
+  requestAutomationResponse (message: string, data: any, fn: (...args: any) => any) {
     return new Bluebird((resolve, reject) => {
-      const id = uuidv4()
+      const id = randomUUID()
 
       this.requests[id] = function (obj) {
         // normalize the error from automation responses
@@ -96,18 +185,19 @@ export class Automation {
     })
   }
 
-  invokeAsync (fn, ...args) {
-    return Bluebird
-    .try(() => {
-      fn = this.get(fn)
+  async invokeAsync (fn, ...args) {
+    const invocationTarget = this.get(fn) as (...args: any[]) => Promise<any>
 
-      if (fn) {
-        return fn(...args)
+    if (invocationTarget) {
+      try {
+        return await invocationTarget(...args)
+      } catch (err: unknown) {
+        debug('invokeAsync on %s failed: %s', fn, err)
       }
-    })
+    }
   }
 
-  normalize (message, data, automate?) {
+  normalize<T extends keyof AutomationCommands> (message: T, data: AutomationCommands[T]['dataType'], automate?): Promise<AutomationCommands[T]['returnType']> {
     return Bluebird.try(() => {
       switch (message) {
         case 'take:screenshot':
@@ -118,15 +208,33 @@ export class Automation {
           return this.cookies.getCookie(data, automate)
         case 'set:cookie':
           return this.cookies.setCookie(data, automate)
+          .then((automationCookie) => {
+            // the sync runs only once the automation resolves, so a namespaced or
+            // browser-rejected cookie never reaches the jar
+            syncSetCookieToJar(data)
+
+            return automationCookie
+          })
         case 'set:cookies':
           return this.cookies.setCookies(data, automate)
+        case 'add:cookies':
+          return this.cookies.addCookies(data, automate)
         case 'clear:cookies':
-          return this.cookies.clearCookies(data, automate)
+          return Bluebird.all([
+            this.cookies.clearCookies(data, automate),
+            cookieJar.removeAllCookies(),
+          ])
+          .spread((automationResult) => automationResult)
         case 'clear:cookie':
-          return this.cookies.clearCookie(data, automate)
+          return Bluebird.all([
+            this.cookies.clearCookie(data, automate),
+            cookieJar.removeCookie(data),
+          ])
+          .spread((automationResult) => automationResult)
         case 'change:cookie':
           return this.cookies.changeCookie(data)
         case 'create:download':
+        case 'canceled:download':
         case 'complete:download':
           return data
         default:
@@ -144,47 +252,49 @@ export class Automation {
   }
 
   use (middlewares: AutomationMiddleware) {
+    debug('installing middleware')
+
     return this.middleware = {
       ...this.middleware,
       ...middlewares,
     }
   }
 
-  push (message: string, data: unknown) {
-    return this.normalize(message, data)
-    .then((data) => {
-      if (data) {
-        this.invokeAsync('onPush', message, data)
-      }
-    })
+  async push<T extends keyof AutomationCommands> (message: T, data: AutomationCommands[T]['dataType']) {
+    debug('push `%s`: %o', message, data)
+    const result = await this.normalize(message, data)
+
+    if (result) {
+      await this.invokeAsync('onPush', message, result)
+    }
   }
 
-  request (message, data, fn) {
+  async request<T extends keyof AutomationCommands> (message: T, data: AutomationCommands[T]['dataType'], fn) {
     // curry in the message + callback function
     // for obtaining the external automation data
+    debug('request: `%s`', message)
     const automate = this.automationValve(message, fn)
 
-    // enable us to tap into before making the request
-    return this.invokeAsync('onBeforeRequest', message, data)
-    .then(() => {
-      return this.normalize(message, data, automate)
-    })
-    .tap((resp) => {
-      return this.invokeAsync('onAfterResponse', message, data, resp)
-    })
+    await this.invokeAsync('onBeforeRequest', message, data)
+
+    const resp = await this.normalize(message, data, automate)
+
+    await this.invokeAsync('onAfterResponse', message, data, resp)
+
+    return resp
   }
 
   response = (id, resp) => {
     const request = this.requests[id]
 
     if (request) {
-      delete request[id]
+      delete this.requests[id]
 
       return request(resp)
     }
   }
 
-  get = (fn: keyof AutomationMiddleware) => {
+  get = <K extends keyof AutomationMiddleware>(fn: K): AutomationMiddleware[K] => {
     return this.middleware[fn]
   }
 }

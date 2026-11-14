@@ -1,0 +1,45 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`exec info > logs additional info about pre-releases > logs additional info about pre-releases 1`] = `
+"
+Application Data: [36m/user/app/data/path[39m
+Browser Profiles: [36m/user/app/data/path/to/browsers[39m
+Binary Caches: [36m/user/path/to/binary/cache[39m
+
+Cypress Version: [32m0.0.0-development[39m [31m(pre-release)[39m
+System Platform: [32mlinux[39m ([32mFoo - OsVersion[39m)
+System Memory: [32m1.2 GB[39m free [32m400 MB[39m
+
+This is a [31mpre-release[39m build of Cypress.
+Build info:
+  Commit SHA: [32mabc123[39m
+  Commit Branch: [32msomeBranchName[39m
+  Commit Date: [32m2022-02-02T00:00:00.000Z[39m
+"
+`;
+
+exports[`exec info > logs if unbuilt development > logs additional info about development 1`] = `
+"
+Application Data: [36m/user/app/data/path[39m
+Browser Profiles: [36m/user/app/data/path/to/browsers[39m
+Binary Caches: [36m/user/path/to/binary/cache[39m
+
+Cypress Version: [32m0.0.0-development[39m [31m(pre-release)[39m
+System Platform: [32mlinux[39m ([32mFoo - OsVersion[39m)
+System Memory: [32m1.2 GB[39m free [32m400 MB[39m
+
+This is the [31mdevelopment[39m (un-built) Cypress CLI.
+"
+`;
+
+exports[`exec info > prints collected info > cypress info 1`] = `
+"
+Application Data: [36m/user/app/data/path[39m
+Browser Profiles: [36m/user/app/data/path/to/browsers[39m
+Binary Caches: [36m/user/path/to/binary/cache[39m
+
+Cypress Version: [32m0.0.0-development[39m [32m(stable)[39m
+System Platform: [32mlinux[39m ([32mFoo - OsVersion[39m)
+System Memory: [32m1.2 GB[39m free [32m400 MB[39m
+"
+`;

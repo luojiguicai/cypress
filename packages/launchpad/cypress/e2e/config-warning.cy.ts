@@ -1,0 +1,196 @@
+describe('baseUrl', () => {
+  it('should show baseUrl warning if Cypress cannot connect to provided baseUrl', () => {
+    cy.scaffoldProject('config-with-base-url-warning')
+    cy.openProject('config-with-base-url-warning')
+    cy.visitLaunchpad()
+
+    cy.get('[data-cy-testingtype="e2e"]').click()
+    cy.get('[data-cy="alert"]').contains('Warning: Cannot Connect Base Url Warning')
+
+    cy.withCtx((ctx) => {
+      sinon.stub(ctx._apis.projectApi, 'isListening').resolves(undefined)
+    })
+
+    cy.contains('button', 'Try again').click()
+    cy.get('[data-cy="alert"]').should('not.exist')
+  })
+
+  it('should clear baseUrl warning if Cypress can connect to provided baseUrl', () => {
+    cy.scaffoldProject('config-with-base-url-warning')
+    cy.openProject('config-with-base-url-warning')
+    cy.visitLaunchpad()
+
+    cy.get('[data-cy-testingtype="e2e"]').click()
+    cy.get('[data-cy="alert"]').contains('Warning: Cannot Connect Base Url Warning')
+
+    cy.withCtx(async (ctx) => {
+      await ctx.actions.file.writeFileInProject('cypress.config.js', `
+        module.exports = {
+          e2e: {
+            supportFile: false,
+            baseUrl: 'http://localhost:5555',
+          },
+        }
+      `)
+    })
+
+    cy.get('h1').should('contain', 'Choose a browser')
+    cy.get('[data-cy="alert"]').should('not.exist')
+  })
+
+  it('should add baseUrl warning when going from good to bad config', () => {
+    cy.scaffoldProject('config-with-js')
+    cy.openProject('config-with-js')
+    cy.visitLaunchpad()
+
+    cy.get('[data-cy-testingtype="e2e"]').click()
+    cy.get('h1').should('contain', 'Choose a browser')
+    cy.get('[data-cy="alert"]').should('not.exist')
+
+    cy.withCtx(async (ctx) => {
+      await ctx.actions.file.writeFileInProject('cypress.config.js', `
+        module.exports = {
+          pageLoadTimeout: 10000,
+          e2e: {
+            supportFile: false,
+            baseUrl: 'http://localhost:9999',
+            defaultCommandTimeout: 500,
+            videoCompression: 20,
+          },
+        }
+      `)
+    })
+
+    cy.get('[data-cy="loading-spinner"]').should('be.visible')
+    cy.get('h1').should('contain', 'Choose a browser')
+    cy.get('[data-cy="alert"]').contains('Warning: Cannot Connect Base Url Warning')
+  })
+})
+
+describe('experimentalSingleTabRunMode', () => {
+  it('is a valid config for component testing', () => {
+    cy.scaffoldProject('experimentalSingleTabRunMode')
+    cy.openProject('experimentalSingleTabRunMode', ['--component', '--config-file', 'cypress-component-only.config.js'])
+
+    cy.visitLaunchpad()
+
+    cy.findByTestId('launchpad-Choose a browser')
+    cy.get('h1').contains('Choose a browser')
+  })
+
+  it('is not a valid config for e2e testing', () => {
+    cy.scaffoldProject('experimentalSingleTabRunMode')
+    cy.openProject('experimentalSingleTabRunMode', ['--e2e'])
+    cy.visitLaunchpad()
+    cy.findByTestId('error-header').contains('Cypress configuration error')
+    cy.findByTestId('alert-body').contains('The experimentalSingleTabRunMode experiment is currently only supported for Component Testing.')
+  })
+})
+
+describe('experimentalOriginDependencies', () => {
+  it('is a valid config for e2e testing', () => {
+    cy.scaffoldProject('session-and-origin-e2e-specs')
+    cy.openProject('session-and-origin-e2e-specs', ['--e2e'])
+
+    cy.visitLaunchpad()
+    cy.findByTestId('launchpad-Choose a browser')
+    cy.get('h1').contains('Choose a browser')
+  })
+
+  it('is not a valid config for component testing', () => {
+    cy.scaffoldProject('session-and-origin-e2e-specs')
+    // TODO: remove config file from session-and-origin-e2e-specs project once the experimental flag is removed
+    cy.openProject('session-and-origin-e2e-specs', ['--component', '--config-file', 'cypress-invalid-component.config.js'])
+
+    cy.visitLaunchpad()
+    cy.findByTestId('error-header')
+    cy.contains('The experimentalOriginDependencies experiment is currently only supported for End to End Testing')
+  })
+
+  it('is not valid config when specified at root', () => {
+    cy.scaffoldProject('session-and-origin-e2e-specs')
+    // TODO: remove config file from session-and-origin-e2e-specs project once the experimental flag is removed
+    cy.openProject('session-and-origin-e2e-specs', ['--e2e', '--config-file', 'cypress-invalid-root.config.js'])
+
+    cy.visitLaunchpad()
+    cy.findByTestId('error-header')
+    cy.contains('The experimentalOriginDependencies experiment is currently only supported for End to End Testing')
+  })
+})
+
+describe('component testing dependency warnings', () => {
+  // This is a bit different than traditional implementations of warning against outdated dependencies
+  // Instead, with vite, we know for a fact that vite 7 and less will NOT work with the vite-dev-server
+  // so we need to throw an error to prevent the user from continuing with the project.
+  // However, future versions (9+) MAY work. This is tested in cypress/vite-dev-server itself as a unit test
+  it('throws an error if vite version is below the supported minimum', () => {
+    cy.scaffoldProject('component-testing-outdated-dependencies')
+    cy.addProject('component-testing-outdated-dependencies')
+    cy.openGlobalMode()
+    cy.visitLaunchpad()
+    cy.contains('component-testing-outdated-dependencies').click()
+    cy.get('[data-cy="alert-header"]').should('not.exist')
+    cy.contains('a', 'Projects').click()
+    cy.get('[data-cy-testingtype="component"]').click()
+    cy.get('[data-cy="collapsible"]', { timeout: 12000 }).should('exist')
+    .should('contain.text', 'ViteVersionNotSupportedError')
+    .should('contain.text', 'Vite 8 is the required version to use cypress/vite-dev-server. Found Vite version v7.3.3')
+  })
+
+  it('warns against outdated react version', () => {
+    cy.scaffoldProject('outdated-deps-react')
+    cy.addProject('outdated-deps-react')
+    cy.openGlobalMode()
+    cy.visitLaunchpad()
+    cy.contains('outdated-deps-react').click()
+    cy.get('[data-cy="warning-alert"]').should('not.exist')
+    cy.contains('a', 'Projects').click()
+    cy.get('[data-cy-testingtype="component"]').click()
+    cy.get('[data-cy="warning-alert"]', { timeout: 12000 }).should('exist')
+    .should('contain.text', 'Warning: Component Testing Mismatched Dependencies')
+    .should('contain.text', 'react. Expected ^18.0.0 || ^19.0.0, found 17.0.2.')
+    .should('contain.text', 'react-dom. Expected ^18.0.0 || ^19.0.0 but dependency was not found.')
+
+    cy.get('.warning-markdown').find('li').should('have.length', 2)
+  })
+
+  it('warns against outdated vue dependency', () => {
+    cy.scaffoldProject('outdated-deps-vue')
+    cy.addProject('outdated-deps-vue')
+    cy.openGlobalMode()
+    cy.visitLaunchpad()
+    cy.contains('outdated-deps-vue').click()
+    cy.get('[data-cy="warning-alert"]').should('not.exist')
+    cy.contains('a', 'Projects').click()
+    cy.get('[data-cy-testingtype="component"]', { timeout: 12000 }).click()
+    cy.get('[data-cy="warning-alert"]', { timeout: 12000 }).should('exist')
+    .should('contain.text', 'Warning: Component Testing Mismatched Dependencies')
+    .should('contain.text', 'vue. Expected ^3.0.0, found 2.7.8.')
+
+    cy.get('.warning-markdown').find('li').should('have.length', 1)
+  })
+
+  it('does not show warning for project with supported dependencies', () => {
+    cy.scaffoldProject('vue3-webpack-ts-configured')
+    cy.addProject('vue3-webpack-ts-configured')
+    cy.openGlobalMode()
+    cy.visitLaunchpad()
+    cy.contains('vue3-webpack-ts-configured').click()
+    cy.get('[data-cy="warning-alert"]').should('not.exist')
+    cy.get('a').contains('Projects').click()
+    cy.get('[data-cy-testingtype="component"]', { timeout: 10000 }).click()
+
+    // Wait until launch browser screen and assert warning does not exist
+    cy.contains('Choose a browser', { timeout: 12000 })
+    cy.get('[data-cy="warning-alert"]').should('not.exist')
+  })
+
+  it('does not show warning for project that does not require bundler to be installed', () => {
+    cy.scaffoldProject('next-16')
+    cy.openProject('next-16', ['--component'])
+    cy.visitLaunchpad()
+    cy.get('[data-cy="warning-alert"]').should('not.exist')
+    cy.contains('Choose a browser', { timeout: 12000 })
+    cy.get('[data-cy="warning-alert"]').should('not.exist')
+  })
+})

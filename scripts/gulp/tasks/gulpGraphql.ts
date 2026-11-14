@@ -1,0 +1,143 @@
+// @ts-expect-error - no types
+import rp from '@cypress/request-promise'
+import path from 'path'
+import chalk from 'chalk'
+import fs from 'fs-extra'
+import type { GraphQLSchema } from 'graphql'
+import { buildSchema, extendSchema, introspectionFromSchema, isObjectType, parse } from 'graphql'
+
+import { writeUrqlIntrospection } from '../../../packages/data-context/scripts/urqlIntrospection'
+import { nexusTypegen, watchNexusTypegen } from '../utils/nexusTypegenUtil'
+import { monorepoPaths } from '../monorepoPaths'
+import { spawned, universalSpawn } from '../utils/childProcessUtils'
+import { DEFAULT_INTERNAL_CLOUD_ENV } from '../gulpConstants'
+
+export async function nexusCodegen () {
+  return nexusTypegen({
+    cwd: monorepoPaths.pkgDataContext,
+    filePath: path.join(monorepoPaths.pkgDataContext, 'src/schema.ts'),
+    outputPath: path.join(monorepoPaths.pkgDataContext, 'src/gen/nxs.gen.ts'),
+  })
+}
+
+export async function nexusCodegenWatch () {
+  return watchNexusTypegen({
+    cwd: monorepoPaths.pkgDataContext,
+    watchPaths: [
+      'src/**/*.ts',
+    ],
+    filePath: path.join(monorepoPaths.pkgDataContext, 'graphql/schema.ts'),
+    outputPath: path.join(monorepoPaths.pkgDataContext, 'src/gen/nxs.gen.ts'),
+  })
+}
+
+export async function graphqlCodegen () {
+  return spawned('gql-codegen', 'yarn graphql-codegen --config graphql/graphql-codegen.yml', {
+    cwd: monorepoPaths.pkgDataContext,
+    waitForExit: true,
+  })
+}
+
+export async function graphqlCodegenWatch () {
+  const spawned = universalSpawn('graphql-codegen', ['--watch', '--config', 'graphql/graphql-codegen.yml'], {
+    cwd: monorepoPaths.pkgDataContext,
+  })
+  const dfd = Promise.withResolvers()
+
+  spawned.stdout.on('data', (chunk) => {
+    const strs = `${chunk}`.split('\n').filter((f) => f)
+    const timestampRegex = /\[\d{2}:\d{2}:\d{2}\]/
+    const isFailureBlock = strs.some((s) => s.includes('[failed]'))
+
+    strs.forEach((str) => {
+      let codegenMsg = timestampRegex.test(str) ? str.slice(10) : str
+
+      if (codegenMsg.includes('Watching for changes')) {
+        dfd.resolve({})
+      }
+
+      if (codegenMsg === str) {
+        process.stdout.write(
+          `${chalk.cyan('graphqlCodegen')}: ${chalk.gray(str)}\n`,
+        )
+      } else if (codegenMsg.startsWith(' Generate .') || isFailureBlock) {
+        codegenMsg = codegenMsg.includes('[failed]')
+          ? chalk.red(codegenMsg)
+          : chalk.yellow(codegenMsg)
+
+        process.stdout.write(`${chalk.cyan('graphqlCodegen')}: ${codegenMsg}\n`)
+      }
+    })
+  })
+
+  spawned.stderr.on('data', (data) => {
+    console.error(chalk.red(String(data)))
+  })
+
+  return dfd.promise
+}
+
+const ENV_MAP = {
+  development: 'http://localhost:3000',
+  staging: 'https://cloud-staging.cypress.io',
+  production: 'https://cloud.cypress.io',
+}
+
+export async function syncRemoteGraphQL () {
+  if (!ENV_MAP[DEFAULT_INTERNAL_CLOUD_ENV]) {
+    throw new Error(`Expected --env to be one of ${Object.keys(ENV_MAP).join(', ')}`)
+  }
+
+  try {
+    const body = await rp.get(`${ENV_MAP[DEFAULT_INTERNAL_CLOUD_ENV]}/test-runner-graphql-schema`)
+
+    // TODO(tim): fix
+    await fs.ensureDir(path.join(monorepoPaths.pkgDataContext, 'src/gen'))
+    await fs.promises.writeFile(path.join(monorepoPaths.pkgDataContext, 'schemas/cloud.graphql'), body)
+  } catch (error) {
+    console.error('Could not sync remote GraphQL schema', error)
+  }
+}
+
+/**
+ * Regenerates both artifacts derived from the committed SDL, which live in
+ * different packages: the test-extended introspection `mountFragment` queries
+ * against, and the introspection the urql GraphCache reads.
+ */
+export async function generateFrontendSchema () {
+  const schemaContents = await fs.promises.readFile(path.join(monorepoPaths.pkgDataContext, 'schemas/schema.graphql'), 'utf8')
+  const schema = buildSchema(schemaContents, { assumeValid: true })
+  const testExtensions = generateTestExtensions(schema)
+  const extendedSchema = extendSchema(schema, parse(testExtensions))
+
+  await fs.ensureDir(path.join(monorepoPaths.pkgFrontendShared, 'src/generated'))
+  await fs.writeFile(path.join(monorepoPaths.pkgFrontendShared, 'src/generated/schema-for-tests.gen.json'), JSON.stringify(introspectionFromSchema(extendedSchema), null, 2))
+
+  await writeUrqlIntrospection(schema)
+}
+
+/**
+ * Extends Query with two fields the component tests use to mount a fragment
+ * against any object type, via a union spanning all of them.
+ */
+function generateTestExtensions (schema: GraphQLSchema) {
+  const objects: string[] = []
+  const typesMap = schema.getTypeMap()
+
+  for (const [typeName, type] of Object.entries(typesMap)) {
+    if (!typeName.startsWith('__') && isObjectType(type)) {
+      if (isObjectType(type)) {
+        objects.push(typeName)
+      }
+    }
+  }
+
+  return `
+    union TestUnion = ${objects.join(' | ')}
+
+    extend type Query {
+      testFragmentMember: TestUnion!
+      testFragmentMemberList(count: Int = 2): [TestUnion!]!
+    }
+  `
+}

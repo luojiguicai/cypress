@@ -1,16 +1,20 @@
 import cs from 'classnames'
-import _ from 'lodash'
 import { observer } from 'mobx-react'
-import React, { Component } from 'react'
+import React, { useEffect, useState } from 'react'
 
+import type { TestState } from '@packages/types'
 import Agents from '../agents/agents'
 import Collapsible from '../collapsible/collapsible'
 import Hooks from '../hooks/hooks'
 import Routes from '../routes/routes'
 import TestError from '../errors/test-error'
-import TestModel from '../test/test-model'
-import AttemptModel from './attempt-model'
+import type TestModel from '../test/test-model'
+import type AttemptModel from './attempt-model'
 import Sessions from '../sessions/sessions'
+
+import CollapseIcon from '@packages/frontend-shared/src/assets/icons/collapse_x16.svg'
+import ExpandIcon from '@packages/frontend-shared/src/assets/icons/expand_x16.svg'
+import StateIcon from '../lib/state-icon'
 
 const NoCommands = () => (
   <ul className='hooks-container'>
@@ -20,89 +24,80 @@ const NoCommands = () => (
   </ul>
 )
 
-const AttemptHeader = ({ index }: {index: number}) => (
+const AttemptHeader = ({ index, state }: { index: number, state: TestState }) => (
   <span className='attempt-tag'>
-    <span className='open-close-indicator'>
-      <i className='fa fa-fw fa-angle-up' />
-      <i className='fa fa-fw fa-angle-down' />
+    <StateIcon state={state} className="attempt-state" iconSize='8' />
+    <span className='attempt-tag-text'>
+      Attempt {index + 1}
     </span>
-    Attempt {index + 1}
-    <i className="attempt-state fa fa-fw" />
+    <span className='open-close-indicator'>
+      <CollapseIcon className='collapse-icon' />
+      <ExpandIcon className='expand-icon' />
+    </span>
   </span>
 )
 
-const StudioError = () => (
-  <div className='runnable-err-wrapper studio-err-wrapper'>
-    <div className='runnable-err'>
-      <div className='runnable-err-message'>
-        Studio cannot add commands to a failing test.
-      </div>
-    </div>
-  </div>
-)
-
-function renderAttemptContent (model: AttemptModel) {
-  // performance optimization - don't render contents if not open
-
-  return (
-    <div className={`attempt-${model.id + 1}`}>
-      <Sessions model={model.sessions} />
-      <Agents model={model} />
-      <Routes model={model} />
-      <div ref='commands' className='runnable-commands-region'>
-        {model.hasCommands ? <Hooks model={model} /> : <NoCommands />}
-      </div>
-
-      <div className='attempt-error-region'>
-        <TestError model={model} />
-        <StudioError />
-      </div>
-    </div>
-  )
-}
-
 interface AttemptProps {
   model: AttemptModel
-  scrollIntoView: Function
+  scrollIntoView: () => void
 }
 
-@observer
-class Attempt extends Component<AttemptProps> {
-  componentDidUpdate () {
-    this.props.scrollIntoView()
-  }
+const Attempt: React.FC<AttemptProps> = observer(({ model, scrollIntoView }) => {
+  const [isMounted, setIsMounted] = useState(false)
 
-  render () {
-    const { model } = this.props
+  useEffect(() => {
+    if (isMounted) {
+      scrollIntoView()
+    } else {
+      setIsMounted(true)
+    }
+  })
 
-    // HACK: causes component update when command log is added
-    model.commands.length
-
-    return (
-      <li
-        key={model.id}
-        className={cs('attempt-item', `attempt-state-${model.state}`, {
-          'attempt-failed': model.state === 'failed',
-        })}
-        ref="container"
+  return (
+    <li
+      key={model.id}
+      className={cs('attempt-item', `attempt-state-${model.state}`)}
+    >
+      <Collapsible
+        header={<AttemptHeader index={model.id} state={model.state} />}
+        hideExpander
+        headerClass='attempt-name'
+        contentClass='attempt-content'
+        isOpen={model.isOpen}
+        onOpenStateChangeRequested={(isOpen: boolean) => model.setIsOpen(isOpen)}
       >
-        <Collapsible
-          header={<AttemptHeader index={model.id}/>}
-          headerClass='attempt-name'
-          isOpen={model.isOpen}
-        >
-          {renderAttemptContent(model)}
-        </Collapsible>
-      </li>
-    )
-  }
+        <div className={`attempt-${model.id + 1}`}>
+          <Sessions model={model.sessions} />
+          <Agents model={model} />
+          <Routes model={model} />
+          <div className='runnable-commands-region'>
+            {model.hasCommands ? <Hooks model={model} scrollIntoView={scrollIntoView} /> : <NoCommands />}
+          </div>
+          {model.state === 'failed' && (
+            <div className='attempt-error-region'>
+              <TestError {...model.error} />
+            </div>
+          )}
+        </div>
+      </Collapsible>
+    </li>
+  )
+})
+
+Attempt.displayName = 'Attempt'
+
+interface AttemptsProps {
+  test: TestModel
+  isSingleStudioTest?: boolean
+  scrollIntoView: () => void
 }
 
-const Attempts = observer(({ test, scrollIntoView }: {test: TestModel, scrollIntoView: Function}) => {
+const Attempts: React.FC<AttemptsProps> = observer(({ test, isSingleStudioTest, scrollIntoView }: AttemptsProps) => {
   return (<ul className={cs('attempts', {
     'has-multiple-attempts': test.hasMultipleAttempts,
+    'single-studio-test': Boolean(isSingleStudioTest),
   })}>
-    {_.map(test.attempts, (attempt) => {
+    {test.attempts.map((attempt) => {
       return (
         <Attempt
           key={attempt.id}
@@ -114,6 +109,9 @@ const Attempts = observer(({ test, scrollIntoView }: {test: TestModel, scrollInt
   </ul>)
 })
 
-export { Attempt, AttemptHeader, NoCommands }
+Attempts.displayName = 'Attempts'
+
+/** @public - consumed by the external test-replay viewer */
+export { Attempt }
 
 export default Attempts

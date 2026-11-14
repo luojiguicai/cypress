@@ -1,8 +1,8 @@
 /* eslint-disable padding-line-between-statements */
 import _ from 'lodash'
-import { computed, observable } from 'mobx'
+import { computed, observable, makeObservable } from 'mobx'
 
-import type { FileDetails } from '@packages/ui-components'
+import type { FileDetails } from '@packages/types'
 
 export interface ParsedStackMessageLine {
   message: string
@@ -15,7 +15,7 @@ export interface ParsedStackFileLine extends FileDetails {
   whitespace: string
 }
 
-export type ParsedStackLine = ParsedStackMessageLine | ParsedStackFileLine
+type ParsedStackLine = ParsedStackMessageLine | ParsedStackFileLine
 
 export interface CodeFrame extends FileDetails {
   frame: string
@@ -25,34 +25,51 @@ export interface CodeFrame extends FileDetails {
 export interface ErrProps {
   name: string
   message: string
+  isRecovered: boolean
   stack: string
-  sourceMappedStack: string
   parsedStack: ParsedStackLine[]
   docsUrl: string | string[]
   templateType: string
   codeFrame: CodeFrame
+  docsUrlTitle: string | null
+  triggerAction: 'loginModal' | 'projectConnectModal' | null
 }
 
 export default class Err {
-  @observable name = ''
-  @observable message = ''
-  @observable stack = ''
-  @observable sourceMappedStack = ''
-  @observable.ref parsedStack: ParsedStackLine[] | null = null
-  @observable docsUrl = '' as string | string[]
-  @observable templateType = ''
-  // @ts-ignore
-  @observable.ref codeFrame: CodeFrame
-
+  name = ''
+  message = ''
+  stack = ''
+  parsedStack: ParsedStackLine[] | null = null
+  docsUrl = '' as string | string[]
+  templateType = ''
+  codeFrame?: CodeFrame
+  isRecovered: boolean = false
+  docsUrlTitle: string | null = null
+  triggerAction: 'loginModal' | 'projectConnectModal' | null = null
   constructor (props?: Partial<ErrProps>) {
+    makeObservable(this, {
+      name: observable,
+      message: observable,
+      stack: observable,
+      parsedStack: observable.ref,
+      docsUrl: observable,
+      templateType: observable,
+      codeFrame: observable.ref,
+      isRecovered: observable,
+      displayMessage: computed,
+      isCommandErr: computed,
+      docsUrlTitle: observable,
+      triggerAction: observable,
+    })
+
     this.update(props)
   }
 
-  @computed get displayMessage () {
+  get displayMessage () {
     return _.compact([this.name, this.message]).join(': ')
   }
 
-  @computed get isCommandErr () {
+  get isCommandErr () {
     return /(AssertionError|CypressError)/.test(this.name)
   }
 
@@ -63,9 +80,11 @@ export default class Err {
     if (props.message) this.message = props.message
     if (props.stack) this.stack = props.stack
     if (props.docsUrl) this.docsUrl = props.docsUrl
-    if (props.sourceMappedStack) this.sourceMappedStack = props.sourceMappedStack
     if (props.parsedStack) this.parsedStack = props.parsedStack
     if (props.templateType) this.templateType = props.templateType
     if (props.codeFrame) this.codeFrame = props.codeFrame
+    if (props.docsUrlTitle) this.docsUrlTitle = props.docsUrlTitle
+    if (props.triggerAction) this.triggerAction = props.triggerAction
+    this.isRecovered = !!props.isRecovered
   }
 }

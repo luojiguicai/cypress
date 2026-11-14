@@ -1,0 +1,446 @@
+import { vi, describe, it, beforeEach, afterEach, expect } from 'vitest'
+import type { MockInstance } from 'vitest'
+import events from 'events'
+import os from 'os'
+import path from 'path'
+import cp from 'child_process'
+import createDebug from 'debug'
+import readline from 'readline'
+import fs from 'fs-extra'
+import type { Systeminformation } from 'systeminformation'
+import si from 'systeminformation'
+import { Console } from 'console'
+import yauzl from 'yauzl'
+
+import logger from '../../../lib/logger'
+import util from '../../../lib/util'
+import unzip from '../../../lib/tasks/unzip'
+import extractWithYauzl from '../../../lib/tasks/extract-with-yauzl'
+
+const debug = createDebug('test')
+
+const version = '1.2.3'
+const installDir = path.join(os.tmpdir(), 'Cypress', version)
+
+vi.mock('../../../lib/tasks/extract-with-yauzl')
+vi.mock('child_process')
+vi.mock('readline')
+vi.mock('fs-extra')
+
+vi.mock('systeminformation', async (importActual) => {
+  const actual = await importActual()
+
+  return {
+    default: {
+      // @ts-expect-error - importActual returns unknown, so .default is untyped
+      ...actual.default,
+      osInfo: vi.fn(),
+    },
+  }
+})
+
+vi.mock('os', async (importActual) => {
+  const actual = await importActual()
+
+  return {
+    default: {
+      // @ts-expect-error - importActual returns unknown, so .default is untyped
+      ...actual.default,
+      platform: vi.fn(),
+      arch: vi.fn(),
+    },
+  }
+})
+
+// `getRealArch()` falls through to the `arch` package, which reports the real
+// machine, so pin it alongside the mocked `os.arch()`
+vi.mock('arch', () => ({ default: () => 'x64' }))
+
+vi.mock('../../../lib/util', async (importActual) => {
+  const actual = await importActual()
+
+  return {
+    default: {
+      // @ts-expect-error - importActual returns unknown, so .default is untyped
+      ...actual.default,
+      pkgVersion: vi.fn(),
+    },
+  }
+})
+
+describe('lib/tasks/unzip', function () {
+  const createStdoutCapture = () => {
+    const logs: string[] = []
+
+    const originalOut = process.stdout.write
+
+    vi.spyOn(process.stdout, 'write').mockImplementation((strOrBugger: string | Uint8Array<ArrayBufferLike>) => {
+      logs.push(strOrBugger as string)
+
+      return originalOut(strOrBugger)
+    })
+
+    return () => logs.join('')
+  }
+  let originalConsole: Console
+
+  beforeEach(async function () {
+    vi.resetAllMocks()
+    vi.mocked(os.platform).mockReturnValue('darwin')
+    vi.mocked(os.arch).mockReturnValue('x64')
+    vi.mocked(util.pkgVersion).mockReturnValue(version)
+    vi.mocked(si.osInfo).mockResolvedValue({
+      distro: 'Foo',
+      release: 'OsVersion',
+    } as Systeminformation.OsData)
+
+    const actualExtract = (await vi.importActual<typeof import('../../../lib/tasks/extract-with-yauzl')>('../../../lib/tasks/extract-with-yauzl')).default
+
+    vi.mocked(extractWithYauzl).mockImplementation(actualExtract)
+
+    // @ts-expect-error - default import
+    const actualChildProcess = (await vi.importActual<typeof import('child_process')>('child_process')).default
+
+    vi.mocked(cp.spawn).mockImplementation(actualChildProcess.spawn)
+
+    vi.mocked(readline.createInterface).mockImplementation(() => {
+      return {
+        on: vi.fn(),
+      } as any
+    })
+
+    originalConsole = globalThis.console
+    // Redirect console output to a custom stream or mock
+    globalThis.console = new Console(process.stdout, process.stderr)
+  })
+
+  afterEach(() => {
+    globalThis.console = originalConsole // Restore original console
+  })
+
+  it('throws when cannot unzip', async function () {
+    const output = createStdoutCapture()
+
+    try {
+      await unzip.start({
+        zipFilePath: path.join('test', 'fixture', 'bad_example.zip'),
+        installDir,
+      })
+    } catch (err) {
+      logger.error(err)
+
+      return expect(output()).toMatchSnapshot()
+    }
+
+    throw new Error('should have failed')
+  })
+
+  it('throws max path length error when cannot unzip due to realpath ENOENT on windows', async function () {
+    const output = createStdoutCapture()
+
+    const err: any = new Error('failed')
+
+    err.code = 'ENOENT'
+    err.syscall = 'realpath'
+
+    vi.mocked(os.platform).mockReturnValue('win32')
+    vi.mocked(fs.ensureDir).mockRejectedValue(err)
+
+    try {
+      await unzip.start({
+        zipFilePath: path.join('test', 'fixture', 'bad_example.zip'),
+        installDir,
+      })
+    } catch (err) {
+      logger.error(err)
+
+      return expect(output()).toMatchSnapshot()
+    }
+
+    throw new Error('should have failed')
+  })
+
+  it('can really unzip', async function () {
+    const onProgress = vi.fn().mockReturnValue(undefined)
+
+    await unzip.start({
+      zipFilePath: path.join('test', 'fixture', 'example.zip'),
+      installDir,
+      progress: { onProgress },
+    })
+
+    expect(onProgress).toHaveBeenCalled()
+
+    await fs.stat(installDir)
+  })
+
+  describe('progress', () => {
+    const zipFilePath = 'entries.zip'
+    const onProgress = vi.fn()
+    let openSpy: MockInstance
+
+    const extractTicking = (entries: number) => {
+      return async (_zip: string, _dest: string, onEntry: () => void) => {
+        for (let i = 0; i < entries; i++) {
+          onEntry()
+        }
+      }
+    }
+
+    const percents = () => onProgress.mock.calls.map(([percent]) => percent)
+    const etas = () => onProgress.mock.calls.map(([, secsRemaining]) => secsRemaining)
+    const upTo = (max: number) => Array.from({ length: max + 1 }, (_, i) => i)
+
+    beforeEach(() => {
+      onProgress.mockReset()
+      vi.mocked(os.platform).mockReturnValue('win32')
+      // unzip() only opens the zip to read its entry count
+      openSpy = vi.spyOn(yauzl, 'open').mockImplementation((_path: string, optionsOrCallback?: unknown, maybeCallback?: unknown) => {
+        const callback = maybeCallback ?? optionsOrCallback
+
+        if (typeof callback === 'function') {
+          callback(null, { entryCount: 1000, close: () => {} })
+        }
+      })
+
+      // Freeze the clock so only percent changes trigger an update
+      vi.useFakeTimers({ toFake: ['Date'] })
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+      openSpy.mockRestore()
+    })
+
+    it('reports once per percent while extracting a 1,000-entry zip and ends at 100', async function () {
+      vi.mocked(extractWithYauzl).mockImplementation(extractTicking(1000))
+
+      await unzip.start({ zipFilePath, installDir, progress: { onProgress } })
+
+      expect(percents()).toEqual(upTo(100))
+    })
+
+    it('reports an unchanged percent again once the throttle interval has passed', async function () {
+      vi.mocked(extractWithYauzl).mockImplementation(async (_zip, _dest, onEntry) => {
+        onEntry()
+        vi.advanceTimersByTime(99)
+        onEntry()
+        vi.advanceTimersByTime(1)
+        onEntry()
+      })
+
+      await unzip.start({ zipFilePath, installDir, progress: { onProgress } })
+
+      expect(percents()).toEqual([0, 0])
+    })
+
+    it('restarts progress and the ETA when the OS tool fails partway and node takes over', async function () {
+      vi.mocked(os.platform).mockReturnValue('linux')
+      vi.mocked(extractWithYauzl).mockImplementation(extractTicking(1000))
+
+      const unzipChildProcess = new events.EventEmitter() as any
+
+      unzipChildProcess.stdout = new events.EventEmitter()
+      unzipChildProcess.stderr = new events.EventEmitter()
+
+      vi.mocked(cp.spawn).mockImplementation(() => {
+        setImmediate(() => {
+          for (let i = 0; i < 600; i++) {
+            unzipChildProcess.stdout.emit('data', `  inflating: entries/${i}`)
+          }
+
+          // The node extraction below runs with the clock frozen, so its ETA
+          // is 0 unless it counts the time the failed tool used
+          vi.advanceTimersByTime(30_000)
+          unzipChildProcess.emit('close', 1)
+        })
+
+        return unzipChildProcess
+      })
+
+      await unzip.start({ zipFilePath, installDir, progress: { onProgress } })
+
+      expect(percents()).toEqual([...upTo(60), ...upTo(100)])
+      expect(etas().slice(61)).toEqual(Array(101).fill('0'))
+    })
+  })
+
+  describe('on linux', () => {
+    beforeEach(() => {
+      vi.mocked(os.platform).mockReturnValue('linux')
+    })
+
+    it('can try unzip first then fall back to node unzip', async function () {
+      const zipFilePath = path.join('test', 'fixture', 'example.zip')
+
+      vi.mocked(extractWithYauzl).mockResolvedValue(undefined)
+
+      const unzipChildProcess = new events.EventEmitter()
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stdout = {
+        on: vi.fn(),
+      }
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stderr = {
+        on: vi.fn(),
+      }
+
+      vi.mocked(cp.spawn).mockImplementation((args: string) => {
+        if (args === 'unzip') {
+          return unzipChildProcess as any
+        }
+      })
+
+      setTimeout(() => {
+        debug('emitting unzip error')
+        unzipChildProcess.emit('error', new Error('unzip fails badly'))
+      }, 100)
+
+      await unzip.start({
+        zipFilePath,
+        installDir,
+      })
+
+      debug('checking if unzip was called')
+      expect(cp.spawn).toHaveBeenCalledExactlyOnceWith('unzip', ['-o', zipFilePath, '-d', installDir])
+      expect(extractWithYauzl).toHaveBeenCalledExactlyOnceWith(zipFilePath, installDir, expect.any(Function))
+    })
+
+    it('can try unzip first then fall back to node unzip and fails with an empty error', async function () {
+      const zipFilePath = path.join('test', 'fixture', 'example.zip')
+
+      vi.mocked(extractWithYauzl).mockRejectedValue(undefined)
+
+      const unzipChildProcess = new events.EventEmitter()
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stdout = {
+        on: vi.fn(),
+      }
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stderr = {
+        on: vi.fn(),
+      }
+
+      vi.mocked(cp.spawn).mockImplementation((args: string) => {
+        if (args === 'unzip') {
+          return unzipChildProcess as any
+        }
+      })
+
+      setTimeout(() => {
+        debug('emitting unzip error')
+        unzipChildProcess.emit('error', new Error('unzip fails badly'))
+      }, 100)
+
+      try {
+        await unzip.start({
+          zipFilePath,
+          installDir,
+        })
+      } catch (err: any) {
+        logger.error(err)
+        expect(err.message).toMatch('Unknown error with Node extract tool')
+
+        return
+      }
+      throw new Error('should have failed')
+    })
+
+    it('calls node unzip just once', async function () {
+      const zipFilePath = path.join('test', 'fixture', 'example.zip')
+
+      vi.mocked(extractWithYauzl).mockResolvedValue(undefined)
+
+      const unzipChildProcess = new events.EventEmitter()
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stdout = {
+        on: vi.fn(),
+      }
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stderr = {
+        on: vi.fn(),
+      }
+
+      vi.mocked(cp.spawn).mockImplementation((args: string) => {
+        if (args === 'unzip') {
+          return unzipChildProcess as any
+        }
+      })
+
+      setTimeout(() => {
+        debug('emitting unzip error')
+        unzipChildProcess.emit('error', new Error('unzip fails badly'))
+      }, 100)
+
+      setTimeout(() => {
+        debug('emitting unzip close')
+        unzipChildProcess.emit('close', 1)
+      }, 110)
+
+      await unzip
+      .start({
+        zipFilePath,
+        installDir,
+      })
+
+      debug('checking if unzip was called')
+      expect(cp.spawn).toHaveBeenCalledExactlyOnceWith('unzip', ['-o', zipFilePath, '-d', installDir])
+      expect(extractWithYauzl).toHaveBeenCalledExactlyOnceWith(zipFilePath, installDir, expect.any(Function))
+    })
+  })
+
+  describe('on Mac', () => {
+    beforeEach(() => {
+      vi.mocked(os.platform).mockReturnValue('darwin')
+    })
+
+    it('calls node unzip just once', async function () {
+      const zipFilePath = path.join('test', 'fixture', 'example.zip')
+
+      vi.mocked(extractWithYauzl).mockResolvedValue(undefined)
+
+      const unzipChildProcess = new events.EventEmitter()
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stdout = {
+        on: vi.fn(),
+      }
+
+      // @ts-expect-error - mocking process
+      unzipChildProcess.stderr = {
+        on: vi.fn(),
+      }
+
+      vi.mocked(cp.spawn).mockImplementation((args: string) => {
+        if (args === 'ditto') {
+          return unzipChildProcess as any
+        }
+      })
+
+      setTimeout(() => {
+        debug('emitting ditto error')
+        unzipChildProcess.emit('error', new Error('ditto fails badly'))
+      }, 100)
+
+      setTimeout(() => {
+        debug('emitting ditto close')
+        unzipChildProcess.emit('close', 1)
+      }, 110)
+
+      await unzip.start({
+        zipFilePath,
+        installDir,
+      })
+
+      debug('checking if unzip was called')
+      expect(cp.spawn).toHaveBeenCalledExactlyOnceWith('ditto', ['-xkV', zipFilePath, installDir])
+      expect(extractWithYauzl).toHaveBeenCalledExactlyOnceWith(zipFilePath, installDir, expect.any(Function))
+    })
+  })
+})

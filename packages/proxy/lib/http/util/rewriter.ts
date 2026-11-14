@@ -1,79 +1,132 @@
 import * as inject from './inject'
-import * as astRewriter from './ast-rewriter'
 import * as regexRewriter from './regex-rewriter'
+import type { CypressWantsInjection } from '../../types'
+import type { SerializableAutomationCookie } from '@packages/server/lib/automation/cookie/jar'
 
 export type SecurityOpts = {
-  isHtml?: boolean
   url: string
-  useAstSourceRewriting: boolean
-  deferSourceMapRewrite: (opts: any) => string
+  modifyObstructiveThirdPartyCode: boolean
+  modifyObstructiveCode: boolean
+  removeSRIAttributes: boolean
 }
 
 export type InjectionOpts = {
+  cspNonce?: string
   domainName: string
-  wantsInjection: WantsInjection
+  wantsInjection: CypressWantsInjection
   wantsSecurityRemoved: any
+  simulatedCookies: SerializableAutomationCookie[]
+  shouldInjectDocumentDomain: boolean
 }
 
-const doctypeRe = /(<\!doctype.*?>)/i
-const headRe = /(<head(?!er).*?>)/i
-const bodyRe = /(<body.*?>)/i
-const htmlRe = /(<html.*?>)/i
+const doctypeRe = /<!doctype.*?>/i
+const headRe = /<head(?!er).*?>/i
+const bodyRe = /<body.*?>/i
+const htmlRe = /<html.*?>/i
+const bootstrapScriptRe = /(<script[^>]*\bdata-cy-bootstrap\b[^>]*>)([\s\S]*?)(<\/script>)/i
 
-type WantsInjection = 'full' | 'partial' | false
+function getHtmlToInject (opts: InjectionOpts & SecurityOpts) {
+  const {
+    cspNonce,
+    domainName,
+    wantsInjection,
+    modifyObstructiveThirdPartyCode,
+    modifyObstructiveCode,
+    simulatedCookies,
+    shouldInjectDocumentDomain,
+  } = opts
 
-function getRewriter (useAstSourceRewriting: boolean) {
-  return useAstSourceRewriting ? astRewriter : regexRewriter
-}
-
-function getHtmlToInject ({ domainName, wantsInjection }: InjectionOpts) {
   switch (wantsInjection) {
     case 'full':
-      return inject.full(domainName)
+      return inject.full(domainName, {
+        shouldInjectDocumentDomain,
+        cspNonce,
+      })
+    case 'fullCrossOrigin':
+      return inject.fullCrossOrigin(domainName, {
+        cspNonce,
+        modifyObstructiveThirdPartyCode,
+        modifyObstructiveCode,
+        simulatedCookies,
+        shouldInjectDocumentDomain,
+      })
     case 'partial':
-      return inject.partial(domainName)
+      return inject.partial(domainName, {
+        shouldInjectDocumentDomain,
+        cspNonce,
+      })
     default:
       return
   }
 }
 
-export async function html (html: string, opts: SecurityOpts & InjectionOpts) {
-  const replace = (re, str) => {
-    return html.replace(re, str)
-  }
+const insertBefore = (originalString, match, stringToInsert) => {
+  const index = match.index || 0
 
+  return `${originalString.slice(0, index)}${stringToInsert} ${originalString.slice(index)}`
+}
+
+const insertAfter = (originalString, match, stringToInsert) => {
+  const index = (match.index || 0) + match[0].length
+
+  return `${originalString.slice(0, index)} ${stringToInsert}${originalString.slice(index)}`
+}
+
+export async function html (html: string, opts: SecurityOpts & InjectionOpts) {
   const htmlToInject = await Promise.resolve(getHtmlToInject(opts))
 
   // strip clickjacking and framebusting
   // from the HTML if we've been told to
   if (opts.wantsSecurityRemoved) {
-    html = await Promise.resolve(getRewriter(opts.useAstSourceRewriting).strip(html, opts))
+    html = regexRewriter.strip(html, opts)
   }
 
   if (!htmlToInject) {
     return html
   }
 
-  // TODO: move this into regex-rewriting and have ast-rewriting handle this in its own way
-  switch (false) {
-    case !headRe.test(html):
-      return replace(headRe, `$1 ${htmlToInject}`)
+  const bootstrapMatch = html.match(bootstrapScriptRe)
 
-    case !bodyRe.test(html):
-      return replace(bodyRe, `<head> ${htmlToInject} </head> $1`)
+  if (bootstrapMatch) {
+    const contentToInject = htmlToInject.replace(/^<script[^>]*>|<\/script>$/g, '')
+    let openTag = bootstrapMatch[1]
 
-    case !htmlRe.test(html):
-      return replace(htmlRe, `$1 <head> ${htmlToInject} </head>`)
+    // Ensure nonce is present if provided in options
+    if (opts.cspNonce && !openTag.includes('nonce=')) {
+      openTag = openTag.replace(/>$/, ` nonce="${opts.cspNonce}">`)
+    }
 
-    case !doctypeRe.test(html):
-      // if only <!DOCTYPE> content, inject <head> after doctype
-      return `${html}<head> ${htmlToInject} </head>`
-
-    default:
-      return `<head> ${htmlToInject} </head>${html}`
+    return html.replace(bootstrapScriptRe, `${openTag}${contentToInject}${bootstrapMatch[3]}`)
   }
+
+  // TODO: move this into regex-rewriting
+
+  const headMatch = html.match(headRe)
+
+  if (headMatch) {
+    return insertAfter(html, headMatch, htmlToInject)
+  }
+
+  const bodyMatch = html.match(bodyRe)
+
+  if (bodyMatch) {
+    return insertBefore(html, bodyMatch, `<head> ${htmlToInject} </head>`)
+  }
+
+  const htmlMatch = html.match(htmlRe)
+
+  if (htmlMatch) {
+    return insertAfter(html, htmlMatch, `<head> ${htmlToInject} </head>`)
+  }
+
+  // if only <!DOCTYPE> content, inject <head> after doctype
+  if (doctypeRe.test(html)) {
+    return `${html}<head> ${htmlToInject} </head>`
+  }
+
+  return `<head> ${htmlToInject} </head>${html}`
 }
 
 export function security (opts: SecurityOpts) {
-  return getRewriter(opts.useAstSourceRewriting).stripStream(opts)
+  return regexRewriter.stripStream(opts)
 }

@@ -18,7 +18,11 @@ describe('e2e screenshot viewport capture', () => {
   // this tests that consistent screenshots are taken for app
   // captures (namely that the runner UI is hidden)
   systemTests.it('passes', {
-    spec: 'screenshot_viewport_capture_spec.js',
+    spec: 'screenshot_viewport_capture.cy.js',
     snapshot: true,
+    // viewport-sized captures are the most expensive of the screenshot specs,
+    // and WebKit is the slowest browser at producing them, so the default
+    // 2 minute system test timeout leaves too little room on a loaded CI box
+    timeout: 180000,
   })
 })

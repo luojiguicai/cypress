@@ -3,14 +3,18 @@
 // "afterSign": "./scripts/after-sign-hook.js"
 const fs = require('fs')
 const path = require('path')
-let electron_notarize = require('electron-notarize')
-
-/* eslint-disable no-console */
+const electron_notarize = require('@electron/notarize')
 
 module.exports = async function (params) {
-  // Only notarize the app on Mac OS only.
+  // Only notarize the app on Mac OS.
   if (process.platform !== 'darwin') {
     console.log('not Mac, skipping after sign hook')
+
+    return
+  }
+
+  if (process.env.SKIP_NOTARIZATION) {
+    console.log('SKIP_NOTARIZATION set, skipping after sign hook')
 
     return
   }
@@ -18,9 +22,9 @@ module.exports = async function (params) {
   console.log('afterSign hook triggered in', params.appOutDir)
 
   // Same appId in electron-builder.
-  let appId = 'com.electron.cypress'
+  const appId = 'com.electron.cypress'
 
-  let appPath = path.join(params.appOutDir, `${params.packager.appInfo.productFilename}.app`)
+  const appPath = path.join(params.appOutDir, `${params.packager.appInfo.productFilename}.app`)
 
   if (!fs.existsSync(appPath)) {
     throw new Error(`Cannot find application at: ${appPath}`)
@@ -36,12 +40,17 @@ module.exports = async function (params) {
     throw new Error('Missing Apple password for notarization: NOTARIZE_APP_PASSWORD')
   }
 
+  if (!process.env.NOTARIZE_APP_TEAM_ID) {
+    throw new Error('Missing Apple team id for notarization: NOTARIZE_APP_TEAM_ID')
+  }
+
   try {
     await electron_notarize.notarize({
       appBundleId: appId,
       appPath,
       appleId: process.env.NOTARIZE_APP_APPLE_ID,
       appleIdPassword: process.env.NOTARIZE_APP_PASSWORD,
+      teamId: process.env.NOTARIZE_APP_TEAM_ID,
     })
   } catch (error) {
     console.error('could not notarize application')

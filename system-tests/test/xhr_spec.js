@@ -15,8 +15,14 @@ const onServer = function (app) {
     })
   })
 
-  return app.post('/html', (req, res) => {
+  app.post('/html', (req, res) => {
     return res.json({ content: '<html>content</html>' })
+  })
+
+  app.get('/json', (req, res) => {
+    res.setHeader('Set-Cookie', 'foo=bar')
+
+    return res.json({ content: 'json' })
   })
 }
 
@@ -26,15 +32,24 @@ describe('e2e xhr', () => {
       port: 1919,
       onServer,
     },
+    settings: {
+      hosts: {
+        '*.foobar.com': '127.0.0.1',
+      },
+      e2e: {
+      },
+    },
   })
 
   systemTests.it('passes in global mode', {
-    spec: 'xhr_spec.js',
+    browser: '!webkit', // TODO(webkit): fix+unskip
+    spec: 'xhr.cy.js',
     snapshot: true,
   })
 
   systemTests.it('passes through CLI', {
-    spec: 'xhr_spec.js',
+    browser: '!webkit', // TODO(webkit): fix+unskip
+    spec: 'xhr.cy.js',
     snapshot: true,
     useCli: true,
   })

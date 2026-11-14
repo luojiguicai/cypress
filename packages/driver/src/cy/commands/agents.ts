@@ -56,7 +56,7 @@ const onInvoke = function (Cypress, obj, args) {
   const fakes = agent.matchingFakes(args)
 
   agent._cyLog.set('callCount', agent.callCount)
-  for (let fake of fakes) {
+  for (const fake of fakes) {
     fake._cyLog.set('callCount', fake.callCount)
   }
 
@@ -68,7 +68,7 @@ const onInvoke = function (Cypress, obj, args) {
   const logProps: Record<string, any> = {
     name: agentName,
     message: obj.message,
-    error: obj.error,
+    state: obj.error ? 'failed' : 'passed',
     type: 'parent',
     end: true,
     snapshot: !agent._noSnapshot,
@@ -76,9 +76,8 @@ const onInvoke = function (Cypress, obj, args) {
     consoleProps () {
       const consoleObj: Record<string, any> = {}
 
-      consoleObj.Command = null
-      consoleObj.Error = null
-      consoleObj.Event = `${agentName} called`
+      consoleObj.name = `${agentName} called`
+      consoleObj.error = null
 
       consoleObj[agent._cyType] = agent
       consoleObj['Call #'] = agent.callCount
@@ -93,7 +92,7 @@ const onInvoke = function (Cypress, obj, args) {
         consoleObj.Error = obj.error.stack
       }
 
-      for (let fake of fakes) {
+      for (const fake of fakes) {
         const count = fake._cyCount
 
         consoleObj[`Child ${fake._cyType} (${count})`] = '---'
@@ -167,7 +166,6 @@ export default function (Commands, Cypress, cy, state) {
     const log = Cypress.log({
       instrument: 'agent',
       name,
-      type: name,
       functionName: method,
       count,
       callCount: 0,
@@ -236,7 +234,7 @@ export default function (Commands, Cypress, cy, state) {
     agent.as = (alias) => {
       cy.validateAlias(alias)
       cy.addAlias(ctx, {
-        subject: agent,
+        subjectChain: [agent],
         command: log,
         alias,
       })
@@ -269,19 +267,9 @@ export default function (Commands, Cypress, cy, state) {
     return wrap(this, 'spy', theSpy, obj, method)
   }
 
-  const stub = function (obj, method: string, replacerFnOrValue) {
+  const stub = function (obj, method: string) {
     // TODO: make the code below work with `packages/runner` type check without casting to `never`.
-    let theStub = sandbox.stub.call(sandbox, obj, method as never)
-
-    // sinon 2 changed the stub signature
-    // this maintains the 3-argument signature so it's not breaking
-    if (arguments.length === 3) {
-      if (_.isFunction(replacerFnOrValue)) {
-        theStub = theStub.callsFake(replacerFnOrValue)
-      } else {
-        theStub = theStub.value(replacerFnOrValue)
-      }
-    }
+    const theStub = sandbox.stub.call(sandbox, obj, method as never)
 
     return wrap(this, 'stub', theStub, obj, method)
   }

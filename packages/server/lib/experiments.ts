@@ -46,15 +46,17 @@ interface StringValues {
  * @example
   ```
   {
-    experimentalFetchPolyfill: 'Polyfills `window.fetch` to enable Network spying and stubbing.'
+    experimentalRunAllSpecs: 'Enables the "Run All Specs" UI feature, allowing the execution of multiple specs sequentially'
   }
   ```
 */
 const _summaries: StringValues = {
-  experimentalFetchPolyfill: 'Polyfills `window.fetch` to enable Network spying and stubbing.',
   experimentalInteractiveRunEvents: 'Allows listening to the `before:run`, `after:run`, `before:spec`, and `after:spec` events in the plugins file during interactive mode.',
-  experimentalSourceRewriting: 'Enables AST-based JS/HTML rewriting. This may fix issues caused by the existing regex-based JS/HTML replacement algorithm.',
-  experimentalStudio: 'Generate and save commands directly to your test suite by interacting with your app as an end user would.',
+  experimentalModifyObstructiveThirdPartyCode: 'Applies `modifyObstructiveCode` to third party `.html` and `.js`, removes subresource integrity, and modifies the user agent in Electron.',
+  experimentalSingleTabRunMode: 'Runs all component specs in a single tab, trading spec isolation for faster run mode execution.',
+  experimentalWebKitSupport: 'Adds support for testing in the WebKit browser engine used by Safari. See https://on.cypress.io/webkit-experiment for more information.',
+  experimentalRunAllSpecs: 'Enables the "Run All Specs" UI feature, allowing the execution of multiple specs sequentially',
+  experimentalOriginDependencies: 'Enables support for `Cypress.require()` for including dependencies within the `cy.origin()` callback.',
 }
 
 /**
@@ -63,24 +65,24 @@ const _summaries: StringValues = {
  * @example
   ```
   {
-    experimentalFetchPolyfill: 'Fetch polyfill'
+    experimentalRunAllSpecs: 'Run All Specs'
   }
   ```
 */
 const _names: StringValues = {
-  experimentalFetchPolyfill: 'Fetch polyfill',
   experimentalInteractiveRunEvents: 'Interactive Mode Run Events',
-  experimentalSourceRewriting: 'Improved source rewriting',
-  experimentalStudio: 'Studio',
+  experimentalModifyObstructiveThirdPartyCode: 'Modify Obstructive Third Party Code',
+  experimentalSingleTabRunMode: 'Single Tab Run Mode',
+  experimentalWebKitSupport: 'WebKit Support',
+  experimentalRunAllSpecs: 'Run All Specs',
+  experimentalOriginDependencies: 'Origin Dependencies',
 }
 
 /**
- * Export this object for easy stubbing from end-to-end tests.
- * If you cannot easily pass "names" and "summaries" arguments
- * to "getExperimentsFromResolved" function, then use this
- * object to change "experiments.names" and "experimental.summaries" objects.
+ * Internal object containing experiment names and summaries.
+ * Used as default parameters in getExperimentsFromResolved and getExperiments.
 */
-export const experimental = {
+const experimental = {
   names: _names,
   summaries: _summaries,
 }
@@ -129,19 +131,4 @@ export const getExperiments = (project: CypressProject, names = experimental.nam
   const resolvedEnv = get(project, 'resolvedConfig', {})
 
   return getExperimentsFromResolved(resolvedEnv, names, summaries)
-}
-
-/**
- * Whilelist known experiments here to avoid accidentally showing
- * any config key that starts with "experimental" prefix
-*/
-// @ts-ignore
-export const isKnownExperiment = (experiment, key) => {
-  return Object.keys(experimental.names).includes(key)
-}
-
-// exporting a single default object with methods
-// helps make it is to stub and to test
-export default {
-  getExperiments,
 }

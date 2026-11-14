@@ -1,0 +1,33 @@
+// TODO: fix flaky test (webkit)
+describe('cy.pause()', { browser: '!webkit' }, () => {
+  it('pauses', () => {
+    let didPause = false
+
+    cy.visit('https://example.cypress.io')
+
+    cy.once('paused', (name) => {
+      cy.once('paused', (name) => {
+        didPause = true
+
+        // resume the rest of the commands so this
+        // test ends
+        Cypress.emit('resume:all')
+      })
+
+      Cypress.emit('resume:next')
+    })
+
+    cy.pause().wrap({}).should('deep.eq', {}).then(function () {
+      cy.env(['SHOULD_PAUSE']).then(({ SHOULD_PAUSE }) => {
+        if (SHOULD_PAUSE) {
+          expect(didPause).to.be.true
+
+          // should no longer have onPaused
+          expect(cy.state('onPaused')).to.be.null
+        } else {
+          expect(didPause).to.be.false
+        }
+      })
+    })
+  })
+})

@@ -2,13 +2,22 @@ import $ from 'jquery'
 
 import $dom from '../dom'
 import $utils from '../cypress/utils'
+import type { StateFunc } from '../cypress/state'
 
 const remoteJQueryisNotSameAsGlobal = (remoteJQuery) => {
   return remoteJQuery && (remoteJQuery !== $)
 }
 
 // eslint-disable-next-line @cypress/dev/arrow-body-multiline-braces
-export const create = (state) => ({
+export const create = (state: StateFunc) => ({
+  $$ (selector, context?) {
+    if (context == null) {
+      context = state('document')
+    }
+
+    return $dom.query(selector, context)
+  },
+
   getRemotejQueryInstance (subject) {
     // we make assumptions that you cannot have
     // an array of mixed types, so we only look at
@@ -20,6 +29,12 @@ export const create = (state) => ({
     const remoteJQuery = state('jQuery') || state('window').$
 
     if (remoteJQueryisNotSameAsGlobal(remoteJQuery)) {
+      // Check if remoteJQuery is actually a function before calling it
+      // https://github.com/cypress-io/cypress/issues/1502
+      if (typeof remoteJQuery !== 'function') {
+        return
+      }
+
       const remoteSubject = remoteJQuery(subject)
 
       return remoteSubject
@@ -27,4 +42,4 @@ export const create = (state) => ({
   },
 })
 
-export interface IJQuery extends ReturnType<typeof create> {}
+export type IJQuery = ReturnType<typeof create>

@@ -1,0 +1,21 @@
+export interface ReporterRunState {
+  autoScrollingEnabled?: boolean
+  scrollTop?: number
+}
+
+export interface StatsStoreStartInfo {
+  startTime: string
+  numPassed?: number
+  numFailed?: number
+  numPending?: number
+}
+
+export interface ReporterStartInfo extends StatsStoreStartInfo {
+  isSpecsListOpen: boolean
+  autoScrollingEnabled: boolean
+  scrollTop: number
+  studioActive: boolean
+  studioSingleTestActive: boolean
+  showFetchRequests: boolean
+  codeEditorLineWrap: boolean
+}

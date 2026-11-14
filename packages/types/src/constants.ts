@@ -1,0 +1,64 @@
+import semverMajor from 'semver/functions/major'
+import packageInfo from '@packages/root'
+
+import type { SpecFile } from './spec'
+
+export const PLUGINS_STATE = ['uninitialized', 'initializing', 'initialized', 'error'] as const
+
+export const CODE_LANGUAGES = [
+  {
+    type: 'js',
+    name: 'JavaScript',
+  },
+  {
+    type: 'ts',
+    name: 'TypeScript',
+  },
+] as const
+
+export type CodeLanguage = typeof CODE_LANGUAGES[number]
+
+export const PACKAGE_MANAGERS = ['npm', 'yarn', 'pnpm', 'bun'] as const
+
+export const GET_MAJOR_VERSION_FOR_CONTENT = () => {
+  // @packages/root's Rollup build replaces the 0.0.0-development sentinel with
+  // the next computed release version (via scripts/get-next-version.js), so
+  // semverMajor always returns the correct major (e.g. 15) rather than 0.
+  return semverMajor(packageInfo.version).toString()
+}
+
+export const RUN_ALL_SPECS_KEY = '__all' as const
+
+export const RUN_ALL_SPECS: SpecFile = {
+  name: 'All E2E Specs',
+  absolute: RUN_ALL_SPECS_KEY,
+  relative: RUN_ALL_SPECS_KEY,
+  baseName: RUN_ALL_SPECS_KEY,
+  fileName: RUN_ALL_SPECS_KEY,
+}
+
+/**
+ * In cypress-in-cypress tests that visit the app in open mode,
+ * we use this to make `isRunMode` true on the UI side so that
+ * we can test some run-mode-specific UI features
+ */
+export const CY_IN_CY_SIMULATE_RUN_MODE = 'CY_IN_CY_SIMULATE_RUN_MODE'
+
+// These are the URLS that we use to get the Cypress version and release time
+export const CYPRESS_REMOTE_MANIFEST_URL = 'https://download.cypress.io/desktop.json'
+
+export const NPM_CYPRESS_REGISTRY_URL = 'https://registry.npmjs.org/cypress'
+
+/**
+ * Maximum number of elements to check for visibility for the command log.
+ * Beyond this limit, the visibility check is skipped to prevent browser crashes
+ * when dealing with very large element sets.
+ * This number is fairly arbitrary.
+ */
+export const MAX_VISIBILITY_CHECK_ELEMENTS = 10
+
+export const RUNNABLE_LOGS = ['routes', 'agents', 'commands', 'hooks'] as const
+
+export const RUNNABLE_PROPS = [
+  '_cypressTestStatusInfo', '_testConfig', 'id', 'order', 'title', '_titlePath', 'root', 'hookName', 'hookId', 'err', 'state', 'pending', 'failedFromHookId', 'failedFromHookName', 'body', 'speed', 'type', 'duration', 'wallClockStartedAt', 'wallClockDuration', 'timings', 'file', 'originalTitle', 'invocationDetails', 'final', 'currentRetry', 'retries', '_slow',
+] as const

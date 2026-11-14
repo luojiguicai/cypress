@@ -16,6 +16,13 @@ describe('e2e typescript in plugins file', function () {
     })
   })
 
+  it('works with typescript 5 with preserveValueImports: true to run config', function () {
+    return systemTests.exec(this, {
+      project: 'ts-proj-5',
+      testingType: 'component',
+    })
+  })
+
   // https://github.com/cypress-io/cypress/issues/7575
   it('allows esModuleInterop to be overridden with true via tsconfig.json', function () {
     return systemTests.exec(this, {

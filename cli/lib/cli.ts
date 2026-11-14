@@ -1,0 +1,663 @@
+// @ts-check
+import _ from 'lodash'
+import commander from 'commander'
+import { stripIndent } from 'common-tags'
+import logSymbols from 'log-symbols'
+import Debug from 'debug'
+import util from './util'
+import logger from './logger'
+import { exitWithError, errors } from './errors'
+import cache from './tasks/cache'
+
+import openModule from './exec/open'
+import runModule from './exec/run'
+import { start } from './tasks/verify'
+import installModule from './tasks/install'
+import versionModule from './exec/versions'
+import infoModule from './exec/info'
+
+const debug = Debug('cypress:cli:cli')
+
+// patch "commander" method called when a user passed an unknown option
+// we want to print help for the current command and exit with an error
+function unknownOption (this: any, flag: string, type: string = 'option'): void {
+  if (this._allowUnknownOption) return
+
+  logger.error()
+  logger.error(`  error: unknown ${type}:`, flag)
+  logger.error()
+  this.outputHelp()
+
+  // A command that took exitOverride() means to handle its own failure — exiting
+  // here would skip the rest of its run, including anything it does on the way
+  // out. `cypress tap` relies on this to report the invocation before leaving.
+  if (this._exitCallback) {
+    this._exitCallback(new commander.CommanderError(1, 'commander.unknownOption', `unknown ${type}: ${flag}`))
+  }
+
+  process.exit(1)
+}
+commander.Command.prototype.unknownOption = unknownOption
+
+const coerceFalse = (arg: string): boolean => {
+  return arg !== 'false'
+}
+
+const coerceAnyStringToInt = (arg: any): number => {
+  return typeof arg === 'string' ? parseInt(arg) : arg
+}
+
+const spaceDelimitedArgsMsg = (flag: string, args: string[]): void => {
+  let msg = `
+    ${logSymbols.warning} Warning: It looks like you're passing --${flag} a space-separated list of arguments:
+
+    "${args.join(' ')}"
+
+    This will work, but it's not recommended.
+
+    If you are trying to pass multiple arguments, separate them with commas instead:
+      cypress run --${flag} arg1,arg2,arg3
+  `
+
+  if (flag === 'spec') {
+    msg += `
+    The most common cause of this warning is using an unescaped glob pattern. If you are
+    trying to pass a glob pattern, escape it using quotes:
+      cypress run --spec "**/*.spec.js"
+    `
+  }
+
+  logger.log()
+  logger.warn(stripIndent(msg))
+  logger.log()
+}
+
+const parseVariableOpts = (fnArgs: any[], args: string[]): any => {
+  const [opts, unknownArgs] = fnArgs
+
+  if ((unknownArgs && unknownArgs.length) && (opts.spec || opts.tag)) {
+    // this will capture space-delimited args after
+    // flags that could have possible multiple args
+    // but before the next option
+    // --spec spec1 spec2 or --tag foo bar
+
+    const multiArgFlags = _.compact([
+      opts.spec ? 'spec' : opts.spec,
+      opts.tag ? 'tag' : opts.tag,
+    ])
+
+    _.forEach(multiArgFlags, (flag: string) => {
+      const argIndex = _.indexOf(args, `--${flag}`) + 2
+      const nextOptOffset = _.findIndex(_.slice(args, argIndex), (arg: string) => {
+        return _.startsWith(arg, '--')
+      })
+      const endIndex = nextOptOffset !== -1 ? argIndex + nextOptOffset : args.length
+
+      const maybeArgs = _.slice(args, argIndex, endIndex)
+      const extraArgs = _.intersection(maybeArgs, unknownArgs)
+
+      if (extraArgs.length) {
+        opts[flag] = [opts[flag]].concat(extraArgs)
+        spaceDelimitedArgsMsg(flag, opts[flag])
+        opts[flag] = opts[flag].join(',')
+      }
+    })
+  }
+
+  debug('variable-length opts parsed %o', { args, opts })
+
+  return util.parseOpts(opts)
+}
+
+const descriptions: any = {
+  autoCancelAfterFailures: 'overrides the project-level Cloud configuration to set the failed test threshold for auto cancellation or to disable auto cancellation when recording to the Cloud',
+  browser: 'runs Cypress in the browser with the given name. if a filesystem path is supplied, Cypress will attempt to use the browser at that path.',
+  cacheClear: 'delete all cached binaries',
+  cachePrune: 'deletes all cached binaries except for the version currently in use',
+  cacheList: 'list cached binary versions',
+  cachePath: 'print the path to the binary cache',
+  cacheSize: 'Used with the list command to show the sizes of the cached folders',
+  ciBuildId: 'the unique identifier for a run on your CI provider. typically a "BUILD_ID" env var. this value is automatically detected for most CI providers',
+  component: 'runs component tests',
+  config: 'sets configuration values. separate multiple values with a comma. overrides any value in cypress.config.{js,ts,mjs,cjs}.',
+  configFile: 'path to script file where configuration values are set. defaults to "cypress.config.{js,ts,mjs,cjs}".',
+  detached: 'runs Cypress application in detached mode',
+  dev: 'runs cypress in development and bypasses binary check',
+  e2e: 'runs end to end tests',
+  env: 'sets environment variables. separate multiple values with a comma. overrides any value in cypress.config.{js,ts,mjs,cjs} or cypress.env.json',
+  expose: 'sets exposed public configuration variables. separate multiple values with a comma. overrides any value in cypress.config.{js,ts,mjs,cjs}',
+  exit: 'keep the browser open after tests finish',
+  forceInstall: 'force install the Cypress binary',
+  global: 'force Cypress into global mode as if it were globally installed',
+  group: 'a named group for recorded runs in Cypress Cloud',
+  headed: 'displays the browser instead of running headlessly',
+  headless: 'hide the browser instead of running headed (default for cypress run)',
+  inspect: 'enable the Node.js inspector to debug the Cypress development process. only available when used with --dev',
+  inspectBrk: 'enable the Node.js inspector and break before the Cypress development process starts. only available when used with --dev',
+  session: 'target a local Cypress session by its process id (PID)',
+  json: 'print the raw JSON result instead of the human-readable rendering',
+  tapTimeout: 'how long to wait on any single call into the Cypress session, in milliseconds (default 30000)',
+  key: 'your secret Record Key. you can omit this if you set a CYPRESS_RECORD_KEY environment variable.',
+  parallel: 'enables concurrent runs and automatic load balancing of specs across multiple machines or processes',
+  passWithNoTests: 'pass when no tests are found',
+  port: 'runs Cypress on a specific port. overrides any value in cypress.config.{js,ts,mjs,cjs}.',
+  project: 'path to the project',
+  posixExitCodes: 'use POSIX exit codes for error handling',
+  quiet: 'run quietly, using only the configured reporter',
+  record: 'records the run. sends test results, screenshots and videos to Cypress Cloud.',
+  reporter: 'runs a specific mocha reporter. pass a path to use a custom reporter. defaults to "spec"',
+  reporterOptions: 'options for the mocha reporter. defaults to "null"',
+  runnerUi: 'displays the Cypress Runner UI',
+  noRunnerUi: 'hides the Cypress Runner UI',
+  spec: 'runs specific spec file(s). defaults to "all"',
+  tag: 'named tag(s) for recorded runs in Cypress Cloud',
+  version: 'prints Cypress version',
+}
+
+const knownCommands = [
+  'cache',
+  'help',
+  '-h',
+  '--help',
+  'install',
+  'open',
+  'run',
+  'tap',
+  'verify',
+  '-v',
+  '--version',
+  'version',
+  'info',
+]
+
+const text = (description: string): string => {
+  if (!descriptions[description]) {
+    throw new Error(`Could not find description for: ${description}`)
+  }
+
+  return descriptions[description]
+}
+
+function includesVersion (args: string[]): boolean {
+  return (
+    _.includes(args, '--version') ||
+    _.includes(args, '-v')
+  )
+}
+
+async function showVersions (opts: any): Promise<any> {
+  debug('printing Cypress version')
+  debug('additional arguments %o', opts)
+
+  debug('parsed version arguments %o', opts)
+
+  const reportAllVersions = (versions: any): void => {
+    logger.always('Cypress package version:', versions.package)
+    logger.always('Cypress binary version:', versions.binary)
+    logger.always('Electron version:', versions.electronVersion)
+    logger.always('Bundled Node version:', versions.electronNodeVersion)
+  }
+
+  const reportComponentVersion = (componentName: string, versions: any): void => {
+    const names: any = {
+      package: 'package',
+      binary: 'binary',
+      electron: 'electronVersion',
+      node: 'electronNodeVersion',
+    }
+
+    if (!names[componentName]) {
+      throw new Error(`Unknown component name "${componentName}"`)
+    }
+
+    const name = names[componentName]
+
+    if (!versions[name]) {
+      throw new Error(`Cannot find version for component "${componentName}" under property "${name}"`)
+    }
+
+    const version = versions[name]
+
+    logger.always(version)
+  }
+
+  const defaultVersions = {
+    package: undefined,
+    binary: undefined,
+    electronVersion: undefined,
+    electronNodeVersion: undefined,
+  }
+
+  try {
+    const versions = (await versionModule.getVersions()) || defaultVersions
+
+    if (opts?.component) {
+      reportComponentVersion(opts.component, versions)
+    } else {
+      reportAllVersions(versions)
+    }
+
+    process.exit(0)
+  } catch (e: any) {
+    util.logErrorExit1(e)
+  }
+}
+
+const createProgram = (): any => {
+  const program = new commander.Command()
+
+  // bug in commander not printing name
+  // in usage help docs
+  program._name = 'cypress'
+
+  program.usage('<command> [options]')
+
+  return program
+}
+
+const addCypressRunCommand = (program: any): any => {
+  return program
+  .command('run')
+  .usage('[options]')
+  .description('Runs Cypress tests from the CLI without the GUI')
+  .option('--auto-cancel-after-failures <test-failure-count || false>', text('autoCancelAfterFailures'))
+  .option('-b, --browser <browser-name-or-path>', text('browser'))
+  .option('--ci-build-id <id>', text('ciBuildId'))
+  .option('--component', text('component'))
+  .option('-c, --config <config>', text('config'))
+  .option('-C, --config-file <config-file>', text('configFile'))
+  .option('--e2e', text('e2e'))
+  .option('-e, --env <env>', text('env'))
+  .option('-x, --expose <expose>', text('expose'))
+  .option('--group <name>', text('group'))
+  .option('-k, --key <record-key>', text('key'))
+  .option('--headed', text('headed'))
+  .option('--headless', text('headless'))
+  .option('--no-exit', text('exit'))
+  .option('--parallel', text('parallel'))
+  .option('--pass-with-no-tests', text('passWithNoTests'))
+  .option('-p, --port <port>', text('port'))
+  .option('-P, --project <project-path>', text('project'))
+  .option('--posix-exit-codes', text('posixExitCodes'))
+  .option('-q, --quiet', text('quiet'))
+  .option('--record [bool]', text('record'), coerceFalse)
+  .option('-r, --reporter <reporter>', text('reporter'))
+  .option('--runner-ui', text('runnerUi'))
+  .option('--no-runner-ui', text('noRunnerUi'))
+  .option('-o, --reporter-options <reporter-options>', text('reporterOptions'))
+  .option('-s, --spec <spec>', text('spec'))
+  .option('-t, --tag <tag>', text('tag'))
+}
+
+const addCypressOpenCommand = (program: any): any => {
+  return program
+  .command('open')
+  .usage('[options]')
+  .description('Opens Cypress in the interactive GUI.')
+  .option('-b, --browser <browser-path>', text('browser'))
+  .option('--component', text('component'))
+  .option('-c, --config <config>', text('config'))
+  .option('-C, --config-file <config-file>', text('configFile'))
+  .option('-d, --detached [bool]', text('detached'), coerceFalse)
+  .option('--e2e', text('e2e'))
+  .option('-e, --env <env>', text('env'))
+  .option('-x, --expose <expose>', text('expose'))
+  .option('--global', text('global'))
+  .option('-p, --port <port>', text('port'))
+  .option('-P, --project <project-path>', text('project'))
+}
+
+// `--dev`, `--inspect` and `--inspect-brk` are internal flags used when
+// developing Cypress itself. They are intentionally hidden from the public
+// `--help` output and only registered when `--dev` is actually passed, so that
+// released versions don't advertise flags that error for end users.
+// See https://github.com/cypress-io/cypress/issues/21320
+const maybeAddDevFlag = (program: any, args: string[]): any => {
+  if (args.includes('--dev')) {
+    return program.option('--dev', text('dev'), coerceFalse)
+  }
+
+  return program
+}
+
+const maybeAddInspectFlags = (program: any, args: string[]): any => {
+  if (args.includes('--dev')) {
+    return program
+    .option('--inspect', text('inspect'))
+    .option('--inspect-brk', text('inspectBrk'))
+  }
+
+  return program
+}
+
+/**
+ * Casts known command line options for "cypress run" to their intended type.
+ * For example if the user passes "--port 5005" the ".port" property should be
+ * a number 5005 and not a string "5005".
+ *
+ * Returns a clone of the original object.
+ */
+const castCypressOptions = (opts: any): any => {
+  // only properties that have type "string | false" in our TS definition
+  // require special handling, because CLI parsing takes care of purely
+  // boolean arguments
+  const castOpts = { ...opts }
+
+  if (_.has(opts, 'port')) {
+    castOpts.port = coerceAnyStringToInt(opts.port)
+  }
+
+  return castOpts
+}
+
+const cliModule = {
+  /**
+   * Parses `cypress run` command line option array into an object
+   * with options that you can feed into a `cypress.run()` module API call.
+   * @example
+   *  const options = parseRunCommand(['cypress', 'run', '--browser', 'chrome'])
+   *  // options is {browser: 'chrome'}
+   */
+  parseRunCommand (args: string[]): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!Array.isArray(args)) {
+        return reject(new Error('Expected array of arguments'))
+      }
+
+      // make a copy of the input arguments array
+      // and add placeholders where "node ..." would usually be
+      // also remove "cypress" keyword at the start if present
+      const cliArgs = args[0] === 'cypress' ? [...args.slice(1)] : [...args]
+
+      cliArgs.unshift(null as any, null as any)
+
+      debug('creating program parser')
+      const program = createProgram()
+
+      maybeAddInspectFlags(maybeAddDevFlag(addCypressRunCommand(program), cliArgs), cliArgs)
+      .action((...fnArgs: any[]) => {
+        debug('parsed Cypress run %o', fnArgs)
+        const options = parseVariableOpts(fnArgs, cliArgs)
+
+        debug('parsed options %o', options)
+
+        const casted = castCypressOptions(options)
+
+        debug('casted options %o', casted)
+        resolve(casted)
+      })
+
+      debug('parsing args: %o', cliArgs)
+      program.parse(cliArgs)
+    })
+  },
+
+  /**
+   * Parses `cypress open` command line option array into an object
+   * with options that you can feed into cy.openModeSystemTest test calls
+   * @example
+   *  const options = parseOpenCommand(['cypress', 'open', '--browser', 'chrome'])
+   *  // options is {browser: 'chrome'}
+   */
+  parseOpenCommand (args: string[]): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!Array.isArray(args)) {
+        return reject(new Error('Expected array of arguments'))
+      }
+
+      // make a copy of the input arguments array
+      // and add placeholders where "node ..." would usually be
+      // also remove "cypress" keyword at the start if present
+      const cliArgs = args[0] === 'cypress' ? [...args.slice(1)] : [...args]
+
+      cliArgs.unshift(null as any, null as any)
+
+      debug('creating program parser')
+      const program = createProgram()
+
+      maybeAddInspectFlags(maybeAddDevFlag(addCypressOpenCommand(program), cliArgs), cliArgs)
+      .action((...fnArgs: any[]) => {
+        debug('parsed Cypress open %o', fnArgs)
+        const options = parseVariableOpts(fnArgs, cliArgs)
+
+        debug('parsed options %o', options)
+
+        const casted = castCypressOptions(options)
+
+        debug('casted options %o', casted)
+        resolve(casted)
+      })
+
+      debug('parsing args: %o', cliArgs)
+      program.parse(cliArgs)
+    })
+  },
+
+  /**
+   * Parses the command line and kicks off Cypress process.
+   */
+  async init (args?: string[]): Promise<any> {
+    if (!args) {
+      args = process.argv
+    }
+
+    const { CYPRESS_INTERNAL_ENV } = process.env
+
+    if (!util.isValidCypressInternalEnvValue(CYPRESS_INTERNAL_ENV)) {
+      debug('invalid CYPRESS_INTERNAL_ENV value', CYPRESS_INTERNAL_ENV)
+
+      return exitWithError(errors.invalidCypressEnv)(
+        `CYPRESS_INTERNAL_ENV=${CYPRESS_INTERNAL_ENV}`,
+      )
+    }
+
+    if (util.isNonProductionCypressInternalEnvValue(CYPRESS_INTERNAL_ENV)) {
+      debug('non-production CYPRESS_INTERNAL_ENV value', CYPRESS_INTERNAL_ENV)
+
+      const msg = `
+        ${logSymbols.warning} Warning: It looks like you're passing CYPRESS_INTERNAL_ENV=${CYPRESS_INTERNAL_ENV}
+
+        The environment variable "CYPRESS_INTERNAL_ENV" is reserved and should only be used internally.
+
+        Unset the "CYPRESS_INTERNAL_ENV" environment variable and run Cypress again.
+      `
+
+      logger.log()
+      logger.warn(stripIndent(msg))
+      logger.log()
+    }
+
+    const program = createProgram()
+
+    program
+    .command('help')
+    .description('Shows CLI help and exits')
+    .action(() => {
+      program.help()
+    })
+
+    const handleVersion = (cmd: any): any => {
+      return cmd
+      .option('--component <package|binary|electron|node>', 'component to report version for')
+      .action((opts: any, ...other: any[]) => {
+        showVersions(util.parseOpts(opts))
+      })
+    }
+
+    handleVersion(program
+    .storeOptionsAsProperties()
+    .option('-v, --version', text('version'))
+    .command('version')
+    .description(text('version')))
+
+    maybeAddInspectFlags(maybeAddDevFlag(addCypressOpenCommand(program), args), args)
+    .action(async (opts: any) => {
+      debug('opening Cypress')
+
+      try {
+        const code = await openModule.start(util.parseOpts(opts))
+
+        process.exit(code)
+      } catch (e: any) {
+        util.logErrorExit1(e)
+      }
+    })
+
+    maybeAddInspectFlags(maybeAddDevFlag(addCypressRunCommand(program), args), args)
+    .action(async (...fnArgs: any[]) => {
+      debug('running Cypress with args %o', fnArgs)
+      try {
+        const code = await runModule.start(parseVariableOpts(fnArgs, args as string[]))
+
+        process.exit(code)
+      } catch (e: any) {
+        util.logErrorExit1(e)
+      }
+    })
+
+    program
+    .command('install')
+    .usage('[options]')
+    .description(
+      'Installs the Cypress executable matching this package\'s version',
+    )
+    .option('-f, --force', text('forceInstall'))
+    .action(async (opts: any) => {
+      try {
+        await installModule.start(util.parseOpts(opts))
+      } catch (e: any) {
+        util.logErrorExit1(e)
+      }
+    })
+
+    maybeAddDevFlag(program
+    .command('verify')
+    .usage('[options]')
+    .description(
+      'Verifies that Cypress is installed correctly and executable',
+    ), args)
+    .action(async (opts: any) => {
+      const defaultOpts = { force: true, welcomeMessage: false }
+      const parsedOpts = util.parseOpts(opts)
+      const options = _.extend(parsedOpts, defaultOpts)
+
+      try {
+        await start(options)
+      } catch (e: any) {
+        util.logErrorExit1(e)
+      }
+    })
+
+    program
+    .command('cache')
+    .usage('[command]')
+    .description('Manages the Cypress binary cache')
+    .option('list', text('cacheList'))
+    .option('path', text('cachePath'))
+    .option('clear', text('cacheClear'))
+    .option('prune', text('cachePrune'))
+    .option('--size', text('cacheSize'))
+    .action(async function (this: any, opts: any, args: string[]) {
+      if (!args || !args.length) {
+        this.outputHelp()
+        process.exit(1)
+      }
+
+      const [command] = args
+
+      if (!_.includes(['list', 'path', 'clear', 'prune'], command)) {
+        unknownOption.call(this, `cache ${command}`, 'command')
+      }
+
+      if (command === 'list') {
+        debug('cache command %o', {
+          command,
+          size: opts.size,
+        })
+
+        try {
+          const result = await cache.list(opts.size)
+
+          return result
+        } catch (e: any) {
+          if (e.code === 'ENOENT') {
+            logger.always('No cached binary versions were found.')
+            process.exit(0)
+          }
+
+          util.logErrorExit1(e)
+        }
+      }
+
+      cache[command]()
+    })
+
+    program
+    .command('tap')
+    .usage('[command] [args...]')
+    .description('Discover, control, and query an open-mode Cypress session from the command line')
+    .helpOption(false)
+    .allowUnknownOption(true)
+    .option('-s, --session <pid>', text('session'), coerceAnyStringToInt)
+    .option('--json', text('json'))
+    .option('--timeout <ms>', text('tapTimeout'), coerceAnyStringToInt)
+    .action(async function (this: any, opts: any, args: string[]) {
+      try {
+        const { default: tapModule } = await import('./exec/tap')
+        const code = await tapModule.start(args || [], _.pick(opts, ['session', 'json', 'timeout']))
+
+        process.exit(code)
+      } catch (e: any) {
+        util.logErrorExit1(e)
+      }
+    })
+
+    maybeAddDevFlag(program
+    .command('info')
+    .usage('[command]')
+    .description('Prints Cypress and system information'), args)
+    .action(async (opts: any) => {
+      try {
+        const code = await infoModule.start(opts)
+
+        process.exit(code)
+      } catch (e: any) {
+        util.logErrorExit1(e)
+      }
+    })
+
+    debug('cli starts with arguments %j', args)
+    util.printNodeOptions()
+
+    // if there are no arguments
+    if (args.length <= 2) {
+      debug('printing help')
+      program.help()
+      // exits
+    }
+
+    const firstCommand = args[2]
+
+    if (!_.includes(knownCommands, firstCommand)) {
+      debug('unknown command %s', firstCommand)
+      logger.error('Unknown command', `"${firstCommand}"`)
+      program.outputHelp()
+
+      return process.exit(1)
+    }
+
+    if (includesVersion(args)) {
+      // commander 2.11.0 changes behavior
+      // and now does not understand top level options
+      // .option('-v, --version').command('version')
+      // so we have to manually catch '-v, --version'
+      handleVersion(program)
+    }
+
+    debug('program parsing arguments')
+
+    return program.parse(args)
+  },
+}
+
+export default cliModule

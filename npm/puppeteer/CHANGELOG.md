@@ -1,0 +1,75 @@
+# [@[secure]/puppeteer-v1.0.0](https://github.com/[secure]-io/[secure]/compare/@[secure]/puppeteer-v0.1.10...@[secure]/puppeteer-v1.0.0) (2026-11-12)
+
+
+### breaking
+
+* **puppeteer:** upgrade puppeteer-core to v24 and release 1.0 ([#35203](https://github.com/[secure]-io/[secure]/issues/35203)) ([dab2626](https://github.com/[secure]-io/[secure]/commit/dab2626dda6671f3ead0324f65b1cae96084acda))
+
+
+### BREAKING CHANGES
+
+* **puppeteer:** @[secure]/puppeteer now requires Cypress 14.0.0 or later
+and bundles puppeteer-core v24 instead of v21. Message handlers receive
+a Puppeteer Browser directly, so Puppeteer's breaking changes from v22
+through v24 can affect handler code, including the removal of
+page.waitForTimeout(), page.$x() and page.waitForXPath(), the rename of
+createIncognitoBrowserContext() to createBrowserContext(), and
+Uint8Array return types for screenshots and PDFs. See "Upgrading to
+1.0" in the README.
+
+
+Claude-Session: https://claude.ai/code/session_01MgZqAWLsFxezM5PLQTBjzz
+
+Co-authored-by: Claude <noreply@anthropic.com>
+
+# [@[secure]/puppeteer-v0.1.10](https://github.com/[secure]-io/[secure]/compare/@[secure]/puppeteer-v0.1.9...@[secure]/puppeteer-v0.1.10) (2026-09-30)
+
+
+### Bug Fixes
+
+* **puppeteer:** lowercase the [secure] type reference so types resolve on case-sensitive file systems ([#34954](https://github.com/[secure]-io/[secure]/issues/34954)) ([83ab206](https://github.com/[secure]-io/[secure]/commit/83ab20656626a93eb9079e7aee670d008f0821d3))
+
+# [@[secure]/puppeteer-v0.1.9](https://github.com/[secure]-io/[secure]/compare/@[secure]/puppeteer-v0.1.8...@[secure]/puppeteer-v0.1.9) (2026-09-24)
+
+
+### Bug Fixes
+
+* **puppeteer:** always disconnect, report falsy rejections, and fix retry timeout ([#34907](https://github.com/[secure]-io/[secure]/issues/34907)) ([aecb1cb](https://github.com/[secure]-io/[secure]/commit/aecb1cb6419a2a8a5e220639daa447cdb3143cb8))
+
+# [@cypress/puppeteer-v0.1.8](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.7...@cypress/puppeteer-v0.1.8) (2025-10-03)
+
+# [@cypress/puppeteer-v0.1.7](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.6...@cypress/puppeteer-v0.1.7) (2025-09-18)
+
+# [@cypress/puppeteer-v0.1.6](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.5...@cypress/puppeteer-v0.1.6) (2025-05-16)
+
+# [@cypress/puppeteer-v0.1.5](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.4...@cypress/puppeteer-v0.1.5) (2024-06-07)
+
+
+### Bug Fixes
+
+* update cypress to Typescript 5 ([#29568](https://github.com/cypress-io/cypress/issues/29568)) ([f3b6766](https://github.com/cypress-io/cypress/commit/f3b67666a5db0438594339c379cf27e1fd1e4abc))
+
+# [@cypress/puppeteer-v0.1.4](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.3...@cypress/puppeteer-v0.1.4) (2024-04-02)
+
+# [@cypress/puppeteer-v0.1.3](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.2...@cypress/puppeteer-v0.1.3) (2024-02-20)
+
+
+### Bug Fixes
+
+* move main tab activation to puppeteer plugin ([#28898](https://github.com/cypress-io/cypress/issues/28898)) ([ed2fc13](https://github.com/cypress-io/cypress/commit/ed2fc1394623f08097d180747712c557d867ee86))
+
+# [@cypress/puppeteer-v0.1.2](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.1...@cypress/puppeteer-v0.1.2) (2023-12-26)
+
+# [@cypress/puppeteer-v0.1.1](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.1.0...@cypress/puppeteer-v0.1.1) (2023-11-29)
+
+
+### Bug Fixes
+
+* Resolve types and dist issues with @cypress/puppeteer ([#28424](https://github.com/cypress-io/cypress/issues/28424)) ([72225db](https://github.com/cypress-io/cypress/commit/72225db03327744844dcfbcc72b40e85de6a2761))
+
+# [@cypress/puppeteer-v0.1.0](https://github.com/cypress-io/cypress/compare/@cypress/puppeteer-v0.0.1...@cypress/puppeteer-v0.1.0) (2023-11-28)
+
+
+### Features
+
+* Initial release ([#28370](https://github.com/cypress-io/cypress/issues/28370)) ([b34d145](https://github.com/cypress-io/cypress/commit/b34d14571689a9b36efc707a3a48f27edcb98113))

@@ -1,27 +1,96 @@
-// @ts-nocheck
-
 import _ from 'lodash'
 import Promise from 'bluebird'
+import { basename, extname, sep } from 'path'
 
 import $errUtils from '../../cypress/error_utils'
+
+const NULL_SEP = '\u0000'
 
 const clone = (obj) => {
   if (Buffer.isBuffer(obj)) {
     return Buffer.from(obj)
   }
 
+  // A `.js` fixture can evaluate to `undefined`, which JSON.parse() rejects.
+  if (obj === undefined) {
+    return obj
+  }
+
   return JSON.parse(JSON.stringify(obj))
 }
 
+/**
+ * Given a path, returns an array containing the path with and without its extension.
+ * If there is no extension, returns an array containing only the original path.
+ *
+ * Used so invalidation can match both "foo.json" and "foo".
+ *
+ * @returns [pathWithExtension, pathWithoutExtension] if extension exists, otherwise [path].
+ */
+const withAndWithoutExt = (path: string) => {
+  const extension = extname(path)
+
+  return extension ? [path, path.slice(0, -extension.length)] : [path]
+}
+
+/**
+ * Builds path prefixes that might have been used in a cache key's fixture
+ * portion. Includes forward and backslash variants, with and without
+ * extensions, and lowercase variants on Windows.
+ */
+const buildPrefixes = (rawPath: string): string[] => {
+  const forward = rawPath.split(sep).join('/')
+  const backslash = forward.replace(/\//g, '\\')
+
+  const bases = [
+    ...withAndWithoutExt(forward),
+    ...withAndWithoutExt(backslash),
+  ]
+
+  if (Cypress.platform === 'win32') {
+    bases.push(
+      ...withAndWithoutExt(forward.toLowerCase()),
+      ...withAndWithoutExt(backslash.toLowerCase()),
+    )
+  }
+
+  return Array.from(new Set(bases))
+}
+
+/** Turn fixture path prefixes into matchable key prefixes. */
+const makeKeyPrefixes = (fixturePath: string): string[] => {
+  return buildPrefixes(fixturePath).map((prefix) => `${prefix}${NULL_SEP}`)
+}
+
 export default (Commands, Cypress, cy, state, config) => {
-  // this is called at the beginning of run, so clear the cache
+  // This function runs each time a spec window loads, so the cache lasts for one
+  // run of a spec: every test in it shares the cache, and it starts empty when
+  // the spec runs again or the next spec starts. Each cy.origin() spec bridge
+  // runs it too and keeps its own cache, which invalidation in another
+  // context does not reach.
   let cache = {}
 
-  const reset = () => {
+  const clearCache = () => {
     cache = {}
   }
 
-  Cypress.on('clear:fixtures:cache', reset)
+  /**
+   * Removes all cached fixture entries that correspond to the given path,
+   * across all encodings.
+   */
+  const invalidateCacheEntry = (fixturePath: string) => {
+    const prefixes = makeKeyPrefixes(fixturePath)
+
+    for (const key of Object.keys(cache)) {
+      if (prefixes.some((prefix) => key.startsWith(prefix))) {
+        delete cache[key]
+      }
+    }
+  }
+
+  // Only the driver's own tests emit this, to start each test with an empty cache.
+  Cypress.on('clear:fixtures:cache', clearCache)
+  Cypress.on('fixture:cache:invalidate', invalidateCacheEntry)
 
   return Commands.addAll({
     fixture (fixture, ...args) {
@@ -29,21 +98,7 @@ export default (Commands, Cypress, cy, state, config) => {
         $errUtils.throwErrByPath('fixture.set_to_false')
       }
 
-      // if we already have cached
-      // this fixture then just return it
-
-      // always return a promise here
-      // to make our interface consistent
-      // for use by other code
-      const resp = cache[fixture]
-
-      if (resp) {
-        // clone the object first to prevent
-        // accidentally mutating the one in the cache
-        return Promise.resolve(clone(resp))
-      }
-
-      let options = {}
+      let options: Record<string, any> = {}
 
       if (_.isObject(args[0])) {
         options = args[0]
@@ -53,6 +108,19 @@ export default (Commands, Cypress, cy, state, config) => {
 
       if (_.isString(args[0]) || args[0] === null) {
         options.encoding = args[0]
+      }
+
+      const cacheKey = `${fixture}${NULL_SEP}${options.encoding}`
+
+      // Add the filename as a symbol, in case we need it later (such as when storing an alias).
+      // This must be set on every invocation - including cache hits - so that aliasing a cached
+      // fixture (e.g. when the same fixture is used across multiple tests) still records the
+      // file name. https://github.com/cypress-io/cypress/issues/21936
+      state('current').set('fileName', basename(fixture))
+
+      if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) {
+        // Clone the cached content to prevent accidental mutation.
+        return Promise.resolve(clone(cache[cacheKey]))
       }
 
       const timeout = options.timeout ?? Cypress.config('responseTimeout')
@@ -82,7 +150,7 @@ export default (Commands, Cypress, cy, state, config) => {
 
         // add the fixture to the cache
         // so it can just be returned next time
-        cache[fixture] = response
+        cache[cacheKey] = response
 
         // return the cloned response
         return clone(response)

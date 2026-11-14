@@ -1,0 +1,19 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>React with webpack</title>
+    <link href="../../node_modules/uppy/dist/uppy.min.css" rel="stylesheet">
+</head>
+<body>
+    <script type="module">
+      import { Uppy, Dashboard } from "../../node_modules/uppy/dist/uppy.min.mjs"
+      new Uppy().use(Dashboard, {
+        inline: true,
+        target: '#uppy',
+      })
+    </script>
+    <div id="uppy" />
+</body>
+</html>

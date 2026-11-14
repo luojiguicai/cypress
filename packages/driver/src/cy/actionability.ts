@@ -4,10 +4,14 @@ import Promise from 'bluebird'
 
 import debugFn from 'debug'
 import $dom from '../dom'
-import type { ElWindowPostion, ElViewportPostion } from '../dom/coordinates'
+import $utils from './../cypress/utils'
+import type { ElWindowPosition, ElViewportPosition, ElementPositioning } from '../dom/coordinates'
 import $elements from '../dom/elements'
 import $errUtils from '../cypress/error_utils'
+import { callNativeMethod, getNativeProp } from '../dom/elements/nativeProps'
 const debug = debugFn('cypress:driver:actionability')
+// for logs emitted on every retry iteration of an actionability check
+const debugVerbose = debugFn('cypress-verbose:driver:actionability')
 
 const delay = 50
 
@@ -16,20 +20,33 @@ const getStickyEl = $dom.getFirstStickyPositionParent
 
 const dispatchPrimedChangeEvents = function (state) {
   // if we have a changeEvent, dispatch it
-  let changeEvent
-
-  changeEvent = state('changeEvent')
+  const changeEvent = state('changeEvent')
 
   if (changeEvent) {
     return changeEvent()
   }
 }
 
+// `top` and `bottom` only describe the block axis, so they leave `inline` at the
+// browser default the way `scrollIntoView(alignToTop)` does. The rest name a
+// position either axis can take, so they apply to both.
 const scrollBehaviorOptionsMap = {
-  top: 'start',
-  bottom: 'end',
-  center: 'center',
-  nearest: 'nearest',
+  top: { block: 'start' },
+  bottom: { block: 'end' },
+  start: { block: 'start', inline: 'start' },
+  end: { block: 'end', inline: 'end' },
+  center: { block: 'center', inline: 'center' },
+  nearest: { block: 'nearest', inline: 'nearest' },
+}
+
+// `scrollBehavior` is either one of the alignments above or an explicit per-axis
+// `{ block, inline }` using the same values as the native `scrollIntoView`. An
+// axis the caller left out is omitted so that `scrollIntoView` applies its own
+// default.
+const toScrollIntoViewOptions = (scrollBehavior) => {
+  return _.isPlainObject(scrollBehavior)
+    ? _.pick(scrollBehavior, ['block', 'inline'])
+    : scrollBehaviorOptionsMap[scrollBehavior]
 }
 
 const getPositionFromArguments = function (positionOrX, y, options) {
@@ -53,15 +70,138 @@ const getPositionFromArguments = function (positionOrX, y, options) {
   return { options, position, x, y }
 }
 
+const ensureElDoesNotHaveCSS = ($el, cssProperty, cssValue, name: string, onFail) => {
+  const el = $el[0]
+  const win = $dom.getWindowByElement(el)
+  const value = win.getComputedStyle(el)[cssProperty]
+
+  if (value === cssValue) {
+    const elInherited = $elements.findParent(el, (el, prevEl) => {
+      if (win.getComputedStyle(el)[cssProperty] !== cssValue) {
+        return prevEl
+      }
+    })
+
+    const element = $dom.stringify(el)
+    const elementInherited = (el !== elInherited) && $dom.stringify(elInherited)
+
+    const consoleProps = {
+      'But it has CSS': `${cssProperty}: ${cssValue}`,
+    }
+
+    if (elementInherited) {
+      _.extend(consoleProps, {
+        'Inherited From': elInherited,
+      })
+    }
+
+    $errUtils.throwErrByPath('dom.pointer_events_none', {
+      onFail,
+      args: {
+        cmd: name,
+        element,
+        elementInherited,
+      },
+      errProps: {
+        consoleProps,
+      },
+    })
+  }
+}
+
+const ensureElIsNotAnimating = ($el, coords = [], threshold, name: string) => {
+  const lastTwo = coords.slice(-2)
+
+  // bail if we dont yet have two points
+  if (lastTwo.length !== 2) {
+    debug('animation check for `%s` has %d coordinate sample(s); 2 are required', name, lastTwo.length)
+    $errUtils.throwErrByPath('dom.animation_check_failed')
+  }
+
+  const [point1, point2] = lastTwo
+
+  // verify that there is not a distance
+  // greater than a default of '5' between
+  // the points
+  const distance = $utils.getDistanceBetween(point1, point2)
+
+  if (distance > threshold) {
+    const node = $dom.stringify($el)
+
+    debugVerbose('distance between coordinate samples %o and %o is %d with threshold %d for `%s` on %s', point1, point2, distance, threshold, name, node)
+
+    $errUtils.throwErrByPath('dom.animating', {
+      args: { cmd: name, node },
+    })
+  }
+}
+
+const VALID_POSITIONS = 'topLeft top topRight left center right bottomLeft bottom bottomRight'.split(' ')
+const ensureIsValidPosition = (position, log?): true | void => {
+  // make sure its valid first!
+  if (VALID_POSITIONS.includes(position)) {
+    return true
+  }
+
+  $errUtils.throwErrByPath('dom.invalid_position_argument', {
+    onFail: log,
+    args: {
+      position,
+      validPositions: VALID_POSITIONS.join(', '),
+    },
+  })
+}
+
+const ensureIsDescendent = ($el1, $el2, name: string, onFail) => {
+  if (!$dom.isDescendent($el1, $el2)) {
+    // https://github.com/cypress-io/cypress/issues/18008
+    // when an element inside a shadow root is covered by its shadow host
+    if (
+      $dom.isWithinShadowRoot($el1.get(0)) &&
+        $el1.get(0).getRootNode() === $el2?.get(0).shadowRoot
+    ) {
+      return
+    }
+
+    if ($el2) {
+      const element1 = $dom.stringify($el1)
+      const element2 = $dom.stringify($el2)
+
+      debugVerbose('element at the checked coordinates is %s, which is not a descendent of %s, the target of `%s`', element2, element1, name)
+
+      $errUtils.throwErrByPath('dom.covered', {
+        onFail,
+        args: { cmd: name, element1, element2 },
+        errProps: {
+          consoleProps: {
+            'But its Covered By': $dom.getElements($el2),
+          },
+        },
+      })
+    }
+
+    const node = $dom.stringify($el1)
+
+    $errUtils.throwErrByPath('dom.center_hidden', {
+      onFail,
+      args: { cmd: name, node },
+      errProps: {
+        consoleProps: {
+          'But its Covered By': $dom.getElements($el2),
+        },
+      },
+    })
+  }
+}
+
 const ensureElIsNotCovered = function (cy, win, $el, fromElViewport, options, log, onScroll) {
   let $elAtCoords: JQuery<any> | null = null
 
+  const name = cy.state('current').get('name')
   const getElementAtPointFromViewport = function (fromElViewport) {
     // get the element at point from the viewport based
     // on the desired x/y normalized coordinations
-    let elAtCoords
-
-    elAtCoords = $dom.getElementAtPointFromViewport(win.document, fromElViewport.x, fromElViewport.y)
+    const elAtCoords = $dom.getElementAtPointFromViewport(win.document, fromElViewport.x, fromElViewport.y)
 
     if (elAtCoords) {
       $elAtCoords = $dom.wrap(elAtCoords)
@@ -78,9 +218,9 @@ const ensureElIsNotCovered = function (cy, win, $el, fromElViewport, options, lo
     $elAtCoords = getElementAtPointFromViewport(fromElViewport)
     debug('elAtCoords', $elAtCoords)
     debug('el has pointer-events none?')
-    cy.ensureElDoesNotHaveCSS($el, 'pointer-events', 'none', log)
+    ensureElDoesNotHaveCSS($el, 'pointer-events', 'none', name, log)
     debug('is descendent of elAtCoords?')
-    cy.ensureDescendents($el, $elAtCoords, log)
+    ensureIsDescendent($el, $elAtCoords, name, log)
 
     return $elAtCoords
   }
@@ -96,14 +236,14 @@ const ensureElIsNotCovered = function (cy, win, $el, fromElViewport, options, lo
       }
 
       // if we're being covered by a fixed position element then
-      // we're going to attempt to continously scroll the element
+      // we're going to attempt to continuously scroll the element
       // from underneath this fixed position element until we can't
       // anymore
       const $fixed = getFixedOrStickyEl($elAtCoords)
 
       debug('elAtCoords is fixed', !!$fixed)
 
-      // if we dont have a fixed position
+      // if we don't have a fixed position
       // then just bail, cuz we need to retry async
       if (!$fixed) {
         throw err
@@ -265,6 +405,8 @@ const getCoordinatesForEl = function (cy, $el, options) {
 }
 
 const ensureNotAnimating = function (cy, $el, coordsHistory, animationDistanceThreshold) {
+  const cmd = cy.state('current').get('name')
+
   // if we dont have at least 2 points, we throw this error to force a
   // retry, which will get us another point.
   // this error is purposefully generic because if the actionability
@@ -279,7 +421,7 @@ const ensureNotAnimating = function (cy, $el, coordsHistory, animationDistanceTh
     $errUtils.throwErrByPath('dom.actionability_failed', {
       args: {
         node: $dom.stringify($el),
-        cmd: cy.state('current').get('name'),
+        cmd,
       },
     })
   }
@@ -287,10 +429,16 @@ const ensureNotAnimating = function (cy, $el, coordsHistory, animationDistanceTh
   // verify that our element is not currently animating
   // by verifying it is still at the same coordinates within
   // 5 pixels of x/y
-  cy.ensureElementIsNotAnimating($el, coordsHistory, animationDistanceThreshold)
+  ensureElIsNotAnimating($el, coordsHistory, animationDistanceThreshold, cmd)
 }
 
-const verify = function (cy, $el, config, options, callbacks) {
+interface VerifyCallbacks {
+  onReady?: (finalEl: any, coords: ElementPositioning, $el: any) => any
+  onScroll?: ($el: any, type: 'element' | 'window' | 'container') => any
+  subjectFn?: () => any
+}
+
+const verify = function (cy, $el, config, options, callbacks: VerifyCallbacks) {
   _.defaults(options, {
     scrollBehavior: config('scrollBehavior'),
     ensure: {
@@ -305,6 +453,7 @@ const verify = function (cy, $el, config, options, callbacks) {
   })
 
   const win = $dom.getWindowByElement($el.get(0))
+  const name = cy.state('current').get('name')
 
   const { _log, force, position } = options
 
@@ -318,7 +467,7 @@ const verify = function (cy, $el, config, options, callbacks) {
   // this ahead of time else bail early
   if (options.ensure.position && position) {
     try {
-      cy.ensureValidPosition(position, _log)
+      ensureIsValidPosition(position, _log)
     } catch (error) {
       // cannot proceed, give up
       const err = error
@@ -332,50 +481,72 @@ const verify = function (cy, $el, config, options, callbacks) {
   // make scrolling occur instantly. we do this by adding a style tag
   // and then removing it after we finish scrolling
   // https://github.com/cypress-io/cypress/issues/3200
-  const addScrollBehaviorFix = () => {
-    let style
+  const addScrollBehaviorFix = (element: JQuery<HTMLElement>) => {
+    const affectedParents: Map<HTMLElement, string> = new Map()
 
     try {
-      const doc = $el.get(0).ownerDocument
+      let parent: JQuery<HTMLElement> | null = element
 
-      style = doc.createElement('style')
-      style.innerHTML = '* { scroll-behavior: inherit !important; }'
-      // there's guaranteed to be a <script> tag, so that's the safest thing
-      // to query for and add the style tag after
-      doc.querySelector('script').after(style)
+      do {
+        if ($dom.isScrollable(parent)) {
+          const parentElement = parent[0]
+          const style = getNativeProp(parentElement, 'style')
+          const styles = getComputedStyle(parentElement)
+
+          if (styles.scrollBehavior === 'smooth') {
+            affectedParents.set(parentElement, callNativeMethod(style, 'getStyleProperty', 'scroll-behavior'))
+            callNativeMethod(style, 'setStyleProperty', 'scroll-behavior', 'auto')
+          }
+        }
+
+        parent = $dom.getParent(parent)
+      } while (parent.length)
     } catch (err) {
       // the above shouldn't error, but out of an abundance of caution, we
       // ignore any errors since this fix isn't worth failing the test over
     }
 
     return () => {
-      if (style) style.remove()
+      for (const [parent, value] of affectedParents) {
+        const style = getNativeProp(parent, 'style')
+
+        if (value === '') {
+          if (callNativeMethod(style, 'getStyleProperty', 'length') === 1) {
+            callNativeMethod(parent, 'removeAttribute', 'style')
+          } else {
+            callNativeMethod(style, 'removeProperty', 'scroll-behavior')
+          }
+        } else {
+          callNativeMethod(style, 'setStyleProperty', 'scroll-behavior', value)
+        }
+      }
+      affectedParents.clear()
     }
   }
 
   return Promise.try(() => {
-    const coordsHistory: (ElViewportPostion | ElWindowPostion)[] = []
+    const coordsHistory: (ElViewportPosition | ElWindowPosition)[] = []
 
     const runAllChecks = function () {
       let $elAtCoords
 
       if (force !== true) {
         // ensure it's attached
-        cy.ensureAttached($el, null, _log)
+        Cypress.ensure.isElement($el, name, _log)
+        Cypress.ensure.isAttached($el, name, cy, _log)
 
         // ensure its 'receivable'
         if (options.ensure.notDisabled) {
-          cy.ensureNotDisabled($el, _log)
+          Cypress.ensure.isNotDisabled($el, name, _log)
         }
 
         if (options.scrollBehavior !== false) {
           // scroll the element into view
-          const scrollBehavior = scrollBehaviorOptionsMap[options.scrollBehavior]
+          const scrollIntoViewOptions = toScrollIntoViewOptions(options.scrollBehavior)
+          const removeScrollBehaviorFix = addScrollBehaviorFix($el)
 
-          const removeScrollBehaviorFix = addScrollBehaviorFix()
-
-          debug('scrollIntoView:', $el[0])
-          $el.get(0).scrollIntoView({ block: scrollBehavior })
+          debug('scrollIntoView:', $el[0], scrollIntoViewOptions)
+          $el.get(0).scrollIntoView(scrollIntoViewOptions)
 
           removeScrollBehaviorFix()
 
@@ -385,14 +556,19 @@ const verify = function (cy, $el, config, options, callbacks) {
         }
 
         if (options.ensure.visibility) {
-          // ensure element is visible but do not check if hidden by ancestors
-          // until nudging algorithm occurs
-          // https://whimsical.com/actionability-J38eY9K2Y3vA6uCMWtmLVA
-          cy.ensureStrictVisibility($el, _log)
+          // The legacy strategy checks visibility in two stages: the element here, then
+          // — after the covering/nudging algorithm below — whether it's hidden by ancestors.
+          // The modern strategy does it in one checkVisibility-based call here, so it has
+          // no second stage. https://whimsical.com/actionability-J38eY9K2Y3vA6uCMWtmLVA
+          if (Cypress.config('visibilityStrategy') === 'modern') {
+            Cypress.ensure.isVisible($el, name, _log)
+          } else {
+            Cypress.ensure.isStrictlyVisible($el, name, _log)
+          }
         }
 
         if (options.ensure.notReadonly) {
-          cy.ensureNotReadonly($el, _log)
+          Cypress.ensure.isNotReadonly($el, name, _log)
         }
 
         if (_.isFunction(options.custom)) {
@@ -424,7 +600,13 @@ const verify = function (cy, $el, config, options, callbacks) {
         // this calculation is relative from the viewport so we
         // only care about fromElViewport coords
         $elAtCoords = options.ensure.notCovered && ensureElIsNotCovered(cy, win, $el, coords.fromElViewport, options, _log, onScroll)
-        cy.ensureNotHiddenByAncestors($el, _log)
+
+        // Only the legacy strategy runs this ancestor phase. The modern check above
+        // already covers ancestor display/visibility, and it intentionally omits the
+        // legacy overflow/out-of-bounds clipping check (matching modern `should('be.visible')`).
+        if (Cypress.config('visibilityStrategy') !== 'modern') {
+          Cypress.ensure.isNotHiddenByAncestors($el, name, _log)
+        }
       }
 
       // pass our final object into onReady
@@ -439,7 +621,7 @@ const verify = function (cy, $el, config, options, callbacks) {
         finalEl = $elAtCoords != null ? $elAtCoords : $el
       }
 
-      return onReady(finalEl, finalCoords)
+      return onReady(finalEl, finalCoords, $el)
     }
 
     // we cannot enforce async promises here because if our
@@ -448,6 +630,21 @@ const verify = function (cy, $el, config, options, callbacks) {
     // the checks and firing the event!
     const retryActionability = () => {
       try {
+        if (callbacks.subjectFn) {
+          $el = callbacks.subjectFn()
+
+          if ($el.length === 0 || $dom.isDetached($el)) {
+            const current = cy.state('current')
+            const subjectChain = cy.subjectChain(current.get('chainerId'))
+
+            debugVerbose('re-queried subject for `%s` has length %d, isDetached %o', current.get('name'), $el.length, $dom.isDetached($el))
+
+            $errUtils.throwErrByPath('subject.detached_during_actionability', {
+              args: { name: current.get('name'), subjectChain },
+            })
+          }
+        }
+
         return runAllChecks()
       } catch (err) {
         options.error = err
@@ -465,4 +662,5 @@ export default {
   verify,
   dispatchPrimedChangeEvents,
   getPositionFromArguments,
+  ensureIsValidPosition,
 }

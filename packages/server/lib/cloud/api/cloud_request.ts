@@ -1,0 +1,87 @@
+/**
+ * The axios Cloud instance should not be used.
+ */
+import os from 'os'
+import type { AxiosInstance } from 'axios'
+import axios from 'axios'
+import pkg from '@packages/root'
+import { strictAgent } from '@packages/network'
+
+import app_config from '../../../config/app.json'
+import { installErrorTransform } from './axios_middleware/transform_error'
+import { installLogging } from './axios_middleware/logging'
+import { installEncryption } from './axios_middleware/encryption'
+
+interface CreateCloudRequestOptions {
+  /**
+   * The baseURL for all requests for this Cloud Request instance
+   */
+  baseURL?: string
+  /**
+   * Additional headers for the Cloud Request
+   */
+  additionalHeaders?: Record<string, string>
+  /**
+   * Whether to include the default logging middleware
+   * @default true
+   */
+  enableLogging?: boolean
+  /**
+   * Whether to include the default error transformation
+   * @default true
+   */
+  enableErrorTransform?: boolean
+}
+
+// Allows us to create customized Cloud Request instances w/ different baseURL & encryption configuration
+export const createCloudRequest = (options: CreateCloudRequestOptions = {}): AxiosInstance => {
+  const cfgKey = process.env.CYPRESS_CONFIG_ENV || process.env.CYPRESS_INTERNAL_ENV || 'development'
+  const { baseURL = app_config[cfgKey].api_url, enableLogging = true, enableErrorTransform = true } = options
+
+  const instance = axios.create({
+    baseURL,
+    httpAgent: strictAgent,
+    httpsAgent: strictAgent,
+    // strictAgent applies HTTP(S)_PROXY itself; axios would otherwise tunnel HTTPS through its own agent, bypassing it
+    proxy: false,
+    headers: {
+      'x-os-name': os.platform(),
+      'x-cypress-version': pkg.version,
+      'User-Agent': `cypress/${pkg.version}`,
+      ...options.additionalHeaders,
+    },
+  })
+
+  installEncryption(instance)
+
+  if (enableLogging) {
+    installLogging(instance)
+  }
+
+  if (enableErrorTransform) {
+    installErrorTransform(instance)
+  }
+
+  return instance
+}
+
+export const CloudRequest = createCloudRequest()
+
+export type TCloudReqest = ReturnType<typeof createCloudRequest>
+
+export const isRetryableCloudError = (error: unknown) => {
+  // setting this env via mocha's beforeEach coerces this to a string, even if it's a boolean
+  const disabled = process.env.DISABLE_API_RETRIES && process.env.DISABLE_API_RETRIES !== 'false'
+
+  if (disabled) {
+    return false
+  }
+
+  const axiosErr = axios.isAxiosError(error) ? error : undefined
+
+  if (axiosErr && axiosErr.status) {
+    return [408, 429, 500, 502, 503, 504].includes(axiosErr.status)
+  }
+
+  return true
+}

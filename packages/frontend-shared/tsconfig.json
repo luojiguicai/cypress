@@ -1,0 +1,26 @@
+{
+  "extends": "../ts/tsconfig.json",
+  "include": [
+    "src/**/*",
+    "cypress/**/*",
+    "*.d.ts"
+  ],
+  "compilerOptions": {
+    "module": "esnext",
+    "lib": ["dom", "ESNext"],
+    "jsx": "preserve",
+    "preserveWatchOutput": true,
+    "noImplicitThis": false,
+    "noErrorTruncation": true,
+    "paths": {
+      "@cy/components/*": ["../frontend-shared/src/components/*"]
+    },
+    "types": [
+      "chrome",
+      "@intlify/unplugin-vue-i18n/messages",
+      "@testing-library/cypress",
+      "cypress-real-events", 
+      "cypress"
+    ],
+  }
+}

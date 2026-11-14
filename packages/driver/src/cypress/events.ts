@@ -30,7 +30,7 @@ export function extend (obj): Events {
   events.proxyTo = function (child) {
     const parent = obj
 
-    for (let fn of proxyFunctions) {
+    for (const fn of proxyFunctions) {
       // create a closure
       const original = parent[fn]
 
@@ -40,7 +40,7 @@ export function extend (obj): Events {
         // dont let our child emits also log
         logEmit = false
 
-        const ret2 = child[fn].apply(child, args)
+        const ret2 = child[fn](...args)
 
         logEmit = true
 
@@ -118,17 +118,4 @@ export function extend (obj): Events {
 
   // return the events object
   return events as Events
-}
-
-/**
- * When we create a listener from the runner for the AUT, we need to ensure the function
- * is sourced from the AUT, otherwise the event will not be associated correctly.
- *
- * We do this by creating a function from the AUT window, keeping in state to ensure we
- * only have a single fn
- */
-export function makeContentWindowListener (fnName, contentWindow) {
-  return new contentWindow.Function(fnName, `return function() {
-    return ${fnName}.apply(this, arguments)
-  }`)
 }

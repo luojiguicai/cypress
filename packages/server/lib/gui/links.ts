@@ -1,29 +1,15 @@
-import _ from 'lodash'
+// tslint:disable-next-line no-implicit-dependencies - electron dep needs to be defined
 import { shell } from 'electron'
+
+const ALLOWED_PROTOCOLS = ['http:', 'https:']
 
 // NOTE: in order for query params to be passed through on links
 // forwardQueryParams: true must be set for that slug in the on package
 
-interface OpenExternalOptions {
-  url: string
-  params: { [key: string]: string }
-}
-
-export const openExternal = (opts: OpenExternalOptions | string) => {
-  if (_.isString(opts)) {
-    return shell.openExternal(opts)
+export const openExternal = (url: string) => {
+  if (typeof url !== 'string' || !URL.canParse(url) || !ALLOWED_PROTOCOLS.includes(new URL(url).protocol)) {
+    return Promise.reject(new Error(`Only http and https URLs can be opened externally: ${url}`))
   }
 
-  const url = new URL(opts.url)
-
-  if (opts.params) {
-    // just add the utm_source here so we don't have to duplicate it on every link
-    if (_.find(opts.params, (_val, key) => _.includes(key, 'utm_'))) {
-      opts.params.utm_source = 'Test Runner'
-    }
-
-    url.search = new URLSearchParams(opts.params).toString()
-  }
-
-  return shell.openExternal(url.href)
+  return shell.openExternal(url)
 }

@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# Generates a JSON object of CircleCI pipeline parameters based on changed files.
+# Used in launch-primary-workflow to enable path-based job filtering on PR
+# branches and on genuine webhook pushes to develop and vN maintenance branches.
+#
+# Output: JSON written to stdout, consumed by continuation/continue pipeline_parameters.
+#
+# Every path a job could care about must map to a run-* param below: a path
+# that matches nothing is an error rather than a silent skip.
+#
+# release/* branches, the update-v8-snapshot-cache-on-develop branch, the
+# run-all-jobs manual trigger, and any develop or vN run that isn't a webhook
+# push (scheduled pipelines, API triggers, or an unset/unknown trigger source)
+# skip path inspection entirely and run everything.
+#
+# The corresponding pipeline parameters in @pipeline.yml default to true, so a
+# continuation that omits them runs everything rather than nothing.
+
+set -euo pipefail
+
+driver_tests=false
+server_tests=false
+app_ui_tests=false
+launchpad_tests=false
+reporter_tests=false
+frontend_shared_tests=false
+system_tests=false
+v8_tests=false
+cli_tests=false
+unit_tests=false
+npm_webpack_dev_server_tests=false
+npm_vite_dev_server_tests=false
+npm_webpack_preprocessor_tests=false
+npm_webpack_batteries_tests=false
+npm_vue_tests=false
+npm_react_tests=false
+npm_angular_tests=false
+npm_puppeteer_tests=false
+npm_vite_plugin_esm_tests=false
+npm_mount_utils_tests=false
+npm_grep_tests=false
+npm_schematic_tests=false
+
+# run-force-http1-tests and percy-enabled are NOT forwarded here: each is
+# already a pipeline parameter declared in both the setup config and
+# .circleci/packed/pipeline.yml, so it is inherited into the continued config
+# automatically. Re-passing it through the continuation's `parameters` map
+# collides with that inherited value and CircleCI rejects the continuation with
+# "Conflicting pipeline parameters."
+
+emit_json() {
+  cat <<EOF
+{"run-driver-tests": $driver_tests, "run-server-tests": $server_tests, "run-app-ui-tests": $app_ui_tests, "run-launchpad-tests": $launchpad_tests, "run-reporter-tests": $reporter_tests, "run-frontend-shared-tests": $frontend_shared_tests, "run-system-tests": $system_tests, "run-v8-tests": $v8_tests, "run-cli-tests": $cli_tests, "run-unit-tests": $unit_tests, "run-npm-webpack-dev-server-tests": $npm_webpack_dev_server_tests, "run-npm-vite-dev-server-tests": $npm_vite_dev_server_tests, "run-npm-webpack-preprocessor-tests": $npm_webpack_preprocessor_tests, "run-npm-webpack-batteries-tests": $npm_webpack_batteries_tests, "run-npm-vue-tests": $npm_vue_tests, "run-npm-react-tests": $npm_react_tests, "run-npm-angular-tests": $npm_angular_tests, "run-npm-puppeteer-tests": $npm_puppeteer_tests, "run-npm-vite-plugin-esm-tests": $npm_vite_plugin_esm_tests, "run-npm-mount-utils-tests": $npm_mount_utils_tests, "run-npm-grep-tests": $npm_grep_tests, "run-npm-schematic-tests": $npm_schematic_tests}
+EOF
+}
+
+emit_all_true() {
+  driver_tests=true
+  server_tests=true
+  app_ui_tests=true
+  launchpad_tests=true
+  reporter_tests=true
+  frontend_shared_tests=true
+  system_tests=true
+  v8_tests=true
+  cli_tests=true
+  unit_tests=true
+  npm_webpack_dev_server_tests=true
+  npm_vite_dev_server_tests=true
+  npm_webpack_preprocessor_tests=true
+  npm_webpack_batteries_tests=true
+  npm_vue_tests=true
+  npm_react_tests=true
+  npm_angular_tests=true
+  npm_puppeteer_tests=true
+  npm_vite_plugin_esm_tests=true
+  npm_mount_utils_tests=true
+  npm_grep_tests=true
+  npm_schematic_tests=true
+  emit_json
+}
+
+# ----- branch override --------------------------------------------------------
+# On release branches and the v8 snapshot cache branch all jobs must run.
+BRANCH="${CIRCLE_BRANCH:-}"
+if [[ "$BRANCH" =~ ^release/ ]] || \
+   [[ "$BRANCH" == "update-v8-snapshot-cache-on-develop" ]]; then
+  echo "Branch '$BRANCH' — running all tests" >&2
+  emit_all_true
+  exit 0
+fi
+
+# ----- develop / vN trigger-source exemption ----------------------------------
+# The nightly platform cron runs *on* the develop branch (CIRCLE_BRANCH=develop),
+# and a vN maintenance branch's scheduled build runs on that branch, so a branch
+# check alone can't tell either apart from a real push - they must stay
+# unfiltered, or path-filtering would silently gut the full sweep down to the
+# last merge's diff. Scoping filtering to genuine webhook pushes also
+# covers manual "Trigger Pipeline" reruns and run-platform-workflows=true
+# triggers for free, since those report a non-webhook trigger source too -
+# no separate check is needed for them.
+#
+# filtering_branch_push is threaded through the rest of the script instead of
+# re-testing $BRANCH at each site (diff base resolution, the empty-diff check,
+# the unrecognized-path guard) that needs to behave differently for a branch
+# push than for a PR.
+filtering_branch_push=false
+if [[ "$BRANCH" == "develop" ]] || [[ "$BRANCH" =~ ^v[0-9]+$ ]]; then
+  if [[ "${TRIGGER_SOURCE:-}" != "webhook" ]]; then
+    echo "Branch '$BRANCH' trigger source '${TRIGGER_SOURCE:-<unset>}' is not a webhook push — running all tests" >&2
+    emit_all_true
+    exit 0
+  fi
+  filtering_branch_push=true
+fi
+
+# ----- manual trigger override -----------------------------------------------
+# When run-all-jobs=true is set in the "Trigger Pipeline" UI, skip path filtering.
+RUN_ALL_RAW="${RUN_ALL_JOBS:-false}"
+if [[ "$RUN_ALL_RAW" == "true" || "$RUN_ALL_RAW" == "1" ]]; then
+  echo "run-all-jobs=true — running all jobs" >&2
+  emit_all_true
+  exit 0
+fi
+
+# ----- compute changed files --------------------------------------------------
+# --no-renames on every diff below: with rename detection on, `--name-only`
+# reports only a rename's destination, so moving a file out of a globally
+# triggering package (say packages/config/) would escape that trigger.
+#
+# Resolves the base commit for a develop/vN push. Prefers BASE_REVISION
+# (<< pipeline.git.base_revision >>) since it also covers a push that lands
+# multiple commits at once; falls back to HEAD~1, which is correct for both
+# squash merges and true merge commits (first-parent).
+# Tolerates a missing/garbage BASE_REVISION under `set -e` via the `if` guards.
+resolve_push_base() {
+  local base="${BASE_REVISION:-}"
+
+  if [[ -n "$base" ]] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+    echo "$base"
+    return 0
+  fi
+
+  if git cat-file -e "HEAD~1^{commit}" 2>/dev/null; then
+    echo "HEAD~1"
+    return 0
+  fi
+
+  return 1
+}
+
+if [[ "$filtering_branch_push" == "true" ]]; then
+  # A push's merge-base against its own upstream branch is HEAD itself (the
+  # push already landed), so the upstream-fetch logic below would always see
+  # an empty diff. Diff against the previous tip instead. The checkout in this
+  # job is blobless (full commit/tree history, blobs filtered), so this needs
+  # no extra fetch.
+  if PUSH_BASE=$(resolve_push_base); then
+    echo "Diffing $BRANCH push against $PUSH_BASE" >&2
+    CHANGED=$(git -c core.quotepath=false diff --no-renames --name-only "$PUSH_BASE" HEAD)
+  else
+    echo "Warning: could not resolve a base revision for $BRANCH push (BASE_REVISION='${BASE_REVISION:-<unset>}', HEAD~1 unavailable) — running all tests" >&2
+    emit_all_true
+    exit 0
+  fi
+else
+  # Fetch develop and the vN maintenance branches from the upstream project repo
+  # using CIRCLE_PROJECT_USERNAME/REPONAME, which CircleCI always sets to the
+  # canonical upstream (cypress-io/cypress), not the contributor's fork. This
+  # ensures fork PRs compare against the real upstream branches.
+  #
+  # CircleCI doesn't expose a PR's base branch, so diff against whichever
+  # candidate's merge-base is closest to HEAD. A PR into a vN branch would
+  # otherwise diff against develop and pick up every commit made on vN since
+  # it was cut. On a tie, develop wins.
+  UPSTREAM_URL="https://github.com/${CIRCLE_PROJECT_USERNAME:-cypress-io}/${CIRCLE_PROJECT_REPONAME:-cypress}.git"
+  MAINTENANCE_BRANCHES=$(git ls-remote --heads "$UPSTREAM_URL" 'v*' 2>/dev/null \
+    | sed 's|.*refs/heads/||' | grep -E '^v[0-9]+$' || true)
+  MERGE_BASE=""
+  MERGE_BASE_BRANCH=""
+  MERGE_BASE_DISTANCE=""
+  for candidate in develop $MAINTENANCE_BRANCHES; do
+    if ! git fetch "$UPSTREAM_URL" "+refs/heads/$candidate:refs/upstream/$candidate" 2>/dev/null; then
+      echo "Could not fetch upstream $candidate" >&2
+      continue
+    fi
+    base=$(git merge-base HEAD "refs/upstream/$candidate" 2>/dev/null) || continue
+    distance=$(git rev-list --count "$base..HEAD")
+    if [[ -z "$MERGE_BASE_DISTANCE" ]] || (( distance < MERGE_BASE_DISTANCE )); then
+      MERGE_BASE="$base"
+      MERGE_BASE_BRANCH="$candidate"
+      MERGE_BASE_DISTANCE="$distance"
+    fi
+  done
+
+  if [[ -n "$MERGE_BASE" ]]; then
+    echo "Diffing against merge base with upstream $MERGE_BASE_BRANCH ($MERGE_BASE)" >&2
+    CHANGED=$(git -c core.quotepath=false diff --no-renames --name-only "$MERGE_BASE" HEAD)
+  else
+    echo "Could not find merge base with an upstream branch, falling back to HEAD~1" >&2
+    CHANGED=$(git -c core.quotepath=false diff --no-renames --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+  fi
+fi
+
+if [[ -z "$CHANGED" ]]; then
+  if [[ "$filtering_branch_push" == "true" ]]; then
+    echo "Warning: no changed files detected for $BRANCH push — running all tests" >&2
+    emit_all_true
+    exit 0
+  fi
+  echo "Error: no changed files detected" >&2
+  exit 1
+fi
+
+echo "Changed files:" >&2
+echo "$CHANGED" >&2
+
+# ----- global triggers --------------------------------------------------------
+# Any change to these paths means every job must run.
+while IFS= read -r file; do
+  case "$file" in
+    .circleci/*|yarn.lock|package.json|packages/types/*|packages/config/*|\
+    packages/errors/*|packages/socket/*|packages/network/*|packages/ts/*|scripts/*|\
+    patches/*|packages/root/*|vitest.config.ts|gulpfile.js)
+      echo "Global trigger matched: '$file' — running all tests" >&2
+      emit_all_true
+      exit 0
+      ;;
+  esac
+done <<< "$CHANGED"
+
+# ----- targeted path mapping --------------------------------------------------
+while IFS= read -r file; do
+  case "$file" in
+    # Documentation, assets, and repo-metadata — must be first so that e.g.
+    # packages/driver/README.md doesn't match packages/driver/* below
+    *.md|*.mdx|*.txt|*.png|*.jpg|*.gif|*.svg|*.ico|\
+    LICENSE|.github/*|.gitignore|.gitattributes|.editorconfig|\
+    guides/*|assets/*|\
+    eslint.config.ts|.prettierignore|.nvmrc|.node-version|.npmrc|.yarnclean|\
+    .percy.yml|.releaserc.js|renovate.json|docker-compose.yml|lerna.json|\
+    electron-builder.json|knip.json|nx.json|jsconfig.json|autobarrel.json|\
+    mocha-reporter-config.json|apollo.config.js|\
+    .husky/*|.vscode/*|.cursor/*|.claude/*|__snapshots__/*)
+      ;;
+    packages/driver/*)
+      driver_tests=true
+      system_tests=true
+      ;;
+    packages/server/*)
+      server_tests=true
+      system_tests=true
+      unit_tests=true
+      ;;
+    packages/proxy/*)
+      server_tests=true
+      system_tests=true
+      ;;
+    packages/net-stubbing/*)
+      server_tests=true
+      driver_tests=true
+      system_tests=true
+      ;;
+    packages/network-interception/*)
+      server_tests=true
+      driver_tests=true
+      system_tests=true
+      ;;
+    packages/https-proxy/*)
+      server_tests=true
+      system_tests=true
+      ;;
+    packages/app/*)
+      app_ui_tests=true
+      system_tests=true
+      ;;
+    packages/launchpad/*)
+      launchpad_tests=true
+      system_tests=true
+      ;;
+    packages/reporter/*)
+      reporter_tests=true
+      app_ui_tests=true
+      system_tests=true
+      ;;
+    packages/frontend-shared/*)
+      frontend_shared_tests=true
+      app_ui_tests=true
+      launchpad_tests=true
+      reporter_tests=true
+      system_tests=true
+      ;;
+    packages/data-context/*)
+      app_ui_tests=true
+      launchpad_tests=true
+      server_tests=true
+      system_tests=true
+      unit_tests=true
+      ;;
+    packages/agent-info/*)
+      cli_tests=true
+      unit_tests=true
+      ;;
+    packages/cypress-sessions/*)
+      app_ui_tests=true
+      cli_tests=true
+      server_tests=true
+      system_tests=true
+      unit_tests=true
+      ;;
+    packages/runner/*)
+      driver_tests=true
+      app_ui_tests=true
+      system_tests=true
+      ;;
+    packages/web-config/*)
+      driver_tests=true
+      app_ui_tests=true
+      system_tests=true
+      ;;
+    packages/electron/*)
+      driver_tests=true
+      system_tests=true
+      ;;
+    packages/extension/*)
+      # Extension is a browser WebExtension; driver tests only need to run in Firefox.
+      # TODO: introduce a run-firefox-driver-tests parameter to avoid running all browser variants.
+      driver_tests=true
+      system_tests=true
+      ;;
+    packages/launcher/*)
+      system_tests=true
+      ;;
+    packages/scaffold-config/*)
+      launchpad_tests=true
+      system_tests=true
+      ;;
+    packages/resolve-dist/*)
+      app_ui_tests=true
+      launchpad_tests=true
+      ;;
+    packages/telemetry/*)
+      driver_tests=true
+      server_tests=true
+      app_ui_tests=true
+      system_tests=true
+      ;;
+    packages/network-tools/*)
+      driver_tests=true
+      server_tests=true
+      system_tests=true
+      ;;
+    packages/packherd-require/*)
+      v8_tests=true
+      ;;
+    packages/v8-snapshot-require/*)
+      v8_tests=true
+      ;;
+    packages/stderr-filtering/*)
+      server_tests=true
+      app_ui_tests=true
+      launchpad_tests=true
+      system_tests=true
+      ;;
+    packages/icons/*)
+      driver_tests=true
+      server_tests=true
+      app_ui_tests=true
+      system_tests=true
+      ;;
+    cli/*)
+      cli_tests=true
+      unit_tests=true
+      ;;
+    system-tests/*)
+      system_tests=true
+      ;;
+    tooling/*)
+      v8_tests=true
+      ;;
+    npm/webpack-dev-server/*)
+      npm_webpack_dev_server_tests=true
+      system_tests=true
+      ;;
+    npm/vite-dev-server/*)
+      npm_vite_dev_server_tests=true
+      system_tests=true
+      ;;
+    npm/webpack-preprocessor/*)
+      npm_webpack_preprocessor_tests=true
+      system_tests=true
+      ;;
+    npm/webpack-batteries-included-preprocessor/*)
+      npm_webpack_batteries_tests=true
+      system_tests=true
+      ;;
+    npm/vue/*)
+      npm_vue_tests=true
+      system_tests=true
+      ;;
+    npm/react/*)
+      npm_react_tests=true
+      system_tests=true
+      ;;
+    npm/angular/*)
+      npm_angular_tests=true
+      system_tests=true
+      ;;
+    npm/svelte/*)
+      system_tests=true
+      ;;
+    npm/puppeteer/*)
+      npm_puppeteer_tests=true
+      system_tests=true
+      ;;
+    npm/vite-plugin-cypress-esm/*)
+      npm_vite_plugin_esm_tests=true
+      system_tests=true
+      ;;
+    npm/mount-utils/*)
+      npm_mount_utils_tests=true
+      system_tests=true
+      ;;
+    npm/grep/*)
+      npm_grep_tests=true
+      system_tests=true
+      ;;
+    npm/cypress-schematic/*)
+      npm_schematic_tests=true
+      system_tests=true
+      ;;
+    packages/example/*)
+      unit_tests=true
+      ;;
+    packages/eslint-config/*|npm/xpath/*)
+      # No CI jobs are associated with these packages — no tests to run
+      ;;
+    *)
+      # Unrecognized path. On a PR, fail loudly so the mapping is kept up to
+      # date — add the new path to one of the cases above rather than
+      # silently skipping tests. On a branch push, the merge already passed
+      # PR CI, so failing the merge pipeline over an unmapped path is worse
+      # than over-running it — fall back to running everything instead.
+      if [[ "$filtering_branch_push" == "true" ]]; then
+        echo "Warning: unrecognized path '$file' has no mapping in generate-pipeline-parameters.sh — running all tests" >&2
+        echo "Add it to the targeted path mapping section when convenient." >&2
+        emit_all_true
+        exit 0
+      fi
+      echo "Error: unrecognized path '$file' has no mapping in generate-pipeline-parameters.sh" >&2
+      echo "Add it to the targeted path mapping section before merging." >&2
+      exit 1
+      ;;
+  esac
+done <<< "$CHANGED"
+
+# ----- emit result ------------------------------------------------------------
+echo "Emitting pipeline parameters" >&2
+emit_json

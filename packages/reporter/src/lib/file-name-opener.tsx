@@ -1,28 +1,40 @@
 import { observer } from 'mobx-react'
 import React from 'react'
-// @ts-ignore
-import Tooltip from '@cypress/react-tooltip'
-import { FileDetails } from '@packages/ui-components'
+import type { FileDetails } from '@packages/types'
+import Tooltip from './tooltip'
 
-import FileOpener from './file-opener'
+import TextIcon from '@packages/frontend-shared/src/assets/icons/document-text_x16.svg'
+import OpenFileInIDE from './open-file-in-ide'
 
 interface Props {
   fileDetails: FileDetails
   className?: string
+  hasIcon?: boolean
 }
 
-const FileNameOpener = observer((props: Props) => {
-  const { originalFile, line, column } = props.fileDetails
+/**
+ * Renders a link-style element that presents a tooltip on hover
+ * and opens the file in an external editor when selected.
+ */
+const FileNameOpener: React.FC<Props> = observer((props: Props) => {
+  const { displayFile, originalFile, line, column } = props.fileDetails
 
   return (
     <Tooltip title={'Open in IDE'} wrapperClassName={props.className} className='cy-tooltip'>
       <span>
-        <FileOpener fileDetails={props.fileDetails}>
-          {originalFile}{!!line && `:${line}`}{!!column && `:${column}`}
-        </FileOpener>
+        <OpenFileInIDE fileDetails={props.fileDetails} >
+          <a href="#" onClick={(e) => e.preventDefault()}>
+            {props.hasIcon && (
+              <TextIcon />
+            )}
+            {displayFile || originalFile}{!!line && `:${line}`}{!!column && `:${column}`}
+          </a>
+        </OpenFileInIDE>
       </span>
     </Tooltip>
   )
 })
+
+FileNameOpener.displayName = 'FileNameOpener'
 
 export default FileNameOpener

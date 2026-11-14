@@ -1,4 +1,3 @@
-// @ts-nocheck
 import _ from 'lodash'
 import Promise from 'bluebird'
 
@@ -9,31 +8,33 @@ import $utils from '../../../cypress/utils'
 import $errUtils from '../../../cypress/error_utils'
 import $actionability from '../../actionability'
 import $Keyboard from '../../../cy/keyboard'
+
 import debugFn from 'debug'
 const debug = debugFn('cypress:driver:command:type')
 
 export default function (Commands, Cypress, cy, state, config) {
   const { keyboard } = cy.devices
 
-  function type (subject, chars, options = {}) {
-    const userOptions = options
+  function type (subject: any, chars: any, userOptions: Partial<InternalTypeOptions> = {}) {
     let updateTable
 
     // allow the el we're typing into to be
     // changed by options -- used by cy.clear()
-    options = _.defaults({}, userOptions, {
+    const options: InternalTypeOptions = _.defaults({}, userOptions, {
       $el: subject,
       log: true,
       verify: true,
       force: false,
-      delay: config('keystrokeDelay') || $Keyboard.getConfig().keystrokeDelay,
+      delay: config('keystrokeDelay') ?? $Keyboard.getConfig().keystrokeDelay ?? 0,
       release: true,
       parseSpecialCharSequences: true,
       waitForAnimations: config('waitForAnimations'),
       animationDistanceThreshold: config('animationDistanceThreshold'),
     })
 
-    if (options.log) {
+    // if this instance is not present, create a log instance for cy.type()
+    // cy.clear passes in their log instance
+    if (!options._log) {
       // figure out the options which actually change the behavior of clicks
       const deltaOptions = $utils.filterOutOptions(options)
 
@@ -74,19 +75,14 @@ export default function (Commands, Cypress, cy, state, config) {
         }
       }
 
-      // transform table object into object with zero based index as keys
       const getTableData = () => {
-        return _.reduce(_.values(table), (memo, value, index) => {
-          memo[index + 1] = value
-
-          return memo
-        }
-        , {})
+        return _.values(table)
       }
 
       options._log = Cypress.log({
         message: [chars, deltaOptions],
         $el: options.$el,
+        hidden: options.log === false,
         timeout: options.timeout,
         consoleProps () {
           return {
@@ -107,7 +103,7 @@ export default function (Commands, Cypress, cy, state, config) {
         },
       })
 
-      options._log.snapshot('before', { next: 'after' })
+      options._log?.snapshot('before', { next: 'after' })
     }
 
     if (options.$el.length > 1) {
@@ -132,7 +128,7 @@ export default function (Commands, Cypress, cy, state, config) {
     }
 
     const isInvalidDelay = (delay) => {
-      return delay !== undefined && (!_.isNumber(delay) || delay < 0)
+      return delay != null && (!_.isNumber(delay) || delay < 0)
     }
 
     if (isInvalidDelay(userOptions.delay)) {
@@ -160,7 +156,15 @@ export default function (Commands, Cypress, cy, state, config) {
     const win = state('window')
 
     const getDefaultButtons = (form) => {
-      return form.find('input, button').filter((__, el) => {
+      const formId = CSS.escape(form.attr('id'))
+      const nestedButtons = form.find('input, button')
+
+      const possibleDefaultButtons: JQuery<any> = formId ? $dom.wrap(_.uniq([
+        ...nestedButtons,
+        ...$dom.query('body', form.prop('ownerDocument')).find(`input[form="${formId}"], button[form="${formId}"]`),
+      ])) : nestedButtons
+
+      return possibleDefaultButtons.filter((__, el) => {
         const $el = $dom.wrap(el)
 
         return (
@@ -228,11 +232,9 @@ export default function (Commands, Cypress, cy, state, config) {
           return
         }
 
-        // In Firefox, submit event is automatically fired
-        // when we send {Enter} KeyboardEvent to the input fields.
-        // Because of that, we don't have to click the submit buttons.
-        // Otherwise, we trigger submit events twice.
-        if (!Cypress.isBrowser('firefox')) {
+        // WebKit will send the submit with an Enter keypress event,
+        // so we do need to click the default button in this case.
+        if (!Cypress.isBrowser('webkit')) {
           // issue the click event to the 'default button' of the form
           // we need this to be synchronous so not going through our
           // own click command
@@ -240,7 +242,7 @@ export default function (Commands, Cypress, cy, state, config) {
           // on the button will indeed trigger the form submit event
           // so we dont need to fire it manually anymore!
           if (!clickedDefaultButton(defaultButton)) {
-            // if we werent able to click the default button
+            // if we weren't able to click the default button
             // then synchronously fire the submit event
             // currently this is sync but if we use a waterfall
             // promise in the submit command it will break again
@@ -271,6 +273,15 @@ export default function (Commands, Cypress, cy, state, config) {
 
       const isContentEditable = $elements.isContentEditable(options.$el.get(0))
       const isTextarea = $elements.isTextarea(options.$el.get(0))
+
+      const fireClickEvent = (el) => {
+        const ctor = $dom.getDocumentFromElement(el).defaultView!.PointerEvent
+        const event = new ctor('click', { composed: true })
+
+        el.dispatchEvent(event)
+      }
+
+      let keydownEvents: any[] = []
 
       return keyboard.type({
         $el: options.$el,
@@ -312,7 +323,40 @@ export default function (Commands, Cypress, cy, state, config) {
           }
         },
 
-        onEvent: updateTable || _.noop,
+        onEvent (id, key, event, value) {
+          if (updateTable) {
+            updateTable(id, key, event, value)
+          }
+
+          if (event.type === 'keydown') {
+            keydownEvents.push(event.target)
+          }
+
+          if (
+            (
+              !Cypress.isBrowser('firefox') ||
+              // Firefox no longer sends click events automatically for <button>
+              // and <input> elements, so we have to send them ourselves.
+              // event.target is null when the element is within the shadow DOM
+              (event.target && ($elements.isButton(event.target) || $elements.isInput(event.target)))
+            ) &&
+            // Click event is sent after keyup event with space key.
+            event.type === 'keyup' && event.code === 'Space' &&
+            // When event is prevented, the click event should not be emitted
+            !event.defaultPrevented &&
+            // Click events should be only sent to button-like elements.
+            // event.target is null when used with shadow DOM.
+            (event.target && $elements.isButtonLike(event.target)) &&
+            // When a space key is pressed for input radio elements, the click event is only fired when it's not checked.
+            !(event.target.tagName === 'INPUT' && event.target.type === 'radio' && event.target.checked === true) &&
+            // When a space key is pressed on another element, the click event should not be fired.
+            keydownEvents.includes(event.target)
+          ) {
+            fireClickEvent(event.target)
+
+            keydownEvents = []
+          }
+        },
 
         // fires only when the 'value'
         // of input/text/contenteditable
@@ -321,7 +365,7 @@ export default function (Commands, Cypress, cy, state, config) {
           debug('onValueChange', originalText, el)
           // contenteditable should never be called here.
           // only inputs and textareas can have change events
-          let changeEvent = state('changeEvent')
+          const changeEvent = state('changeEvent')
 
           if (changeEvent) {
             if (!changeEvent(null, true)) {
@@ -347,13 +391,31 @@ export default function (Commands, Cypress, cy, state, config) {
           })
         },
 
-        onEnterPressed (id) {
+        onEnterPressed (el) {
           // dont dispatch change events or handle
           // submit event if we've pressed enter into
           // a textarea or contenteditable
-
           if (isTextarea || isContentEditable) {
             return
+          }
+
+          // click event is only fired on button, image, submit, reset elements.
+          // That's why we cannot use $elements.isButtonLike() here.
+          const type = (type) => $elements.isInputType(el, type)
+          const sendClickEvent = type('button') || type('image') || type('submit') || type('reset')
+
+          // https://github.com/cypress-io/cypress/issues/19541
+          // Send click event on type('{enter}')
+          if (sendClickEvent) {
+            if (
+              !Cypress.isBrowser('firefox') ||
+              // Firefox no longer sends click events automatically for <input>
+              // and <button> elements, so we have to send them ourselves.
+              $elements.isInput(el) ||
+              $elements.isButton(el)
+            ) {
+              fireClickEvent(el)
+            }
           }
 
           // if our value has changed since our
@@ -362,7 +424,7 @@ export default function (Commands, Cypress, cy, state, config) {
           const changeEvent = state('changeEvent')
 
           if (changeEvent) {
-            changeEvent(id)
+            changeEvent()
           }
 
           // handle submit event handler here
@@ -381,6 +443,8 @@ export default function (Commands, Cypress, cy, state, config) {
         },
       })
     }
+
+    const subjectChain = cy.subjectChain()
 
     const handleFocused = function () {
       // if it's the body, don't need to worry about focus
@@ -415,6 +479,8 @@ export default function (Commands, Cypress, cy, state, config) {
       }
 
       return $actionability.verify(cy, options.$el, config, options, {
+        subjectFn: () => cy.getSubjectFromChain(subjectChain),
+
         onScroll ($el, type) {
           return Cypress.action('cy:scrolled', $el, type)
         },
@@ -433,7 +499,6 @@ export default function (Commands, Cypress, cy, state, config) {
           // cannot just call .focus, since children of contenteditable will not receive cursor
           // with .focus()
           return cy.now('click', $elToClick, {
-            $el: $elToClick,
             log: false,
             verify: false,
             _log: options._log,
@@ -442,9 +507,10 @@ export default function (Commands, Cypress, cy, state, config) {
             interval: options.interval,
             errorOnSelect: false,
             scrollBehavior: options.scrollBehavior,
+            subjectFn: () => $elToClick,
           })
           .then(() => {
-            let activeElement = $elements.getActiveElByDocument($elToClick)
+            const activeElement = $elements.getActiveElByDocument($elToClick)
 
             if (!options.force && activeElement === null) {
               const node = $dom.stringify($elToClick)
@@ -494,10 +560,8 @@ export default function (Commands, Cypress, cy, state, config) {
     })
   }
 
-  function clear (subject, options = {}) {
-    const userOptions = options
-
-    options = _.defaults({}, userOptions, {
+  function clear (subject, userOptions: Partial<InternalClearOptions> = {}) {
+    const options: InternalClearOptions = _.defaults({}, userOptions, {
       log: true,
       force: false,
       waitForAnimations: config('waitForAnimations'),
@@ -509,23 +573,22 @@ export default function (Commands, Cypress, cy, state, config) {
     const clear = function (el) {
       const $el = $dom.wrap(el)
 
-      if (options.log) {
-        // figure out the options which actually change the behavior of clicks
-        const deltaOptions = $utils.filterOutOptions(options)
+      // figure out the options which actually change the behavior of clicks
+      const deltaOptions = $utils.filterOutOptions(options)
 
-        options._log = Cypress.log({
-          message: deltaOptions,
-          $el,
-          timeout: options.timeout,
-          consoleProps () {
-            return {
-              'Applied To': $dom.getElements($el),
-              'Elements': $el.length,
-              'Options': deltaOptions,
-            }
-          },
-        })
-      }
+      options._log = Cypress.log({
+        message: deltaOptions,
+        $el,
+        hidden: options.log === false,
+        timeout: options.timeout,
+        consoleProps () {
+          return {
+            'Applied To': $dom.getElements($el),
+            'Elements': $el.length,
+            'Options': deltaOptions,
+          }
+        },
+      })
 
       const callTypeCmd = ($el) => {
         return cy.now('type', $el, '{selectall}{del}', {
@@ -574,7 +637,7 @@ export default function (Commands, Cypress, cy, state, config) {
           },
 
           onReady ($elToClick) {
-            let activeElement = $elements.getActiveElByDocument($elToClick)
+            const activeElement = $elements.getActiveElByDocument($elToClick)
 
             if (!options.force && activeElement === null || !$dom.isTextLike($elToClick.get(0))) {
               throwError($el)

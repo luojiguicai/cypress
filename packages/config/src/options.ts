@@ -1,0 +1,814 @@
+import os from 'os'
+import path from 'path'
+import pkg from '@packages/root'
+import type { AllCypressErrorNames } from '@packages/errors'
+import type { TestingType } from '@packages/types'
+
+import * as validate from './validation'
+
+/**
+ * When adding a new config option, ensure the following steps are taken:
+ * - Add the option to the appropriate array
+ * - Add the type definition to `/cli/types/cypress.d.ts`
+ * - Ensure the `results_spec` system test passes with updated snapshots
+ * - Ensure the config package tests pass with updated snapshots
+ *
+ * Additionally, for experiments:
+ * - add name and description copy to `/packages/app/src/settings/project/Experiments.vue`
+ */
+
+const _BREAKING_OPTION_ERROR_KEY: Readonly<AllCypressErrorNames[]> = [
+  'CONFIG_FILE_INVALID_ROOT_CONFIG',
+  'CONFIG_FILE_INVALID_ROOT_CONFIG_E2E',
+  'CONFIG_FILE_INVALID_ROOT_CONFIG_COMPONENT',
+  'CONFIG_FILE_INVALID_TESTING_TYPE_CONFIG_COMPONENT',
+  'CONFIG_FILE_INVALID_TESTING_TYPE_CONFIG_E2E',
+  'EXPERIMENTAL_SESSION_AND_ORIGIN_REMOVED',
+  'EXPERIMENTAL_SINGLE_TAB_RUN_MODE',
+  'VIDEO_UPLOAD_ON_PASSES_REMOVED',
+  'RENAMED_CONFIG_OPTION',
+  'EXPERIMENTAL_STUDIO_REMOVED',
+  'EXPERIMENTAL_PROMPT_COMMAND_REMOVED',
+  'EXPERIMENTAL_SOURCE_REWRITING_REMOVED',
+  'ALLOW_CYPRESS_ENV_REMOVED',
+  'EXEC_TIMEOUT_REMOVED',
+  'EXPERIMENTAL_FAST_VISIBILITY_RENAMED',
+  'VISIBILITY_STRATEGY_DEPRECATION',
+  'EXPERIMENTAL_MEMORY_MANAGEMENT_REMOVED',
+] as const
+
+type ValidationOptions = {
+  testingType: TestingType | null
+}
+
+export type BreakingOptionErrorKey = typeof _BREAKING_OPTION_ERROR_KEY[number]
+
+/**
+ * Where a configuration option is allowed to be overridden at test time:
+ * - `any`: suite-level overrides, test-level overrides, and at run-time via `Cypress.config()`.
+ * - `suiteOrTest`: suite-level and test-level overrides only. Cannot be set via `Cypress.config()`
+ *    while a test is executing.
+ * - `suite`: suite-level overrides only.
+ * - `never`: cannot be overridden at test time.
+ */
+export type OverrideLevel = 'any' | 'suiteOrTest' | 'suite' | 'never'
+
+/**
+ * The context in which a test-time config change is being applied: `suite`/`test` for
+ * `describe`/`it` config overrides, `runtime` for a `Cypress.config()` call while a test is
+ * executing, and `undefined` for anything else (support/spec file load or a `test:before:run` event).
+ */
+export type OverrideContext = 'suite' | 'test' | 'runtime' | undefined
+
+interface ConfigOption {
+  name: string
+  defaultValue?: any
+  validation: (key: string, value: any, opts: ValidationOptions) => validate.ValidationResult
+  requireRestartOnChange?: 'server' | 'browser'
+  /**
+   * The list of test-time overrides levels supported by the configuration option. When undefined,
+   * it indicates the configuration value cannot be overridden via suite-/test-specific
+   * overrides or at run-time with Cypress.Config().
+   */
+  overrideLevel?: OverrideLevel
+}
+
+interface DriverConfigOption extends ConfigOption {
+  isFolder?: boolean
+  isExperimental?: boolean
+}
+
+// Cypress run-time options
+interface RuntimeConfigOption extends ConfigOption {
+  defaultValue: any
+  isInternal?: boolean
+}
+
+export interface BreakingOption {
+  /**
+   * The non-passive configuration option.
+   */
+  name: string
+  /**
+   * String to summarize the error messaging that is logged.
+   */
+  errorKey: BreakingOptionErrorKey
+  /**
+   * Array of testing types this config option is valid for
+   */
+  testingTypes?: TestingType[]
+  /**
+   * Configuration value of the configuration option to check against.
+   */
+  value?: string
+  /**
+   * The new configuration key that is replacing the existing configuration key.
+   */
+  newName?: string
+  /**
+   * Whether to log the error message as a warning instead of throwing an error.
+   */
+  isWarning?: boolean
+  /**
+   * Whether to display or throw the error message based on the configuration value present.
+   */
+  shouldDisplayOrThrow?: (value: any) => boolean
+}
+
+const isValidConfig = (testingType: string, config: any, opts: ValidationOptions) => {
+  const status = validate.isPlainObject(testingType, config)
+
+  if (status !== true) {
+    return status
+  }
+
+  for (const rule of options) {
+    if (rule.name in config && rule.validation) {
+      const status = rule.validation(`${testingType}.${rule.name}`, config[rule.name], opts)
+
+      if (status !== true) {
+        return status
+      }
+    }
+  }
+
+  return true
+}
+
+export const defaultSpecPattern = {
+  e2e: 'cypress/e2e/**/*.cy.{js,jsx,ts,tsx}',
+  component: '**/*.cy.{js,jsx,ts,tsx}',
+}
+
+export const defaultExcludeSpecPattern = {
+  e2e: '*.hot-update.js',
+  component: ['**/__snapshots__/*', '**/__image_snapshots__/*'],
+}
+
+// NOTE:
+// If you add/remove/change a config value, make sure to update the following
+// - cli/types/index.d.ts (including allowed config options on TestOptions)
+//
+// Add options in alphabetical order for better readability
+const driverConfigOptions: Array<DriverConfigOption> = [
+  {
+    name: 'animationDistanceThreshold',
+    defaultValue: 5,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'arch',
+    defaultValue: () => os.arch(),
+    validation: validate.isString,
+  }, {
+    name: 'baseUrl',
+    defaultValue: null,
+    validation: validate.isFullyQualifiedUrl,
+    overrideLevel: 'any',
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'blockHosts',
+    defaultValue: null,
+    validation: validate.isStringOrArrayOfStrings,
+    overrideLevel: 'suiteOrTest',
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'chromeWebSecurity',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'browser',
+  }, {
+    name: 'clientCertificates',
+    defaultValue: [],
+    validation: validate.isValidClientCertificatesSet,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'component',
+    // runner-ct overrides
+    defaultValue: {
+      specPattern: defaultSpecPattern.component,
+      indexHtmlFile: 'cypress/support/component-index.html',
+    },
+    validation: isValidConfig,
+  }, {
+    name: 'defaultBrowser',
+    defaultValue: null,
+    validation: validate.isString,
+  }, {
+    name: 'defaultCommandTimeout',
+    defaultValue: 4000,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'downloadsFolder',
+    defaultValue: 'cypress/downloads',
+    validation: validate.isString,
+    isFolder: true,
+    requireRestartOnChange: 'browser',
+  }, {
+    name: 'e2e',
+    // e2e runner overrides
+    defaultValue: {
+      specPattern: defaultSpecPattern.e2e,
+    },
+    validation: isValidConfig,
+  }, {
+    name: 'env',
+    defaultValue: {},
+    validation: validate.isPlainObject,
+    overrideLevel: 'never',
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'expose',
+    defaultValue: {},
+    validation: validate.isPlainObject,
+    overrideLevel: 'any',
+  }, {
+    name: 'experimentalCspAllowList',
+    defaultValue: false,
+    validation: validate.validateAny(validate.isBoolean, validate.isArrayIncludingAny('script-src-elem', 'script-src', 'default-src', 'form-action', 'child-src', 'frame-src')),
+    overrideLevel: 'never',
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'experimentalInteractiveRunEvents',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isExperimental: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'experimentalRunAllSpecs',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isExperimental: true,
+  }, {
+    name: 'experimentalModifyObstructiveThirdPartyCode',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isExperimental: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'injectDocumentDomain',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'experimentalOriginDependencies',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isExperimental: true,
+    overrideLevel: 'any',
+    requireRestartOnChange: 'browser',
+  }, {
+    name: 'experimentalSingleTabRunMode',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isExperimental: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'experimentalWebKitSupport',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isExperimental: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'visibilityStrategy',
+    defaultValue: 'modern',
+    validation: validate.isOneOf('legacy', 'modern'),
+    overrideLevel: 'any',
+  }, {
+    name: 'fileServerFolder',
+    defaultValue: '',
+    validation: validate.isString,
+    isFolder: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'fixturesFolder',
+    defaultValue: 'cypress/fixtures',
+    validation: validate.isStringOrFalse,
+    isFolder: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'forceHttp1',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'excludeSpecPattern',
+    defaultValue: (options: Record<string, any> = {}) => options.testingType === 'component' ? defaultExcludeSpecPattern.component : defaultExcludeSpecPattern.e2e,
+    validation: validate.isStringOrArrayOfStrings,
+    overrideLevel: 'any',
+  }, {
+    name: 'includeShadowDom',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    overrideLevel: 'any',
+  }, {
+    name: 'justInTimeCompile',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'keystrokeDelay',
+    defaultValue: null,
+    validation: validate.isNumberOrFalse,
+    overrideLevel: 'any',
+  }, {
+    name: 'manageBrowserMemory',
+    defaultValue: true,
+    validation: validate.isBoolean,
+  }, {
+    name: 'modifyObstructiveCode',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'numTestsKeptInMemory',
+    defaultValue: 50,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'platform',
+    defaultValue: () => os.platform(),
+    validation: validate.isString,
+  }, {
+    name: 'pageLoadTimeout',
+    defaultValue: 60000,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'port',
+    defaultValue: null,
+    validation: validate.isValidPort,
+  }, {
+    name: 'projectId',
+    defaultValue: null,
+    validation: validate.isString,
+  }, {
+    name: 'redirectionLimit',
+    defaultValue: 20,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'removeSRIAttributes',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'reporter',
+    defaultValue: 'spec',
+    validation: validate.isString,
+    overrideLevel: 'any',
+  }, {
+    name: 'reporterOptions',
+    defaultValue: null,
+    validation: validate.isPlainObject,
+    overrideLevel: 'any',
+  }, {
+    name: 'requestTimeout',
+    defaultValue: 5000,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'resolvedNodePath',
+    defaultValue: null,
+    validation: validate.isString,
+  }, {
+    name: 'resolvedNodeVersion',
+    defaultValue: null,
+    validation: validate.isString,
+  }, {
+    name: 'responseTimeout',
+    defaultValue: 30000,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    /**
+     * if experimentalStrategy is `detect-flake-and-pass-on-threshold`
+     * an no experimentalOptions are configured, the following configuration
+     * should be implicitly used:
+     * experimentalStrategy: 'detect-flake-and-pass-on-threshold',
+     * experimentalOptions: {
+     *   maxRetries: 2,
+     *   passesRequired: 2
+     * }
+     *
+     * if experimentalStrategy is `detect-flake-but-always-fail`
+     * an no experimentalOptions are configured, the following configuration
+     * should be implicitly used:
+     * experimentalStrategy: 'detect-flake-but-always-fail',
+     * experimentalOptions: {
+     *   maxRetries: 2,
+     *   stopIfAnyPassed: false
+     * }
+     */
+    name: 'retries',
+    defaultValue: {
+      runMode: 0,
+      openMode: 0,
+      // these values MUST be populated in order to display the experiment correctly inside the project settings in open mode
+      experimentalStrategy: undefined,
+      experimentalOptions: undefined,
+    },
+    validation: validate.isValidRetriesConfig,
+    overrideLevel: 'any',
+  }, {
+    name: 'screenshotOnRunFailure',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    overrideLevel: 'any',
+  }, {
+    name: 'screenshotsFolder',
+    defaultValue: 'cypress/screenshots',
+    validation: validate.isStringOrFalse,
+    isFolder: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'slowTestThreshold',
+    defaultValue: (options: Record<string, any> = {}) => options.testingType === 'component' ? 250 : 10000,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'scrollBehavior',
+    defaultValue: 'top',
+    validation: validate.isValidScrollBehavior,
+    overrideLevel: 'any',
+  }, {
+    name: 'supportFile',
+    defaultValue: (options: Record<string, any> = {}) => options.testingType === 'component' ? 'cypress/support/component.{js,jsx,ts,tsx}' : 'cypress/support/e2e.{js,jsx,ts,tsx}',
+    validation: validate.isStringOrFalse,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'supportFolder',
+    defaultValue: false,
+    validation: validate.isStringOrFalse,
+    isFolder: true,
+    requireRestartOnChange: 'server',
+  }, {
+    name: 'taskTimeout',
+    defaultValue: 60000,
+    validation: validate.isNumber,
+    overrideLevel: 'any',
+  }, {
+    name: 'testIsolation',
+    defaultValue: true,
+    validation: (key: string, value: any, opts: ValidationOptions) => {
+      const { testingType } = opts
+
+      const configOpts = [true, false]
+
+      if (testingType === 'component') {
+        configOpts.pop()
+      }
+
+      return validate.isOneOf(...configOpts)(key, value)
+    },
+    overrideLevel: 'suite',
+  }, {
+    name: 'trashAssetsBeforeRuns',
+    defaultValue: true,
+    validation: validate.isBoolean,
+  }, {
+    name: 'trustedCertificates',
+    defaultValue: [],
+    validation: validate.isValidTrustedCertificates,
+    requireRestartOnChange: 'browser',
+  }, {
+    name: 'userAgent',
+    defaultValue: null,
+    validation: validate.isString,
+    requireRestartOnChange: 'browser',
+  }, {
+    name: 'video',
+    defaultValue: false,
+    validation: validate.isBoolean,
+  }, {
+    name: 'videoCompression',
+    defaultValue: false,
+    validation: validate.isValidCrfOrBoolean,
+  }, {
+    name: 'videosFolder',
+    defaultValue: 'cypress/videos',
+    validation: validate.isString,
+    isFolder: true,
+  }, {
+    name: 'viewportHeight',
+    defaultValue: (options: Record<string, any> = {}) => options.testingType === 'component' ? 500 : 660,
+    validation: validate.isNumber,
+    overrideLevel: 'suiteOrTest',
+  }, {
+    name: 'viewportWidth',
+    defaultValue: (options: Record<string, any> = {}) => options.testingType === 'component' ? 500 : 1000,
+    validation: validate.isNumber,
+    overrideLevel: 'suiteOrTest',
+  }, {
+    name: 'waitForAnimations',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    overrideLevel: 'any',
+  }, {
+    name: 'watchForFileChanges',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    requireRestartOnChange: 'server',
+  },
+  {
+    name: 'specPattern',
+    defaultValue: (options: Record<string, any> = {}) => options.testingType === 'component' ? defaultSpecPattern.component : defaultSpecPattern.e2e,
+    validation: validate.isStringOrArrayOfStrings,
+  },
+]
+
+const runtimeOptions: Array<RuntimeConfigOption> = [
+  {
+    // Internal config field, useful to ignore the e2e specPattern set by the user
+    // or the default one when looking fot CT, it needs to be a config property because after
+    // having the final config that has the e2e property flattened/compacted
+    // we may not be able to get the value to ignore.
+    name: 'additionalIgnorePattern',
+    defaultValue: (options: Record<string, any> = {}): string | any[] => options.testingType === 'component' ? defaultSpecPattern.e2e : [],
+    validation: validate.isStringOrArrayOfStrings,
+    isInternal: true,
+  }, {
+    name: 'autoOpen',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isInternal: true,
+  }, {
+    name: 'browsers',
+    defaultValue: [],
+    validation: validate.isValidBrowserList,
+  }, {
+    name: 'clientRoute',
+    defaultValue: '/__/',
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'configFile',
+    defaultValue: 'cypress.config.js',
+    validation: validate.isString,
+    // not truly internal, but can only be set via cli,
+    // so we don't consider it a "public" option
+    isInternal: true,
+  }, {
+    name: 'cypressBinaryRoot',
+    defaultValue: path.join(__dirname, '..', '..', '..'),
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    // ct-testing specific configuration
+    name: 'devServerPublicPathRoute',
+    defaultValue: '/__cypress/src',
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'hosts',
+    defaultValue: null,
+    validation: validate.isPlainObject,
+  }, {
+    name: 'isInteractive',
+    // `isInteractive` is the inverse of `isTextTerminal`, which run mode sets
+    // to `true`. Deriving it from the mode options ensures plugins /
+    // setupNodeEvents receive the correct value rather than a static default.
+    // https://github.com/cypress-io/cypress/issues/20789
+    defaultValue: (options: Record<string, any> = {}) => !options.isTextTerminal,
+    validation: validate.isBoolean,
+  }, {
+    name: 'isTextTerminal',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isInternal: true,
+  }, {
+    name: 'morgan',
+    defaultValue: true,
+    validation: validate.isBoolean,
+    isInternal: true,
+  }, {
+    name: 'modifyObstructiveCode',
+    defaultValue: true,
+    validation: validate.isBoolean,
+  }, {
+    name: 'namespace',
+    defaultValue: '__cypress',
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'repoRoot',
+    defaultValue: null,
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'reporterRoute',
+    defaultValue: '/__cypress/reporter',
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'socketId',
+    defaultValue: null,
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'socketIoCookie',
+    defaultValue: '__socket',
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'socketIoRoute',
+    defaultValue: '/__socket',
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'version',
+    defaultValue: pkg.version,
+    validation: validate.isString,
+    isInternal: true,
+  }, {
+    name: 'isDefaultProtocolEnabled',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isInternal: true,
+  }, {
+    name: 'hideCommandLog',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isInternal: true,
+  },
+  {
+    name: 'hideRunnerUi',
+    defaultValue: false,
+    validation: validate.isBoolean,
+    isInternal: true,
+  },
+]
+
+export const options: Array<DriverConfigOption | RuntimeConfigOption> = [
+  ...driverConfigOptions,
+  ...runtimeOptions,
+]
+
+/**
+ * Values not allowed in 10.X+ in the root, e2e or component config
+ */
+export const breakingOptions: Readonly<BreakingOption[]> = [
+  {
+    name: 'experimentalJustInTimeCompile',
+    errorKey: 'EXPERIMENTAL_JIT_COMPILE_REMOVED',
+    isWarning: true,
+  }, {
+    name: 'experimentalSessionAndOrigin',
+    errorKey: 'EXPERIMENTAL_SESSION_AND_ORIGIN_REMOVED',
+    isWarning: true,
+  }, {
+    name: 'experimentalSkipDomainInjection',
+    errorKey: 'EXPERIMENTAL_SKIP_DOMAIN_INJECTION_REMOVED',
+    isWarning: false,
+  }, {
+    name: 'videoUploadOnPasses',
+    errorKey: 'VIDEO_UPLOAD_ON_PASSES_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'experimentalStudio',
+    errorKey: 'EXPERIMENTAL_STUDIO_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'experimentalPromptCommand',
+    errorKey: 'EXPERIMENTAL_PROMPT_COMMAND_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'experimentalSourceRewriting',
+    errorKey: 'EXPERIMENTAL_SOURCE_REWRITING_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'allowCypressEnv',
+    errorKey: 'ALLOW_CYPRESS_ENV_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'execTimeout',
+    errorKey: 'EXEC_TIMEOUT_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'experimentalFastVisibility',
+    errorKey: 'EXPERIMENTAL_FAST_VISIBILITY_RENAMED',
+    isWarning: true,
+  },
+  {
+    name: 'visibilityStrategy',
+    errorKey: 'VISIBILITY_STRATEGY_DEPRECATION',
+    shouldDisplayOrThrow: (value: any) => value === 'legacy',
+    isWarning: true,
+  },
+  {
+    name: 'experimentalMemoryManagement',
+    errorKey: 'EXPERIMENTAL_MEMORY_MANAGEMENT_REMOVED',
+    isWarning: true,
+  },
+  {
+    name: 'forceHttp1',
+    errorKey: 'FORCE_HTTP1_DEPRECATION',
+    shouldDisplayOrThrow: (value: any) => value === true,
+    isWarning: true,
+  },
+] as const
+
+export const breakingRootOptions: Array<BreakingOption> = [
+  {
+    name: 'baseUrl',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG_E2E',
+    isWarning: false,
+    testingTypes: ['e2e'],
+  }, {
+    name: 'excludeSpecPattern',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG',
+    isWarning: false,
+    testingTypes: ['component', 'e2e'],
+  }, {
+    name: 'indexHtmlFile',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG_COMPONENT',
+    isWarning: false,
+    testingTypes: ['component'],
+  }, {
+    name: 'slowTestThreshold',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG',
+    isWarning: false,
+    testingTypes: ['component', 'e2e'],
+  }, {
+    name: 'specPattern',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG',
+    isWarning: false,
+    testingTypes: ['component', 'e2e'],
+  }, {
+    name: 'supportFile',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG',
+    isWarning: false,
+    testingTypes: ['component', 'e2e'],
+  }, {
+    name: 'testIsolation',
+    errorKey: 'CONFIG_FILE_INVALID_ROOT_CONFIG',
+    isWarning: false,
+    testingTypes: ['e2e'],
+  },
+  {
+    name: 'experimentalOriginDependencies',
+    errorKey: 'EXPERIMENTAL_ORIGIN_DEPENDENCIES_E2E_ONLY',
+    isWarning: false,
+    testingTypes: ['e2e'],
+  },
+  {
+    name: 'justInTimeCompile',
+    errorKey: 'JIT_COMPONENT_TESTING',
+    isWarning: false,
+    testingTypes: ['component'],
+  },
+]
+
+export const testingTypeBreakingOptions: { e2e: Array<BreakingOption>, component: Array<BreakingOption> } = {
+  e2e: [
+    {
+      name: 'experimentalSingleTabRunMode',
+      errorKey: 'EXPERIMENTAL_SINGLE_TAB_RUN_MODE',
+      isWarning: false,
+    },
+    {
+      name: 'indexHtmlFile',
+      errorKey: 'CONFIG_FILE_INVALID_TESTING_TYPE_CONFIG_E2E',
+      isWarning: false,
+    },
+    {
+      name: 'justInTimeCompile',
+      errorKey: 'JIT_COMPONENT_TESTING',
+      isWarning: false,
+    },
+    {
+      name: 'injectDocumentDomain',
+      errorKey: 'INJECT_DOCUMENT_DOMAIN_DEPRECATION',
+      isWarning: true,
+    },
+  ],
+  component: [
+    {
+      name: 'baseUrl',
+      errorKey: 'CONFIG_FILE_INVALID_TESTING_TYPE_CONFIG_COMPONENT',
+      isWarning: false,
+    },
+    {
+      name: 'testIsolation',
+      errorKey: 'CONFIG_FILE_INVALID_TESTING_TYPE_CONFIG_COMPONENT',
+      isWarning: false,
+    },
+    {
+      name: 'experimentalOriginDependencies',
+      errorKey: 'EXPERIMENTAL_ORIGIN_DEPENDENCIES_E2E_ONLY',
+      isWarning: false,
+    },
+    {
+      name: 'injectDocumentDomain',
+      errorKey: 'INJECT_DOCUMENT_DOMAIN_E2E_ONLY',
+      isWarning: false,
+    },
+  ],
+}

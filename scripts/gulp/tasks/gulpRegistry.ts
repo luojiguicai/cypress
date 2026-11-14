@@ -1,0 +1,125 @@
+import type { ChildProcess } from 'child_process'
+import treeKill from 'tree-kill'
+import gulp from 'gulp'
+import os from 'os'
+
+const childProcesses = new Set<ChildProcess>()
+const exitedPids = new Set<number>()
+
+let hasExited = false
+
+export function addChildProcess (child: ChildProcess) {
+  if (hasExited) {
+    if (child.pid) {
+      treeKill(child.pid)
+    }
+
+    return
+  }
+
+  childProcesses.add(child)
+  child.on('exit', async (code) => {
+    if (!hasExited) {
+      await exitAndRemoveProcess(child)
+    }
+  })
+}
+
+export async function exitAndRemoveProcess (child: ChildProcess) {
+  if (!child.pid) {
+    return
+  }
+
+  if (exitedPids.has(child.pid)) {
+    return
+  }
+
+  if (!childProcesses.has(child)) {
+    throw new Error(`Cannot remove child process ${child.pid}, it was never registered`)
+  }
+
+  childProcesses.delete(child)
+
+  const dfd = Promise.withResolvers()
+
+  exitedPids.add(child.pid)
+  treeKill(child.pid, (err) => {
+    if (err) {
+      console.error(err)
+    }
+
+    dfd.resolve()
+  })
+
+  return dfd.promise
+}
+
+export async function exitAllProcesses () {
+  await Promise.all(Array.from(childProcesses).map(exitAndRemoveProcess))
+}
+
+process.stdin.resume() //so the program will not close instantly
+
+const _task = gulp.task
+
+// So that we auto-exit on single tasks
+// @ts-expect-error - a variadic wrapper does not match the overloads of gulp.task
+gulp.task = function () {
+  if (arguments.length === 1 && typeof arguments[0] === 'function') {
+    process.stdin.pause()
+  }
+
+  // @ts-expect-error - IArguments is not assignable to the parameter tuple of gulp.task
+  return _task.apply(this, arguments)
+}
+
+export async function exitAfterAll () {
+  process.stdin.pause()
+}
+
+async function exitHandler (exitCode: number) {
+  // do not execute if the signal handler has already been called
+  if (hasExited) {
+    return
+  }
+
+  hasExited = true
+  await exitAllProcesses()
+  process.exit(exitCode)
+}
+
+async function signalHandler (signal: NodeJS.Signals) {
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(false)
+  }
+
+  hasExited = true
+  try {
+    await exitAllProcesses()
+  } catch (error) {
+    console.error(`An error occurred while handling signal ${signal}: ${error}`)
+    process.exit(1)
+  }
+
+  process.exit(128 + os.constants.signals[signal])
+}
+
+async function uncaughtExceptionHandler (error: Error) {
+  hasExited = true
+  console.log(`Uncaught exception ${error.message}`)
+  await exitAllProcesses()
+  process.exit(6)
+}
+
+// do something when app is closing
+process.on('exit', exitHandler)
+
+// catches ctrl+c event
+process.on('SIGINT', signalHandler)
+
+// catches "kill pid" (for example: nodemon restart)
+process.on('SIGUSR1', signalHandler)
+process.on('SIGUSR2', signalHandler)
+
+// catches uncaught exceptions
+process.on('uncaughtException', uncaughtExceptionHandler)

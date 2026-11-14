@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "target": "ES2020",
+    "lib": ["es2021"],   
+    "module": "commonjs",
+    "moduleResolution": "node",    
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "declaration": true,
+  },
+  "types": ["node", "cypress"],
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+} 

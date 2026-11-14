@@ -1,18 +1,18 @@
 import Debug from 'debug'
-import type * as socketIo from '@packages/socket'
-import devServer from '@packages/server/lib/plugins/dev-server'
-import { SocketBase } from '@packages/server/lib/socket-base'
-import type { DestroyableHttpServer } from '@packages/server/lib/util/server_destroy'
-
+import devServer from './plugins/dev-server'
+import { SocketBase } from './socket-base'
+import type { StartListeningOptions } from './socket-base'
+import type { Socket } from '@packages/socket'
+import type { DestroyableHttpServer } from './util/server_destroy'
+import assert from 'assert'
+import type { Automation } from './automation'
 const debug = Debug('cypress:server:socket-ct')
 
 export class SocketCt extends SocketBase {
+  #destroyAutPromise?: PromiseWithResolvers<void>
+
   constructor (config: Record<string, any>) {
     super(config)
-
-    devServer.emitter.on('dev-server:compile:error', (error: string | undefined) => {
-      this.toRunner('dev-server:hmr:error', error)
-    })
 
     // should we use this option at all for component testing 😕?
     if (config.watchForFileChanges) {
@@ -22,15 +22,45 @@ export class SocketCt extends SocketBase {
     }
   }
 
-  startListening (server: DestroyableHttpServer, automation, config, options) {
-    const { componentFolder } = config
+  onBeforeSave (config) {
+    // even if the user has turned off file watching
+    // we want to force a reload on save
+    if (!config.watchForFileChanges) {
+      devServer.emitter.on('dev-server:compile:success', this.onCloudTestFileChange)
+    }
+  }
 
-    this.testsDir = componentFolder
+  onAfterSave (config, error) {
+    // even if the user has turned off file watching
+    // we want to force a reload on save
+    if (error && !config.watchForFileChanges) {
+      devServer.emitter.off('dev-server:compile:success', this.onCloudTestFileChange)
+    }
+  }
 
+  onCloudTestFileChange = ({ specFile }) => {
+    this.toRunner('dev-server:compile:success', { specFile })
+    devServer.emitter.off('dev-server:compile:success', this.onCloudTestFileChange)
+  }
+
+  startListening (server: DestroyableHttpServer, automation: Automation, config, options: StartListeningOptions) {
     return super.startListening(server, automation, config, options, {
-      onSocketConnection (socket: socketIo.SocketIOServer) {
+      onSocketConnection: (socket: Socket) => {
         debug('do onSocketConnection')
+
+        socket.on('aut:destroy:complete', () => {
+          assert(this.#destroyAutPromise)
+          this.#destroyAutPromise.resolve()
+        })
       },
     })
+  }
+
+  destroyAut () {
+    this.#destroyAutPromise = Promise.withResolvers<void>()
+
+    this.toRunner('aut:destroy:init')
+
+    return this.#destroyAutPromise.promise
   }
 }

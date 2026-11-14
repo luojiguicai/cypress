@@ -1,18 +1,18 @@
-// @ts-nocheck
 import $ from 'jquery'
 import _ from 'lodash'
 
 // wrap the object in jquery
-const wrap = (obj) => {
+function wrap (obj) {
   return $(obj)
 }
 
 const query = (selector, context) => {
+  // @ts-expect-error - $.fn.init is not declared in the jQuery types
   return new $.fn.init(selector, context)
 }
 
 // pull out the raw elements if this is wrapped
-const unwrap = function (obj) {
+export const unwrap = function (obj) {
   if (isJquery(obj)) {
     // return an array of elements
     return obj.toArray()
@@ -21,7 +21,7 @@ const unwrap = function (obj) {
   return obj
 }
 
-const isJquery = (obj) => {
+export const isJquery = (obj: any): obj is JQuery<any> => {
   let hasJqueryProperty = false
 
   try {

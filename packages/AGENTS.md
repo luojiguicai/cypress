@@ -1,0 +1,94 @@
+# Packages Workspace
+
+## Purpose
+
+The `packages/` workspace contains all first-party Cypress packages that make up the Cypress monorepo. These packages are the implementation of the Cypress test runner, its tooling, and supporting infrastructure. Each package is a standalone npm package (scoped under `@packages/`) consumed by the Cypress binary build, by each other, and in some cases by the public.
+
+## Package Map
+
+### App & Frontend
+
+- **@packages/app** — The main Vue 3 front-end application for the Cypress browser-side UI (specs list, Test Replay, runner toolbar, Studio).
+- **@packages/launchpad** — Vue 3 Electron-rendered application shown when running `cypress open`; handles login, project selection, and configuration setup.
+- **@packages/frontend-shared** — Shared Vue 3 components, TailwindCSS config, and composables consumed by both `app` and `launchpad`.
+- **@packages/reporter** — The test result reporter UI (command log, test tree) rendered inside the runner iframe.
+- **@packages/runner** — Legacy webpack bundler for `driver` and `reporter`; being phased out in favour of `app`.
+
+### Test Runner & Driver
+
+- **@packages/driver** — Core JavaScript library loaded inside the browser; executes Cypress commands and manages the test runtime.
+- **@packages/extension** — Chrome/Firefox WebExtension that enables browser automation (v2 Manifest V2, v3 Manifest V3).
+
+### Server & Network
+
+- **@packages/server** — Node.js heart of Cypress: HTTP server, proxy orchestration, file watching, plugin execution, and IPC with the browser.
+- **@packages/proxy** — HTTP interception proxy layer; applies middleware to requests and responses to enable stubbing, rewriting, and header injection.
+- **@packages/net-stubbing** — Server-side implementation of `cy.intercept()`; route matching, request/response lifecycle, and driver event bridge.
+- **@packages/network** — Node.js networking utilities: HTTP/HTTPS proxy-aware agents, CA certificate management, and connection helpers.
+- **@packages/network-tools** — Isomorphic (browser + Node.js) low-level networking utilities: CORS helpers, URI parsing, domain utilities.
+- **@packages/https-proxy** — Intercepts TLS connections by acting as a dynamic CA; generates per-hostname certificates on the fly using `node-forge`.
+
+### Configuration & Data
+
+- **@packages/config** — Canonical Cypress configuration schema, option definitions, validation logic, and AST-based `cypress.config` file transforms.
+- **@packages/data-context** — Centralized GraphQL data layer (Nexus schema) for the Cypress app; manages project state, Cloud queries, file watching, and actions.
+- **@packages/scaffold-config** — Detects frameworks/bundlers in a user's project and scaffolds `cypress.config.js` and supporting files during onboarding.
+
+### Desktop & Electron
+
+- **@packages/electron** — Installs, packages, and manages the Electron binary that wraps Cypress; provides the `cypress-electron` CLI entrypoint.
+- **@packages/launcher** — Detects installed browsers on macOS, Linux, and Windows and launches them with the correct flags and profile paths.
+
+### Types, Errors & Utilities
+
+- **@packages/types** — Shared TypeScript type definitions used across the entire monorepo.
+- **@packages/errors** — Centralised error definitions, formatting utilities, and `errTemplate` tagged-template system for all Cypress error messages.
+- **@packages/socket** — Thin shared wrapper around `socket.io` client and server instances used for browser–server IPC.
+- **@packages/telemetry** — OpenTelemetry convenience wrapper for capturing performance spans and usage signals inside Cypress processes.
+- **@packages/icons** — Cypress icon assets (SVG, PNG, ICO) and build scripts that produce browser-consumable image files.
+- **@packages/stderr-filtering** — Utility for tagging and filtering noisy third-party stderr output into `debug` streams.
+- **@packages/agent-info** — Detects whether an AI coding agent invoked the current process, and which one, by fingerprinting environment variables.
+
+### Build & Snapshot Infrastructure
+
+- **@packages/v8-snapshot-require** — Loads V8 heap snapshots created by `@tooling/v8-snapshot` to accelerate Electron startup time.
+- **@packages/packherd-require** — Module loader for bundles produced by `@tooling/packherd`; also provides on-demand TypeScript transpilation with source-map support.
+- **@packages/web-config** — Shared webpack/Vite configuration helpers for browser bundles inside the monorepo.
+- **@packages/ts** — Standardises `ts-node` version and base `tsconfig` options for development-time TypeScript require hooks.
+- **@packages/eslint-config** — Monorepo-wide ESLint flat-config with rules for TypeScript, Vue, React, Cypress tests, and imports.
+- **@packages/resolve-dist** — Centralizes path resolution for compiled/static assets referenced from server-side code.
+- **@packages/root** — Bundles the monorepo root `package.json` as an installable package so any package can reference root metadata without absolute paths.
+- **@packages/runner** — (see App & Frontend above)
+
+## Workspace Commands
+
+```bash
+# Run tests targeting a specific file (vitest packages)
+yarn workspace @packages/<name> test -- <path-to-spec>
+
+# Run tests targeting a specific file glob (vitest packages)
+yarn workspace @packages/<name> test -- "<glob-pattern>"
+
+# Build a specific package
+yarn workspace @packages/<name> build
+
+# Run lint for a specific package
+yarn workspace @packages/<name> lint
+
+# Type-check a specific package
+yarn workspace @packages/<name> check-ts
+
+# Run all package builds (from repo root)
+yarn build
+```
+
+## Notes
+
+- Most packages publish both CJS (`cjs/`) and ESM (`esm/`) builds; the `main` field points to CJS and `module` to ESM.
+- Do not build `.js` files by hand. Whether a package needs a pre-build is decided by where its `main` points. A handful still point at tracked source and resolve TypeScript at require time — `proxy` and `data-context` through an `@packages/ts/register` shim, `server` through `tsx`, `net-stubbing` straight at `lib/server` — and those need no build. That is the legacy pattern and is being retired: most Node-side packages now point `main` at build output under `cjs/`, `esm/`, or `dist/`, and a package cannot run its tests until every first-party dependency resolved that way has been built. Check the dependency's own `main` rather than assuming either way.
+- A missing dependency build surfaces as `Failed to resolve entry for package "@packages/x"` from `vite:import-analysis`, which reads like a malformed `package.json` rather than a missing build. Each run only names the next one, so a fresh worktree can need several builds in turn — see [`network/AGENTS.md`](./network/AGENTS.md) for a worked example. A full root `yarn` runs a lerna build and covers this; `yarn clean` or an interrupted install is what leaves you short.
+- The browser bundles (`driver`, `runner`, `app`, `launchpad`, `frontend-shared`, `reporter`) always need building, by `yarn watch` from the repo root.
+- Many packages use `vitest` for unit tests; the front-end packages (`app`, `launchpad`, `frontend-shared`) use Cypress component tests and E2E tests (cypress-in-cypress pattern).
+- The `nohoist` workspace option prevents specific dependencies from being hoisted to the monorepo root. It is set in `driver` (which nohoists everything, `["*"]`), `frontend-shared`, `proxy`, `server`, `socket`, and `types` — check the package's own `package.json` `workspaces.nohoist` rather than assuming.
+- Packages that depend on generated GraphQL types (from `data-context`) must run `yarn build:graphql` before type-checking will pass.
+- **When adding or removing a package under `packages/`**, regenerate the path map with `yarn gulp makePathMap` (from the repo root). This rewrites the auto-generated [`scripts/gulp/monorepoPaths.ts`](../scripts/gulp/monorepoPaths.ts), produced by [`scripts/gulp/utils/makePathMap.ts`](../scripts/gulp/utils/makePathMap.ts) from an enumeration of `packages/*` — do not hand-edit it. `yarn dev` regenerates it too, but run the task explicitly so the change is committed alongside the package addition.

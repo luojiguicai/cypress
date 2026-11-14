@@ -1,17 +1,24 @@
-import Bluebird from 'bluebird'
+import { promisify } from 'util'
 import debugModule from 'debug'
-import dns, { LookupAddress, LookupAllOptions } from 'dns'
+import dns from 'dns'
 import _ from 'lodash'
 import net from 'net'
 import tls from 'tls'
+import os from 'os'
 
 const debug = debugModule('cypress:network:connect')
 
+// Cypress' outbound stack speaks HTTP/1.1 only. Sending no ALPN extension at all
+// leaves an HTTP/2-only origin nothing to negotiate against, so it either refuses
+// the handshake or holds the socket open until the request times out. Advertising
+// http/1.1 explicitly turns that into a fast, legible failure.
+export const ALPNProtocols: readonly string[] = Object.freeze(['http/1.1'])
+
 export function byPortAndAddress (port: number, address: net.Address) {
   // https://nodejs.org/api/net.html#net_net_connect_port_host_connectlistener
-  return new Bluebird<net.Address>((resolve, reject) => {
+  return new Promise<net.Address>((resolve, reject) => {
     const onConnect = () => {
-      client.end()
+      client.destroy()
       resolve(address)
     }
 
@@ -21,49 +28,63 @@ export function byPortAndAddress (port: number, address: net.Address) {
   })
 }
 
-export function getAddress (port: number, hostname: string): Bluebird<net.Address> {
+export async function getAddress (port: number, hostname: string): Promise<net.Address> {
   debug('beginning getAddress %o', { hostname, port })
-
-  const fn = byPortAndAddress.bind({}, port)
 
   // promisify at the very last second which enables us to
   // modify dns lookup function (via hosts overrides)
-  const lookupAsync = Bluebird.promisify<LookupAddress[], string, LookupAllOptions>(dns.lookup, { context: dns })
+  const lookupAsync = promisify(dns.lookup)
 
   // this does not go out to the network to figure
-  // out the addresess. in fact it respects the /etc/hosts file
+  // out the addresses. in fact it respects the /etc/hosts file
   // https://github.com/nodejs/node/blob/dbdbdd4998e163deecefbb1d34cda84f749844a4/lib/dns.js#L108
   // https://nodejs.org/api/dns.html#dns_dns_lookup_hostname_options_callback
-  // @ts-ignore
-  return lookupAsync(hostname, { all: true })
-  .then((addresses) => {
-    debug('got addresses %o', { hostname, port, addresses })
 
-    // convert to an array if string
-    return Array.prototype.concat.call(addresses).map(fn)
-  })
-  .tapCatch((err) => {
-    debug('error getting address %o', { hostname, port, err })
-  })
-  .any()
+  let addresses = await lookupAsync(hostname, { all: true })
+
+  debug('got addresses %o', { hostname, port, addresses })
+
+  // ipv6 addresses are causing problems with cypress in cypress internal e2e tests
+  // on windows, so we are filtering them out here
+  if (process.env.CYPRESS_INTERNAL_E2E_TESTING_SELF_PARENT_PROJECT && os.platform() === 'win32') {
+    debug('filtering ipv6 addresses %o', { hostname, port, addresses })
+    addresses = addresses.filter((address) => {
+      return address.family === 4
+    })
+  }
+
+  try {
+    const address = await Promise.any(addresses.map((address) => {
+      return byPortAndAddress(port, address as net.Address)
+    }))
+
+    return address
+  } catch (error) {
+    debug('error getting address %o', { hostname, port, error })
+
+    throw error
+  }
 }
 
-export function getDelayForRetry (iteration) {
+export function getDelayForRetry (iteration: number) {
   return [0, 100, 200, 200][iteration]
 }
 
-interface RetryingOptions {
+export interface RetryingOptions {
+  family: 4 | 6 | 0
   port: number
   host: string | undefined
   useTls: boolean
-  getDelayMsForRetry: (iteration: number, err: Error) => number | undefined
+  getDelayMsForRetry: (iteration: number, err: Error | undefined) => number | undefined
 }
 
-function createSocket (opts: RetryingOptions, onConnect): net.Socket {
-  const netOpts = _.pick(opts, 'host', 'port')
+function createSocket (opts: RetryingOptions, onConnect: () => void): net.Socket {
+  const netOpts = _.defaults(_.pick(opts, 'family', 'host', 'port'), {
+    family: 4,
+  })
 
   if (opts.useTls) {
-    return tls.connect(netOpts, onConnect)
+    return tls.connect({ ...netOpts, ALPNProtocols: [...ALPNProtocols] }, onConnect)
   }
 
   return net.connect(netOpts, onConnect)
@@ -78,7 +99,7 @@ export function createRetryingSocket (
   }
 
   function tryConnect (iteration = 0) {
-    const retry = (err) => {
+    const retry = (err: Error | undefined) => {
       const delay = opts.getDelayMsForRetry(iteration, err)
 
       if (typeof delay === 'undefined') {
@@ -94,7 +115,7 @@ export function createRetryingSocket (
       }, delay)
     }
 
-    function onError (err) {
+    function onError (err: Error) {
       sock.on('error', (err) => {
         debug('second error received on retried socket %o', { opts, iteration, err })
       })

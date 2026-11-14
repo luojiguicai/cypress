@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "lib": [
+      "es2022",
+      "dom"
+    ],
+    "allowJs": true,
+    "jsx": "preserve",
+    "outDir": "dist",
+    "strict": true,
+    "baseUrl": "./",
+    "types": [
+      "cypress"
+    ],
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true
+  },
+  "include": ["src"],
+}

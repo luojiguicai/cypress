@@ -1,11 +1,10 @@
 import _ from 'lodash'
-import { observable, computed } from 'mobx'
+import { observable, computed, makeObservable } from 'mobx'
 
-import { FileDetails } from '@packages/ui-components'
-
-import { Alias } from '../instruments/instrument-model'
-import Err from '../errors/err-model'
-import CommandModel from '../commands/command-model'
+import type { FileDetails } from '@packages/types'
+import type { Alias } from '../instruments/instrument-model'
+import type Err from '../errors/err-model'
+import type CommandModel from '../commands/command-model'
 
 export type HookName = 'before all' | 'before each' | 'after all' | 'after each' | 'test body' | 'studio commands'
 
@@ -17,30 +16,44 @@ export interface HookProps {
 }
 
 export default class Hook implements HookProps {
-  @observable hookId: string
-  @observable hookName: HookName
-  @observable hookNumber?: number
-  @observable invocationDetails?: FileDetails
-  @observable invocationOrder?: number
-  @observable commands: CommandModel[] = []
-  @observable isStudio: boolean
-  @observable failed = false
+  hookId: string
+  hookName: HookName
+  hookNumber?: number
+  invocationDetails?: FileDetails
+  invocationOrder?: number
+  commands: CommandModel[] = []
+  isStudio: boolean
+  failed = false
 
   private _aliasesWithDuplicatesCache: Array<Alias> | null = null
   private _currentNumber = 1
 
   constructor (props: HookProps) {
+    makeObservable(this, {
+      hookId: observable,
+      hookName: observable,
+      hookNumber: observable,
+      invocationDetails: observable,
+      invocationOrder: observable,
+      commands: observable,
+      isStudio: observable,
+      failed: observable,
+      aliasesWithDuplicates: computed,
+      hasFailedCommand: computed,
+      showStudioPrompt: computed,
+    })
+
     this.hookId = props.hookId
     this.hookName = props.hookName
     this.invocationDetails = props.invocationDetails
     this.isStudio = !!props.isStudio
   }
 
-  @computed get aliasesWithDuplicates () {
+  get aliasesWithDuplicates () {
     // Consecutive duplicates only appear once in command array, but hasDuplicates is true
     // Non-consecutive duplicates appear multiple times in command array, but hasDuplicates is false
     // This returns aliases that have consecutive or non-consecutive duplicates
-    let consecutiveDuplicateAliases: Array<Alias> = []
+    const consecutiveDuplicateAliases: Array<Alias> = []
     const aliases: Array<Alias> = this.commands.map((command) => {
       if (command.alias) {
         if (command.hasChildren) {
@@ -69,16 +82,16 @@ export default class Hook implements HookProps {
     return this._aliasesWithDuplicatesCache
   }
 
-  @computed get hasFailedCommand () {
+  get hasFailedCommand () {
     return !!_.find(this.commands, { state: 'failed' })
   }
 
-  @computed get showStudioPrompt () {
+  get showStudioPrompt () {
     return this.isStudio && !this.hasFailedCommand && (!this.commands.length || (this.commands.length === 1 && this.commands[0].name === 'visit'))
   }
 
   addCommand (command: CommandModel) {
-    if (!command.event && !this.isStudio) {
+    if (!command.event && command.type !== 'system' && !this.isStudio) {
       command.number = this._currentNumber
       this._currentNumber++
     }
@@ -117,10 +130,10 @@ export default class Hook implements HookProps {
     this.commands.splice(commandIndex, 1)
   }
 
-  commandMatchingErr (errToMatch: Err) {
+  commandMatchingErr (errToMatch: Err): CommandModel | undefined {
     return _(this.commands)
     .filter(({ err }) => {
-      return err && err.message === errToMatch.message && err.message !== undefined
+      return !!err && err.message === errToMatch.message && err.message !== undefined
     })
     .last()
   }

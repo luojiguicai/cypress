@@ -1,74 +1,37 @@
-// @ts-nocheck
-
-import $ from 'jquery'
-import _ from 'lodash'
+import JQuery from 'jquery'
 
 import { scrollTo } from './jquery.scrollto'
 import $dom from '../dom'
 
-// force jquery to have the same visible
-// and hidden logic as cypress
-
-// this prevents `is` from calling into the native .matches method
-// which would prevent our `focus` code from ever being called during
-// is(:focus).
-// see https://github.com/jquery/sizzle/wiki#sizzlematchesselector-domelement-element-string-selector-
-
-// this is to help to interpretor make optimizations around try/catch
-const tryCatchFinally = function ({ tryFn, catchFn, finallyFn }) {
-  try {
-    return tryFn()
-  } catch (e) {
-    return catchFn(e)
-  } finally {
-    finallyFn()
-  }
+// Add missing types.
+interface ExtendedJQueryStatic extends JQueryStatic {
+  find: any
+  expr: JQuery.Selectors
 }
 
-const { matchesSelector } = $.find
-
-$.find.matchesSelector = function (elem, expr) {
-  let supportMatchesSelector
-  const isUsingFocus = _.includes(expr, ':focus')
-
-  if (isUsingFocus) {
-    supportMatchesSelector = $.find.support.matchesSelector
-    $.find.support.matchesSelector = false
-  }
-
-  // eslint-disable-next-line prefer-rest-params
-  const args = arguments
-  const _this = this
-
-  return tryCatchFinally({
-    tryFn () {
-      return matchesSelector.apply(_this, args)
-    },
-    catchFn (e) {
-      throw e
-    },
-    finallyFn () {
-      if (isUsingFocus) {
-        $.find.support.matchesSelector = supportMatchesSelector
-      }
-    },
-  })
-}
+const $: ExtendedJQueryStatic = JQuery as any
 
 $.fn.scrollTo = scrollTo
 
-// see difference between 'filters' and 'pseudos'
-// https://api.jquery.com/filter/ and https://api.jquery.com/category/selectors/
-
+// Register custom pseudo-selectors on `$.expr.pseudos`, the canonical
+// extension point. jQuery 4 removed the `$.expr.filters` and `$.expr[':']`
+// aliases that older code wrote through, so we target `$.expr.pseudos` directly.
 $.expr.pseudos.focus = $dom.isFocused
-$.expr.filters.focus = $dom.isFocused
 $.expr.pseudos.focused = $dom.isFocused
 
+// force jquery to have the same visible
+// and hidden logic as cypress
 // we have to add the arrow function here since
 // jquery calls this function with additional parameters
 // https://github.com/jquery/jquery/blob/master/src/selector.js#L1196
-$.expr.filters.visible = (el) => $dom.isVisible(el)
-$.expr.filters.hidden = (el) => $dom.isHidden(el)
+$.expr.pseudos.visible = (el) => $dom.isVisible(el)
+$.expr.pseudos.hidden = (el) => $dom.isHidden(el)
+
+// Back-compat shim: jQuery 4 removed the `$.expr[':']` alias for
+// `$.expr.pseudos`. Restore it by reference so custom selectors registered
+// through `Cypress.$.expr[':']` keep working. On jQuery 3 this reassigns the
+// alias to the same object it already points at, so it is a no-op there.
+$.expr[':'] = $.expr.pseudos
 
 $.expr.cacheLength = 1
 

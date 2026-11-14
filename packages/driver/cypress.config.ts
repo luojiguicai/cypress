@@ -1,0 +1,57 @@
+// tslint:disable-next-line: no-implicit-dependencies - cypress
+import { defineConfig } from 'cypress'
+import { devServer as cypressWebpackDevServer } from '@cypress/webpack-dev-server'
+
+export const baseConfig: Cypress.ConfigOptions = {
+  projectId: 'ypt4pf',
+  experimentalWebKitSupport: true,
+  env: {
+    CI: process.env.CI,
+    CY_ENV_FOO: 'foo',
+    CY_ENV_BAR: 'bar',
+    CY_ENV_BAZ: 'baz',
+  },
+  hosts: {
+    'foobar.com': '127.0.0.1',
+    '*.foobar.com': '127.0.0.1',
+    'barbaz.com': '127.0.0.1',
+    '*.barbaz.com': '127.0.0.1',
+    '*.idp.com': '127.0.0.1',
+    'localalias': '127.0.0.1',
+  },
+  reporter: '../../node_modules/cypress-multi-reporters/index.js',
+  reporterOptions: {
+    configFile: '../../mocha-reporter-config.json',
+  },
+  e2e: {
+    experimentalOriginDependencies: true,
+    experimentalModifyObstructiveThirdPartyCode: true,
+    removeSRIAttributes: true,
+    setupNodeEvents: (on, config) => {
+      on('task', {
+        log (message) {
+          // eslint-disable-next-line no-console
+          console.log(message)
+
+          return null
+        },
+      })
+
+      return require('./cypress/plugins')(on, config)
+    },
+    baseUrl: 'http://localhost:3500',
+  },
+  component: {
+    experimentalSingleTabRunMode: true,
+    specPattern: 'cypress/component/**/*.cy.{js,ts}',
+    supportFile: false,
+    devServer: (devServerOptions) => {
+      return cypressWebpackDevServer({
+        ...devServerOptions,
+        webpackConfig: {},
+      })
+    },
+  },
+}
+
+export default defineConfig(baseConfig)

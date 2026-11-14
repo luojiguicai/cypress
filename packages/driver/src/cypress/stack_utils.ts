@@ -1,5 +1,13 @@
 // See: ./errorScenarios.md for details about error messages and stack traces
-// @ts-nocheck
+
+// NOTE: If you modify the logic relating to this file, ensure the
+// UI for error code frames works as expected with the binary. This includes each
+// browser, as well as e2e and CT testing types. Stack patterns differ in Chrome
+// between the binary and dev mode, so Cy in Cy tests cannot catch them proactively.
+
+// Various stack patterns are saved as scenario fixtures in ./driver/test
+// to prevent regressions.
+
 import _ from 'lodash'
 import path from 'path'
 import errorStackParser from 'error-stack-parser'
@@ -7,12 +15,13 @@ import { codeFrameColumns } from '@babel/code-frame'
 
 import $utils from './utils'
 import $sourceMapUtils from './source_map_utils'
-import { getStackLines, replacedStack, stackWithoutMessage, splitStack, unsplitStack } from '@packages/server/lib/util/stack_utils'
+import { toPosix } from './util/to_posix'
+// Intentionally deep-importing from @packages/errors so as to not bundle the entire @packages/errors in the client unnecessarily
+import { getStackLines, replacedStack, stackWithoutMessage, splitStack, unsplitStack, stackLineRegex } from '@packages/errors/src/stackUtils'
 
 const whitespaceRegex = /^(\s*)*/
-const stackLineRegex = /^\s*(at )?.*@?\(?.*\:\d+\:\d+\)?$/
-const customProtocolRegex = /^[^:\/]+:\/+/
 const percentNotEncodedRegex = /%(?![0-9A-F][0-9A-F])/g
+
 const STACK_REPLACEMENT_MARKER = '__stackReplacementMarker'
 
 const hasCrossFrameStacks = (specWindow) => {
@@ -27,10 +36,11 @@ const hasCrossFrameStacks = (specWindow) => {
   return topStack === specStack
 }
 
-const stackWithContentAppended = (err, stack) => {
+const stackWithContentAppended = (err, stack: string | undefined) => {
+  const usableStack = stack ?? ''
   const appendToStack = err.appendToStack
 
-  if (!appendToStack || !appendToStack.content) return stack
+  if (!appendToStack || !appendToStack.content) return usableStack
 
   delete err.appendToStack
 
@@ -39,7 +49,7 @@ const stackWithContentAppended = (err, stack) => {
   const normalizedContent = normalizeStackIndentation(appendToStack.content)
   const content = $utils.indent(normalizedContent, 2)
 
-  return `${stack}\n\n${appendToStack.title}:\n${content}`
+  return `${usableStack}\n\n${appendToStack.title}:\n${content}`
 }
 
 const stackWithLinesRemoved = (stack, cb) => {
@@ -49,10 +59,61 @@ const stackWithLinesRemoved = (stack, cb) => {
   return unsplitStack(messageLines, remainingStackLines)
 }
 
+const stackTrimmedToTestInvocation = (stack: string, specWindow) => {
+  const modifiedStack = stackWithLinesRemoved(stack, (lines: string[]) => {
+    // Guard against Cypress being undefined/null (can happen when users quickly reload tests)
+    if (!specWindow?.Cypress) {
+      return lines
+    }
+
+    const originalLines = lines
+    let processedLines: string[]
+
+    if (specWindow.Cypress.isBrowser({ family: 'chromium' })) {
+      // The actual test invocation line starts with either 'at eval' or 'at Suite.eval',
+      // so remove all lines until we reach the test invocation line
+      processedLines = _.dropWhile(lines, (line) => {
+        return !(
+          line.trim().startsWith('at eval ') ||
+          line.trim().startsWith('at Suite.eval ')
+        )
+      })
+    } else if (specWindow.Cypress.isBrowser({ family: 'firefox' })) {
+      const isTestInvocationLine = (line: string) => {
+        const splitAtAt = line.split('@')
+
+        // firefox stacks traces look like:
+        // functionName@http://localhost:3000/__cypress/tests?p=cypress/support/e2e.js:444:14
+        // @http://localhost:3000/__cypress/tests?p=cypress/e2e/spec.cy.js:43:3
+        // @http://localhost:3000/__cypress/tests?p=cypress/e2e/spec.cy.js:45:12
+        // evalScripts/<@cypress:///../driver/src/cypress/script_utils.ts:38:23
+        //
+        // the actual invocation details will be at the first line with no function name
+        return splitAtAt.length > 1 && splitAtAt[0].trim().length === 0
+      }
+
+      processedLines = _.dropWhile(lines, (line) => {
+        return !isTestInvocationLine(line)
+      })
+    } else {
+      processedLines = lines
+    }
+
+    // if we removed all the lines then something went wrong with parsing. Return the original lines instead
+    if (processedLines.length === 0) {
+      return originalLines
+    }
+
+    return processedLines
+  })
+
+  return modifiedStack
+}
+
 const stackWithLinesDroppedFromMarker = (stack, marker, includeLast = false) => {
   return stackWithLinesRemoved(stack, (lines) => {
     // drop lines above the marker
-    const withAboveMarkerRemoved = _.dropWhile(lines, (line) => {
+    const withAboveMarkerRemoved = _.dropWhile(lines, (line: any) => {
       return !_.includes(line, marker)
     })
 
@@ -66,7 +127,19 @@ const stackWithReplacementMarkerLineRemoved = (stack) => {
   })
 }
 
-const stackWithUserInvocationStackSpliced = (err, userInvocationStack) => {
+const stackPriorToReplacementMarker = (stack) => {
+  return _.chain(stack).split('\n')
+  .takeWhile((line) => !line.includes(STACK_REPLACEMENT_MARKER))
+  .join('\n')
+  .value()
+}
+
+export type StackAndCodeFrameIndex = {
+  stack: string
+  index?: number
+}
+
+const stackWithUserInvocationStackSpliced = (err, userInvocationStack): StackAndCodeFrameIndex => {
   const stack = _.trim(err.stack, '\n') // trim newlines from end
   const [messageLines, stackLines] = splitStack(stack)
   const userInvocationStackWithoutMessage = stackWithoutMessage(userInvocationStack)
@@ -91,35 +164,65 @@ const stackWithUserInvocationStackSpliced = (err, userInvocationStack) => {
   }
 }
 
-const getInvocationDetails = (specWindow, config) => {
+export type InvocationDetails = {
+  function?: string
+  fileUrl?: string
+  absoluteFile?: string
+  column?: number
+  line?: number
+  originalFile?: string
+  relativeFile?: string
+  stack: string
+}
+
+// used to determine codeframes for hook/test/etc definitions rather than command invocations
+const getInvocationDetails = (specWindow, sourceMapProjectRoot: string, type?: 'test'): InvocationDetails | undefined => {
   if (specWindow.Error) {
     let stack = (new specWindow.Error()).stack
 
     // note: specWindow.Cypress can be undefined or null
     // if the user quickly reloads the tests multiple times
 
-    // firefox throws a different stack than chromium
-    // which includes stackframes from cypress_runner.js.
-    // So we drop the lines until we get to the spec stackframe (includes __cypress/tests)
-    if (specWindow.Cypress && specWindow.Cypress.isBrowser('firefox')) {
-      stack = stackWithLinesDroppedFromMarker(stack, '__cypress/tests', true)
+    // firefox and chrome throw stacks that include lines from cypress
+    // So we drop the lines until we get to the spec stackframe (includes __cypress)
+    if (specWindow.Cypress) {
+      // The stack includes frames internal to cypress, after the spec stackframe. In order
+      // to determine the invocation details, the stack needs to be parsed and trimmed.
+
+      // in Chrome and Firefox in E2E contexts, the spec stackframe includes the pattern, '__cypress/tests'.
+      if (stack.includes('__cypress/tests')) {
+        stack = stackWithLinesDroppedFromMarker(stack, '__cypress/tests', true)
+      } else {
+        // CT error contexts include the `__cypress` marker but not the `/tests` portion
+        stack = stackWithLinesDroppedFromMarker(stack, '__cypress', true)
+      }
+
+      // if the hook is the test, and it's an e2e test, we will try to remove the lines that are not the actual invocation of the test
+      if (type === 'test' && specWindow.Cypress.testingType === 'e2e') {
+        stack = stackTrimmedToTestInvocation(stack, specWindow)
+      }
     }
 
-    const details = getSourceDetailsForFirstLine(stack, config('projectRoot')) || {}
+    const details: Omit<InvocationDetails, 'stack'> = getSourceDetailsForFirstLine(stack, sourceMapProjectRoot) || {}
 
-    details.stack = stack
+    ;(details as any).stack = stack
 
-    return details
+    return details as (InvocationDetails & { stack: any })
   }
+
+  return
 }
 
 const getLanguageFromExtension = (filePath) => {
   return (path.extname(filePath) || '').toLowerCase().replace('.', '') || null
 }
 
-const getCodeFrameFromSource = (sourceCode, { line, column, relativeFile, absoluteFile }) => {
+const getCodeFrameFromSource = (sourceCode, { line, column: originalColumn, relativeFile, absoluteFile }) => {
   if (!sourceCode) return
 
+  // stack columns are 0-based but code frames and IDEs start columns at 1.
+  // add 1 so the code frame and "open in IDE" point to the right line
+  const column = originalColumn + 1
   const frame = codeFrameColumns(sourceCode, { start: { line, column } })
 
   if (!frame) return
@@ -128,24 +231,45 @@ const getCodeFrameFromSource = (sourceCode, { line, column, relativeFile, absolu
     line,
     column,
     originalFile: relativeFile,
-    relativeFile,
+    relativeFile: getRelativePathFromRoot(relativeFile, absoluteFile),
     absoluteFile,
     frame,
     language: getLanguageFromExtension(relativeFile),
   }
 }
 
-const captureUserInvocationStack = (ErrorConstructor, userInvocationStack?) => {
+const getRelativePathFromRoot = (relativeFile: string, absoluteFile?: string) => {
+  // at this point relativeFile is relative to the cypress config
+  // we need it to be relative to the repo root, which is different for monorepos
+  const repoRoot = Cypress.config('repoRoot')
+  const posixAbsoluteFile = absoluteFile ? toPosix(absoluteFile) : ''
+
+  if (posixAbsoluteFile?.startsWith(`${repoRoot}/`)) {
+    return posixAbsoluteFile.replace(`${repoRoot}/`, '')
+  }
+
+  return relativeFile
+}
+
+const captureUserInvocationStack = (ErrorConstructor: SpecWindow['Error'], userInvocationStack?: string | false) => {
   if (!userInvocationStack) {
     const newErr = new ErrorConstructor('userInvocationStack')
 
+    userInvocationStack = newErr.stack
+
     // if browser natively supports Error.captureStackTrace, use it (chrome) (must be bound)
     // otherwise use our polyfill on top.Error
-    const captureStackTrace = ErrorConstructor.captureStackTrace ? ErrorConstructor.captureStackTrace.bind(ErrorConstructor) : Error.captureStackTrace
+    const captureStackTrace: ErrorConstructor['captureStackTrace'] = ErrorConstructor.captureStackTrace ? ErrorConstructor.captureStackTrace.bind(ErrorConstructor) : Error.captureStackTrace
 
     captureStackTrace(newErr, captureUserInvocationStack)
 
-    userInvocationStack = newErr.stack
+    // On Chrome 99+, captureStackTrace strips away the whole stack,
+    // leaving nothing beyond the error message. If we get back a single line
+    // (just the error message with no stack trace), then use the original value
+    // instead of the trimmed one.
+    if (newErr.stack!.match('\n')) {
+      userInvocationStack = newErr.stack
+    }
   }
 
   userInvocationStack = normalizedUserInvocationStack(userInvocationStack)
@@ -160,7 +284,7 @@ const getCodeFrameStackLine = (err, stackIndex) => {
   return err.parsedStack[stackIndex]
 }
 
-const getCodeFrame = (err, stackIndex) => {
+const getCodeFrame = (err, stackIndex?) => {
   if (err.codeFrame) return err.codeFrame
 
   const stackLine = getCodeFrameStackLine(err, stackIndex)
@@ -204,7 +328,7 @@ const getSourceDetails = (generatedDetails) => {
   if (!sourceDetails) return generatedDetails
 
   const { line, column, file } = sourceDetails
-  let fn = generatedDetails.function
+  const fn = generatedDetails.function
 
   return {
     line,
@@ -223,11 +347,9 @@ const cleanFunctionName = (functionName) => {
 }
 
 const parseLine = (line) => {
-  const isStackLine = stackLineRegex.test(line)
+  if (!stackLineRegex.test(line)) return
 
-  if (!isStackLine) return
-
-  const parsed = errorStackParser.parse({ stack: line })[0]
+  const parsed = errorStackParser.parse({ stack: line } as any)[0]
 
   if (!parsed) return
 
@@ -239,32 +361,30 @@ const parseLine = (line) => {
   }
 }
 
-const stripCustomProtocol = (filePath) => {
-  if (!filePath) {
-    return
-  }
-
-  // if the file path (after all said and done)
-  // still starts with "http://" or "https://" then
-  // it is an URL and we have no idea how it maps
-  // to a physical file location on disk. Let it be.
-  const httpProtocolRegex = /^https?:\/\//
-
-  if (httpProtocolRegex.test(filePath)) {
-    return
-  }
-
-  return filePath.replace(customProtocolRegex, '')
+interface MessageLineDetail {
+  message: any
+  whitespace: any
 }
 
-const getSourceDetailsForLine = (projectRoot, line) => {
+interface StackLineDetail {
+  function: any
+  fileUrl: any
+  originalFile: any
+  relativeFile: any
+  absoluteFile: any
+  line: any
+  column: number
+  whitespace: any
+}
+
+const getSourceDetailsForLine = (projectRoot, line): MessageLineDetail | StackLineDetail => {
   const whitespace = getWhitespace(line)
   const generatedDetails = parseLine(line)
 
   // if it couldn't be parsed, it's a message line
   if (!generatedDetails) {
     return {
-      message: line,
+      message: line.replace(whitespace, ''), // strip leading whitespace
       whitespace,
     }
   }
@@ -273,10 +393,31 @@ const getSourceDetailsForLine = (projectRoot, line) => {
 
   const originalFile = sourceDetails.file
 
-  let relativeFile = stripCustomProtocol(originalFile)
+  let relativeFile = $utils.stripCustomProtocol(originalFile)
 
   if (relativeFile) {
     relativeFile = path.normalize(relativeFile)
+
+    if (projectRoot && projectRoot !== '/' && relativeFile.includes(projectRoot)) {
+      relativeFile = relativeFile.replace(projectRoot, '').substring(1)
+    }
+  }
+
+  let absoluteFile
+
+  // WebKit stacks may include an `<unknown>` or `[native code]` location that is not navigable.
+  // We ensure that the absolute path is not set in this case.
+  if (relativeFile &&
+    projectRoot && (
+    !Cypress.isBrowser('webkit') || (relativeFile !== '<unknown>' && relativeFile !== '[native code]')
+  )) {
+    absoluteFile = path.resolve(projectRoot, relativeFile)
+
+    // rollup-plugin-node-builtins/src/es6/path.js only support POSIX, we have
+    // to remove the / so the openFileInIDE can find the correct path
+    if (Cypress.config('platform') === 'win32' && absoluteFile.startsWith('/')) {
+      absoluteFile = absoluteFile.substring(1)
+    }
   }
 
   return {
@@ -284,10 +425,9 @@ const getSourceDetailsForLine = (projectRoot, line) => {
     fileUrl: generatedDetails.file,
     originalFile,
     relativeFile,
-    absoluteFile: (relativeFile && projectRoot) ? path.join(projectRoot, relativeFile) : undefined,
+    absoluteFile,
     line: sourceDetails.line,
-    // adding 1 to column makes more sense for code frame and opening in editor
-    column: sourceDetails.column + 1,
+    column: sourceDetails.column,
     whitespace,
   }
 }
@@ -297,7 +437,7 @@ const getSourceDetailsForFirstLine = (stack, projectRoot) => {
 
   if (!line) return
 
-  return getSourceDetailsForLine(projectRoot, line)
+  return getSourceDetailsForLine(projectRoot, line) as StackLineDetail
 }
 
 const reconstructStack = (parsedStack) => {
@@ -308,11 +448,13 @@ const reconstructStack = (parsedStack) => {
 
     const { whitespace, originalFile, function: fn, line, column } = parsedLine
 
-    return `${whitespace}at ${fn} (${originalFile || '<unknown>'}:${line}:${column})`
-  }).join('\n')
+    const lineAndColumn = (Number.isInteger(line) || Number.isInteger(column)) ? `:${line}:${column}` : ''
+
+    return `${whitespace}at ${fn} (${originalFile || '<unknown>'}${lineAndColumn})`
+  }).join('\n').trimEnd()
 }
 
-const getSourceStack = (stack, projectRoot) => {
+const getSourceStack = (stack?, projectRoot?) => {
   if (!_.isString(stack)) return {}
 
   const getSourceDetailsWithStackUtil = _.partial(getSourceDetailsForLine, projectRoot)
@@ -339,12 +481,48 @@ const normalizeStackIndentation = (stack) => {
   return unsplitStack(messageLines, normalizedStackLines)
 }
 
+const normalizedWebKitStack = (stack: string) => {
+  const lines = stack.split('\n')
+
+  return lines.flatMap((line, index) => {
+    const atIndex = line.lastIndexOf('@')
+
+    if (atIndex === -1) return [line]
+
+    const functionName = line.slice(0, atIndex)
+    const location = line.slice(atIndex + 1)
+
+    // We patch WebKit's Error within the AUT as CyWebKitError, causing it to
+    // be presented within the stack. If we detect it within the stack, we remove it.
+    if (functionName === '__CyWebKitError') {
+      return index === lines.length - 1 ? [''] : []
+    }
+
+    return [`${functionName || '<unknown>'}@${location || '<unknown>'}`]
+  }).join('\n')
+}
+
 const normalizedStack = (err) => {
   // Firefox errors do not include the name/message in the stack, whereas
   // Chromium-based errors do, so we normalize them so that the stack
   // always includes the name/message
   const errString = err.toString()
-  const errStack = err.stack || ''
+  let errStack = err.stack || ''
+
+  if (Cypress.isBrowser('webkit')) {
+    // WebKit will not determine the proper stack trace for an error, with stack entries
+    // missing function names, call locations, or both. This is due to a number of documented
+    // issues with WebKit:
+    // https://bugs.webkit.org/show_bug.cgi?id=86493
+    // https://bugs.webkit.org/show_bug.cgi?id=243668
+    // https://bugs.webkit.org/show_bug.cgi?id=174380
+    //
+    // We update these stack entries with placeholder names/locations to more closely align
+    // the output with other browsers, minimizing the visual impact to the stack traces we render
+    // within the command log and console and ensuring that the stacks can be identified within
+    // and parsed out of test snapshots that include them.
+    errStack = normalizedWebKitStack(errStack)
+  }
 
   // the stack has already been normalized and normalizing the indentation
   // again could mess up the whitespace
@@ -367,22 +545,67 @@ const normalizedUserInvocationStack = (userInvocationStack) => {
   // add/$Chainer.prototype[key] (cypress:///../driver/src/cypress/chainer.js:30:128)
   // whereas Chromium browsers have the user's line first
   const stackLines = getStackLines(userInvocationStack)
-  const winnowedStackLines = _.reject(stackLines, (line) => {
-    // WARNING: STACK TRACE WILL BE DIFFERENT IN DEVELOPMENT vs PRODUCTOIN
+  const nonCypressStackLines = _.reject(stackLines, (line) => {
+    // WARNING: STACK TRACE WILL BE DIFFERENT IN DEVELOPMENT vs PRODUCTION
     // stacks in development builds look like:
     //     at cypressErr (cypress:///../driver/src/cypress/error_utils.js:259:17)
     // stacks in prod builds look like:
     //     at cypressErr (http://localhost:3500/isolated-runner/cypress_runner.js:173123:17)
-    return line.includes('cy[name]') || line.includes('Chainer.prototype[key]')
+    return line.includes('cy[name]')
+    || line.includes('Chainer.prototype[key]')
+    || line.includes('cy.<computed>')
+    || line.includes('$Chainer.<computed>')
+    // Note that these are hard coded for now, because they are happening in the prompt command
+    // for some reason. Long term, we should make this more dynamic if necessary.
+    || line.includes('$Cy.prompt')
+    || line.includes('$Chainer.prompt')
+    || line.includes('CyPrompt.prototype.prompt')
+    // Remove cross origin stack lines
+    || line.includes('SpecBridgeCommunicator')
+    || (line.includes('at invokeOriginFn') && !line.includes('at eval'))
   }).join('\n')
 
-  return normalizeStackIndentation(winnowedStackLines)
+  return normalizeStackIndentation(nonCypressStackLines)
+}
+
+const mergeCrossOriginUserInvocationStack = (userInvocationStack: string, originUserInvocationStack: string) => {
+  // The method here is:
+  // 1. Grab the line/column from the first line of the origin user invocation stack
+  // 2. Add it to and replace the line/column of the first line of the user invocation stack
+  //
+  // Note: If any of our assumptions about the stack format are violated, this will just
+  // return the original user invocation stack to avoid breaking the stack trace.
+  const originStackLines = getStackLines(originUserInvocationStack)
+  const userStackLines = getStackLines(userInvocationStack)
+
+  if (userStackLines.length === 0 || originStackLines.length === 0) return userInvocationStack
+
+  // Note: chrome adds a parenthesis to the end of the stack line and firefox does not
+  const userStackMatch = userStackLines[0].match(/(\d+):(\d+)\)?$/)
+
+  if (!userStackMatch) return userInvocationStack
+
+  const userLine = Number(userStackMatch[1])
+  const userColumn = Number(userStackMatch[2])
+
+  // Note: chrome adds a parenthesis to the end of the stack line and firefox does not
+  const originStackMatch = originStackLines[0].match(/(\d+):(\d+)\)?$/)
+
+  if (!originStackMatch) return userInvocationStack
+
+  const originLine = Number(originStackMatch[1])
+
+  // Note: chrome adds a parenthesis to the end of the stack line and firefox does not so we need to keep whatever we find
+  const newUserStackLine = `${originStackLines[0].replace(/(\d+:\d+)(\)?)$/, `${originLine + userLine - 1}:${userColumn}$2`)}`
+
+  return userInvocationStack.replace(userStackLines[0], newUserStackLine)
 }
 
 export default {
   replacedStack,
   getCodeFrame,
   getCodeFrameFromSource,
+  getRelativePathFromRoot,
   getSourceStack,
   getStackLines,
   getSourceDetailsForFirstLine,
@@ -393,7 +616,9 @@ export default {
   stackWithLinesDroppedFromMarker,
   stackWithoutMessage,
   stackWithReplacementMarkerLineRemoved,
+  stackPriorToReplacementMarker,
   stackWithUserInvocationStackSpliced,
   captureUserInvocationStack,
   getInvocationDetails,
+  mergeCrossOriginUserInvocationStack,
 }

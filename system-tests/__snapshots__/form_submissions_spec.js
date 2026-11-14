@@ -7,14 +7,14 @@ exports['e2e forms / <form> submissions / passes with https on localhost'] = `
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Cypress:    1.2.3                                                                              │
   │ Browser:    FooBrowser 88                                                                      │
-  │ Specs:      1 found (form_submission_multipart_spec.js)                                        │
-  │ Searched:   cypress/integration/form_submission_multipart_spec.js                              │
+  │ Specs:      1 found (form_submission_multipart.cy.js)                                          │
+  │ Searched:   cypress/e2e/form_submission_multipart.cy.js                                        │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                     
-  Running:  form_submission_multipart_spec.js                                               (1 of 1)
+  Running:  form_submission_multipart.cy.js                                                 (1 of 1)
 
 
   <form> submissions
@@ -40,17 +40,10 @@ exports['e2e forms / <form> submissions / passes with https on localhost'] = `
   │ Pending:      0                                                                                │
   │ Skipped:      0                                                                                │
   │ Screenshots:  0                                                                                │
-  │ Video:        true                                                                             │
+  │ Video:        false                                                                            │
   │ Duration:     X seconds                                                                        │
-  │ Spec Ran:     form_submission_multipart_spec.js                                                │
+  │ Spec Ran:     form_submission_multipart.cy.js                                                  │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-  (Video)
-
-  -  Started processing:  Compressing to 32 CRF                                                     
-  -  Finished processing: /XXX/XXX/XXX/cypress/videos/form_submission_multipart_spec.     (X second)
-                          js.mp4                                                                    
 
 
 ====================================================================================================
@@ -60,7 +53,7 @@ exports['e2e forms / <form> submissions / passes with https on localhost'] = `
 
        Spec                                              Tests  Passing  Failing  Pending  Skipped  
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ ✔  form_submission_multipart_spec.js        XX:XX        7        7        -        -        - │
+  │ ✔  form_submission_multipart.cy.js          XX:XX        7        7        -        -        - │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
     ✔  All specs passed!                        XX:XX        7        7        -        -        -  
 
@@ -76,14 +69,14 @@ exports['e2e forms / <form> submissions / passes with http on localhost'] = `
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Cypress:    1.2.3                                                                              │
   │ Browser:    FooBrowser 88                                                                      │
-  │ Specs:      1 found (form_submission_multipart_spec.js)                                        │
-  │ Searched:   cypress/integration/form_submission_multipart_spec.js                              │
+  │ Specs:      1 found (form_submission_multipart.cy.js)                                          │
+  │ Searched:   cypress/e2e/form_submission_multipart.cy.js                                        │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                     
-  Running:  form_submission_multipart_spec.js                                               (1 of 1)
+  Running:  form_submission_multipart.cy.js                                                 (1 of 1)
 
 
   <form> submissions
@@ -109,17 +102,10 @@ exports['e2e forms / <form> submissions / passes with http on localhost'] = `
   │ Pending:      0                                                                                │
   │ Skipped:      0                                                                                │
   │ Screenshots:  0                                                                                │
-  │ Video:        true                                                                             │
+  │ Video:        false                                                                            │
   │ Duration:     X seconds                                                                        │
-  │ Spec Ran:     form_submission_multipart_spec.js                                                │
+  │ Spec Ran:     form_submission_multipart.cy.js                                                  │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-  (Video)
-
-  -  Started processing:  Compressing to 32 CRF                                                     
-  -  Finished processing: /XXX/XXX/XXX/cypress/videos/form_submission_multipart_spec.     (X second)
-                          js.mp4                                                                    
 
 
 ====================================================================================================
@@ -129,7 +115,7 @@ exports['e2e forms / <form> submissions / passes with http on localhost'] = `
 
        Spec                                              Tests  Passing  Failing  Pending  Skipped  
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ ✔  form_submission_multipart_spec.js        XX:XX        7        7        -        -        - │
+  │ ✔  form_submission_multipart.cy.js          XX:XX        7        7        -        -        - │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
     ✔  All specs passed!                        XX:XX        7        7        -        -        -  
 
@@ -145,14 +131,14 @@ exports['e2e forms / submissions with jquery XHR POST / failing'] = `
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Cypress:    1.2.3                                                                              │
   │ Browser:    FooBrowser 88                                                                      │
-  │ Specs:      1 found (form_submission_failing_spec.js)                                          │
-  │ Searched:   cypress/integration/form_submission_failing_spec.js                                │
+  │ Specs:      1 found (form_submission_failing.cy.js)                                            │
+  │ Searched:   cypress/e2e/form_submission_failing.cy.js                                          │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                     
-  Running:  form_submission_failing_spec.js                                                 (1 of 1)
+  Running:  form_submission_failing.cy.js                                                   (1 of 1)
 
 
   form submission fails
@@ -178,86 +164,11 @@ exports['e2e forms / submissions with jquery XHR POST / failing'] = `
   │ Failing:      1                                                                                │
   │ Pending:      0                                                                                │
   │ Skipped:      0                                                                                │
-  │ Screenshots:  1                                                                                │
-  │ Video:        true                                                                             │
-  │ Duration:     X seconds                                                                        │
-  │ Spec Ran:     form_submission_failing_spec.js                                                  │
-  └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-  (Screenshots)
-
-  -  /XXX/XXX/XXX/cypress/screenshots/form_submission_failing_spec.js/form submission     (1280x720)
-      fails -- fails without an explicit wait when an element is immediately found (f               
-     ailed).png                                                                                     
-
-
-  (Video)
-
-  -  Started processing:  Compressing to 32 CRF                                                     
-  -  Finished processing: /XXX/XXX/XXX/cypress/videos/form_submission_failing_spec.js     (X second)
-                          .mp4                                                                      
-
-
-====================================================================================================
-
-  (Run Finished)
-
-
-       Spec                                              Tests  Passing  Failing  Pending  Skipped  
-  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ ✖  form_submission_failing_spec.js          XX:XX        1    └────────────────────────────────────────────────────────────────────────────────────────────────┘
-    ✖  1 of 1 failed (100%)                     XX:XX        1  
-
-`
-
-exports['e2e forms / submissions with jquery XHR POST / passing'] = `
-
-====================================================================================================
-
-  (Run Starting)
-
-  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Cypress:    1.2.3                                                                              │
-  │ Browser:    FooBrowser 88                                                                      │
-  │ Specs:      1 found (form_submission_passing_spec.js)                                          │
-  │ Searched:   cypress/integration/form_submission_passing_spec.js                                │
-  └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-────────────────────────────────────────────────────────────────────────────────────────────────────
-                                                                                                    
-  Running:  form_submission_passing_spec.js                                                 (1 of 1)
-
-
-  form submissions
-    ✓ will find 'form success' message by default (after retrying)
-    ✓ needs an explicit should when an element is immediately found
-
-
-  2 passing
-
-
-  (Results)
-
-  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Tests:        2                                                                                │
-  │ Passing:      2                                                                                │
-  │ Failing:      0                                                                                │
-  │ Pending:      0                                                                                │
-  │ Skipped:      0                                                                                │
   │ Screenshots:  0                                                                                │
-  │ Video:        true                                                                             │
+  │ Video:        false                                                                            │
   │ Duration:     X seconds                                                                        │
-  │ Spec Ran:     form_submission_passing_spec.js                                                  │
+  │ Spec Ran:     form_submission_failing.cy.js                                                    │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-  (Video)
-
-  -  Started processing:  Compressing to 32 CRF                                                     
-  -  Finished processing: /XXX/XXX/XXX/cypress/videos/form_submission_passing_spec.js     (X second)
-                          .mp4                                                                      
 
 
 ====================================================================================================
@@ -267,9 +178,7 @@ exports['e2e forms / submissions with jquery XHR POST / passing'] = `
 
        Spec                                              Tests  Passing  Failing  Pending  Skipped  
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ ✔  form_submission_passing_spec.js          XX:XX        2        2        -        -        - │
-  └────────────────────────────────────────────────────────────────────────────────────────────────┘
-    ✔  All specs passed!                        XX:XX        2        2        -        -        -  
-
+  │ ✖  form_submission_failing.cy.js            XX:XX        1    └────────────────────────────────────────────────────────────────────────────────────────────────┘
+    ✖  1 of 1 failed (100%)                     XX:XX        1  
 
 `

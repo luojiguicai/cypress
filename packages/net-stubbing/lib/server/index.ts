@@ -1,14 +1,16 @@
 export { onNetStubbingEvent } from './driver-events'
 
+export { DriverInterceptRegistrationAdapter } from '../adapters/driver-intercept-registration'
+
 export { InterceptError } from './middleware/error'
 
-export { InterceptRequest } from './middleware/request'
+export { SetMatchingRoutes, InterceptRequest } from './middleware/request'
 
 export { InterceptResponse } from './middleware/response'
 
-export { NetStubbingState } from './types'
+export { handleInterceptResponse } from './handle-intercept-response'
 
-export { getRouteForRequest } from './route-matching'
+export type { NetStubbingState } from './types'
 
 import { state } from './state'
 

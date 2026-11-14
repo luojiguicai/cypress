@@ -2,24 +2,82 @@ import $elements from '../dom/elements'
 
 const invalidTargets = new Set(['_parent', '_top'])
 
-export type GuardedEvent = Event & {target: HTMLFormElement | HTMLAnchorElement}
+export type GuardedEvent = Event & { target: HTMLFormElement | HTMLAnchorElement }
 
 /**
- * Guard against target beting set to something other than blank or self, while trying
+ * A `<base target>` is inherited by every untargeted <a> / <form>, so a value of
+ * `_top` or `_parent` will navigate the AUT out of the Cypress iframe even if
+ * the individual element's `target` attribute is empty. The proxy's HTML rewriter
+ * handles this at load time; this guard backstops dynamically inserted or
+ * post-load-modified <base> tags that bypass the rewriter.
+ */
+function neutralizeUnsafeBaseTarget (doc: Document | null | undefined) {
+  if (!doc) return
+
+  const base = doc.querySelector('base[target]') as HTMLBaseElement | null
+
+  // `HTMLBaseElement.target` reflects the raw content attribute without case
+  // normalization, but the browser matches `_top` / `_parent` case-insensitively
+  // at navigation time — so `<base target="_TOP">` would escape the AUT iframe
+  // unless we lowercase the comparison.
+  if (base && invalidTargets.has(base.target.toLowerCase())) {
+    base.removeAttribute('target')
+  }
+}
+
+/**
+ * Guard against target being set to something other than blank or self, while trying
  * to preserve the appearance of having the correct target value.
  */
 export function handleInvalidEventTarget (e: GuardedEvent) {
-  let targetValue = e.target.target
-  let targetSet = e.target.hasAttribute('target')
+  handleInvalidTarget(e.target)
+}
 
-  if (invalidTargets.has(e.target.target)) {
-    e.target.target = ''
+export type GuardedAnchorEvent = Event & { target: HTMLAnchorElement }
+
+/**
+ * We need to listen to all click events on the window, but only handle anchor elements,
+ * as those might be the ones where we have an incorrect "target" attr, or could have one
+ * dynamically set in subsequent event bubbling.
+ *
+ * @param e
+ */
+export function handleInvalidAnchorTarget (e: GuardedAnchorEvent) {
+  if (e.target.tagName === 'A') {
+    handleInvalidTarget(e.target)
+
+    return
   }
 
-  const { getAttribute, setAttribute, removeAttribute } = e.target
-  const targetDescriptor = Object.getOwnPropertyDescriptor(e.target, 'target')
+  // A click on a descendant of an anchor (e.g. `<a><span>`) sets `e.target` to the
+  // descendant rather than the anchor. The navigation still bubbles up to the <a>
+  // and inherits the document's base target, so base-level neutralization must run
+  // independently of the per-element anchor patch.
+  neutralizeUnsafeBaseTarget(e.target?.ownerDocument)
+}
 
-  e.target.getAttribute = function (k) {
+/**
+ * Guard against target being set to something other than blank or self, while trying
+ * to preserve the appearance of having the correct target value.
+ */
+export function handleInvalidTarget (el: HTMLFormElement | HTMLAnchorElement) {
+  // Neutralize unsafe `<base target>` before any per-element patching. Every
+  // navigation path — same-origin submit events, cross-origin programmatic
+  // `form.submit()`, anchor clicks — routes through here, so the document-scoped
+  // neutralization lives here to keep all call sites covered.
+  neutralizeUnsafeBaseTarget(el.ownerDocument)
+
+  let targetValue = el.target
+  let targetSet = el.hasAttribute('target')
+
+  if (invalidTargets.has(el.target)) {
+    el.target = ''
+  }
+
+  const { getAttribute, setAttribute, removeAttribute } = el
+  const targetDescriptor = Object.getOwnPropertyDescriptor(el, 'target')
+
+  el.getAttribute = function (k) {
     if (k === 'target') {
       // https://github.com/cypress-io/cypress/issues/17512
       // When the target attribute doesn't exist, it should return null.
@@ -34,7 +92,7 @@ export function handleInvalidEventTarget (e: GuardedEvent) {
     return getAttribute.call(this, k)
   }
 
-  e.target.setAttribute = function (k, v) {
+  el.setAttribute = function (k, v) {
     if (k === 'target') {
       targetSet = true
       targetValue = v
@@ -45,18 +103,18 @@ export function handleInvalidEventTarget (e: GuardedEvent) {
     return setAttribute.call(this, k, v)
   }
 
-  e.target.removeAttribute = function (k) {
+  el.removeAttribute = function (k) {
     if (k === 'target') {
       targetSet = false
       targetValue = ''
-
-      // We're not using `$elements.callNativeMethod` here because it disallows `removeAttribute`.
-      return removeAttribute.call(this, k)
     }
+
+    // We're not using `$elements.callNativeMethod` here because it disallows `removeAttribute`.
+    return removeAttribute.call(this, k)
   }
 
   if (!targetDescriptor) {
-    Object.defineProperty(e.target, 'target', {
+    Object.defineProperty(el, 'target', {
       configurable: false,
       set (value) {
         return targetValue = value
@@ -65,20 +123,5 @@ export function handleInvalidEventTarget (e: GuardedEvent) {
         return targetValue
       },
     })
-  }
-}
-
-export type GuardedAnchorEvent = Event & {target: HTMLAnchorElement}
-
-/**
- * We need to listen to all click events on the window, but only handle anchor elements,
- * as those might be the ones where we have an incorrect "target" attr, or could have one
- * dynamically set in subsequent event bubbling.
- *
- * @param e
- */
-export function handleInvalidAnchorTarget (e: GuardedAnchorEvent) {
-  if (e.target.tagName === 'A') {
-    handleInvalidEventTarget(e)
   }
 }

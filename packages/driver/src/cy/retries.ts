@@ -1,13 +1,37 @@
 import _ from 'lodash'
 import Promise from 'bluebird'
+import Debug from 'debug'
 
+import type { CypressError } from '../cypress/error_utils'
 import $errUtils from '../cypress/error_utils'
+import type { ICypress } from '../cypress'
+import type { $Cy } from '../cypress/cy'
+import type { StateFunc } from '../cypress/state'
+import type { Log } from '../cypress/log'
 
 const { errByPath, modifyErrMsg, throwErr, mergeErrProps } = $errUtils
 
+const debug = Debug('cypress:driver:retries')
+
+type retryOptions = {
+  _interval?: number
+  _log?: Log
+  _name?: string
+  _retries?: number
+  _runnable?: any
+  _runnableTimeout?: number
+  _start?: Date
+  error?: CypressError
+  interval: number
+  log: boolean
+  onFail?: (err: Error) => Error
+  timeout: number
+  total?: number
+}
+
 // eslint-disable-next-line @cypress/dev/arrow-body-multiline-braces
-export const create = (Cypress, state, timeout, clearTimeout, whenStable, finishAssertions) => ({
-  retry (fn, options, log) {
+export const create = (Cypress: ICypress, state: StateFunc, timeout: $Cy['timeout'], clearTimeout: $Cy['clearTimeout'], whenStable: $Cy['whenStable'], finishAssertions: (err?: Error) => void) => ({
+  retry (fn, options: retryOptions) {
     // remove the runnables timeout because we are now in retry
     // mode and should be handling timing out ourselves and dont
     // want to accidentally time out via mocha
@@ -20,12 +44,6 @@ export const create = (Cypress, state, timeout, clearTimeout, whenStable, finish
 
     const current = state('current')
 
-    // use the log if passed in, else fallback to options._log
-    // else fall back to just grabbing the last log per our current command
-    if (!log) {
-      log = options._log ?? current?.getLastLog()
-    }
-
     _.defaults(options, {
       _runnable: state('runnable'),
       _runnableTimeout: runnableTimeout,
@@ -35,40 +53,23 @@ export const create = (Cypress, state, timeout, clearTimeout, whenStable, finish
       _name: current?.get('name'),
     })
 
-    let { error } = options
-
     const interval = options.interval ?? options._interval
 
     // we calculate the total time we've been retrying
-    // so we dont exceed the runnables timeout
-    const total = Date.now() - options._start
+    // so we don't exceed the runnables timeout
+    const total = Date.now().valueOf() - options._start!.valueOf()
 
     options.total = total
 
     // increment retries
-    options._retries += 1
+    options._retries! += 1
 
     // if our total exceeds the timeout OR the total + the interval
     // exceed the runnables timeout, then bail
-    if ((total + interval) >= options._runnableTimeout) {
-      // snapshot the DOM since we are bailing
-      // so the user can see the state we're in
-      // when we fail
-      if (log) {
-        log.snapshot()
-      }
+    if ((total + interval) >= options._runnableTimeout!) {
+      const { error, onFail } = options
 
-      const assertions = options.assertions
-
-      if (assertions) {
-        finishAssertions(assertions)
-      }
-
-      let onFail
-
-      ({ error, onFail } = options)
-
-      const prependMsg = errByPath('miscellaneous.retry_timed_out', {
+      const prependMsg = error?.retry === false ? '' : errByPath('miscellaneous.retry_timed_out', {
         ms: options._runnableTimeout,
       }).message
 
@@ -76,11 +77,19 @@ export const create = (Cypress, state, timeout, clearTimeout, whenStable, finish
         return `${msg2}${msg1}`
       })
 
-      const retryErr = mergeErrProps(error, retryErrProps)
+      if (error) {
+        const retryErr = mergeErrProps(error, retryErrProps)
 
-      throwErr(retryErr, {
-        onFail: onFail || log,
-      })
+        throwErr(retryErr, {
+          onFail: (err) => {
+            if (onFail) {
+              err = onFail(err)
+            }
+
+            finishAssertions(err)
+          },
+        })
+      }
     }
 
     const runnableHasChanged = () => {
@@ -91,8 +100,7 @@ export const create = (Cypress, state, timeout, clearTimeout, whenStable, finish
     const ended = () => {
       // we should NOT retry if
       // 1. our promise has been canceled
-      // 2. or we have an error
-      // 3. or if the runnables has changed
+      // 2. or if the runnables has changed
 
       // although bluebird SHOULD cancel these retries
       // since they're all connected - apparently they
@@ -102,7 +110,24 @@ export const create = (Cypress, state, timeout, clearTimeout, whenStable, finish
       // bug in bluebird with not propagating cancellations
       // fast enough in a series of promises
       // https://github.com/petkaantonov/bluebird/issues/1424
-      return state('canceled') || state('error') || runnableHasChanged()
+
+      // reaching this code at all after cancellation or after the runnable
+      // has changed means bluebird did not cancel this retry's promise chain
+      // in time, so log it to make any resulting cross-test contamination
+      // diagnosable
+      if (state('canceled')) {
+        debug('retry #%d of `%s` ran while state(\'canceled\') was true; not retrying', options._retries, options._name)
+
+        return true
+      }
+
+      if (runnableHasChanged()) {
+        debug('retry #%d of `%s` ran after the runnable changed from %o to %o; not retrying', options._retries, options._name, options._runnable?.title, state('runnable')?.title)
+
+        return true
+      }
+
+      return false
     }
 
     return Promise
@@ -130,6 +155,31 @@ export const create = (Cypress, state, timeout, clearTimeout, whenStable, finish
       return whenStable(fn)
     })
   },
+  retryIfCommandAUTOriginMismatch (fn: () => any, timeout: number) {
+    const options: retryOptions = {
+      log: true,
+      timeout,
+      interval: 100,
+    }
+
+    const retryValue = () => {
+      return Promise
+      .try(() => {
+        // If command is not same origin, this will throw an error. also, in this instance, this is cy
+        // @ts-expect-error - cy is typed as the public cy, not $Cy
+        Cypress.ensure.commandCanCommunicateWithAUT(cy)
+      })
+      .catch((err) => {
+        options.error = err
+
+        return this.retry(retryValue, options)
+      })
+    }
+
+    return retryValue().then(() => {
+      return fn()
+    })
+  },
 })
 
-export interface IRetries extends ReturnType<typeof create> {}
+export type IRetries = ReturnType<typeof create>

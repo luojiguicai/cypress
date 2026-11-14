@@ -3,74 +3,136 @@ import $errUtils from '../cypress/error_utils'
 
 // See Test Config Overrides in ../../../../cli/types/cypress.d.ts
 
+export type MochaOverrideLevel = 'restoring' | 'suite' | 'test'
+
 type ResolvedTestConfigOverride = {
   /**
    * The list of test config overrides and the invocation details used to add helpful
    * error messaging to consumers if a test override fails validation.
    */
-  testConfigList: Array<TestConfig>
+  testConfigList: Array<TestConfig | ResolvedTestConfigOverride>
   /**
    * The test config overrides that will apply to the test if it passes validation.
-   * */
-  unverifiedTestConfig: Object
+   */
+  unverifiedTestConfig: object
+  /**
+   * The current runnable level of test config overrides that are being applied.
+   * Used for accurate error reporting.
+   */
+  applied?: MochaOverrideLevel | 'complete'
 }
 
 type TestConfig = {
-  overrides: {
-    browser?: Object
-  }
+  // The level in which the configuration override was set.
+  overrideLevel: MochaOverrideLevel
+  // The configuration overrides. Browser is a valid configuration
+  // to indicate the suite or test should run for that browser(s).
+  overrides: Record<string, any>
   invocationDetails: {
-    stack: Object
+    stack: object
   }
-};
+}
 
 type ConfigOverrides = {
-  env: Object | undefined
-};
+  expose?: Record<string, any>
+}
 
-function setConfig (testConfigList: Array<TestConfig>, config, localConfigOverrides: ConfigOverrides = { env: undefined }) {
-  testConfigList.forEach(({ overrides: testConfigOverride, invocationDetails }) => {
+type ExposeKeyBackup =
+  | { existed: true, value: any }
+  | { existed: false }
+
+type ExposeFn = Cypress.Cypress['expose']
+
+/**
+ * Saves an existing expose key and returns the original value to be restored after the test runs.
+ */
+function backupExposeKey (key: string, expose: ExposeFn): ExposeKeyBackup {
+  const allExpose = expose()
+
+  if (Object.prototype.hasOwnProperty.call(allExpose, key)) {
+    return { existed: true, value: _.cloneDeep(expose(key)) }
+  }
+
+  return { existed: false }
+}
+
+/**
+ * Restores an expose key from a backup value after the test runs. If no value existed, the key will be deleted.
+ */
+function restoreExposeKey (key: string, backup: ExposeKeyBackup, expose: ExposeFn) {
+  if (backup.existed) {
+    expose(key, _.cloneDeep(backup.value))
+  } else {
+    delete expose()[key]
+  }
+}
+
+function setConfig (testConfig: ResolvedTestConfigOverride, config, localConfigOverrides: ConfigOverrides = { expose: undefined }) {
+  const { testConfigList = [] } = testConfig
+
+  testConfigList.forEach((resolvedConfig) => {
+    const { overrides: testConfigOverride, overrideLevel, invocationDetails } = resolvedConfig as TestConfig
+
     if (_.isArray(testConfigOverride)) {
-      setConfig(testConfigOverride, config, localConfigOverrides)
-    } else {
-      delete testConfigOverride.browser
+      setConfig(resolvedConfig as ResolvedTestConfigOverride, config, localConfigOverrides)
+    } else if (Object.keys(testConfigOverride).length) {
+      const testConfigOverrideCopy = { ...testConfigOverride }
+      const exposeOverride = testConfigOverrideCopy.expose
+
+      delete testConfigOverrideCopy.browser
+      delete testConfigOverrideCopy.expose
 
       try {
-        config(testConfigOverride)
+        testConfig.applied = overrideLevel
+
+        config(testConfigOverrideCopy)
       } catch (e: any) {
-        let err = $errUtils.errByPath('config.invalid_test_override', {
+        const err = $errUtils.errByPath('config.invalid_test_override', {
           errMsg: e.message,
+          overrideLevel,
         })
 
         err.stack = $errUtils.stackWithReplacedProps({ stack: invocationDetails.stack }, err)
         throw err
       }
-      localConfigOverrides = { ...localConfigOverrides, ...testConfigOverride }
+
+      localConfigOverrides = { ...localConfigOverrides, ...testConfigOverrideCopy }
+
+      if (exposeOverride) {
+        localConfigOverrides.expose = {
+          ...localConfigOverrides.expose,
+          ...exposeOverride,
+        }
+      }
     }
   })
 
   return localConfigOverrides
 }
 
-function mutateConfiguration (testConfig: ResolvedTestConfigOverride, config, env) {
-  const { testConfigList } = testConfig || []
-
+function mutateConfiguration (testConfig: ResolvedTestConfigOverride, config, expose: ExposeFn) {
   let globalConfig = _.clone(config())
 
-  const localConfigOverrides = setConfig(testConfigList, config)
+  const localConfigOverrides = setConfig(testConfig, config)
 
   // only store the global config values that updated
   globalConfig = _.pick(globalConfig, Object.keys(localConfigOverrides))
-  const globalEnv = _.clone(env())
 
   const localConfigOverridesBackup = _.clone(localConfigOverrides)
 
-  if (localConfigOverrides.env) {
-    env(localConfigOverrides.env)
-  }
+  let testExposeBackup: Map<string, ExposeKeyBackup> | undefined
 
-  const localTestEnv = env()
-  const localTestEnvBackup = _.clone(localTestEnv)
+  // Expose overrides are applied at test start and restored after each test for only the overridden keys
+  // so hook-level values remain intact.
+  if (localConfigOverrides.expose) {
+    const exposeBackup = new Map<string, ExposeKeyBackup>()
+
+    testExposeBackup = exposeBackup
+    _.each(localConfigOverrides.expose, (val, key) => {
+      exposeBackup.set(key, backupExposeKey(key, expose))
+      expose(key, _.cloneDeep(val))
+    })
+  }
 
   // we restore config back to what it was before the test ran
   // UNLESS the user mutated config with Cypress.config, in which case
@@ -79,27 +141,28 @@ function mutateConfiguration (testConfig: ResolvedTestConfigOverride, config, en
   //   do not allow global mutations inside test
   const restoreConfigFn = function () {
     _.each(localConfigOverrides, (val, key) => {
+      if (key === 'expose') {
+        return
+      }
+
       if (localConfigOverridesBackup[key] !== val) {
         globalConfig[key] = val
       }
 
       // explicitly set to undefined if config wasn't previously defined
-      if (!globalConfig.hasOwnProperty(key)) {
+      if (!Object.prototype.hasOwnProperty.call(globalConfig, key)) {
         globalConfig[key] = undefined
       }
     })
 
-    _.each(localTestEnv, (val, key) => {
-      if (localTestEnvBackup[key] !== val) {
-        globalEnv[key] = val
+    if (testExposeBackup) {
+      for (const [key, backup] of testExposeBackup) {
+        restoreExposeKey(key, backup, expose)
       }
-    })
+    }
 
     // reset test config overrides
     config(globalConfig)
-
-    env.reset()
-    env(globalEnv)
   }
 
   return restoreConfigFn
@@ -107,7 +170,7 @@ function mutateConfiguration (testConfig: ResolvedTestConfigOverride, config, en
 
 // this is called during test onRunnable time
 // in order to resolve the test config upfront before test runs
-// note: must return as an object to meet the dashboard recording API
+// note: must return as an object to meet the Cypress Cloud recording API
 export function getResolvedTestConfigOverride (test): ResolvedTestConfigOverride {
   let curr = test
   let testConfigList: TestConfig[] = []
@@ -119,6 +182,7 @@ export function getResolvedTestConfigOverride (test): ResolvedTestConfigOverride
         testConfigList = testConfigList.concat(curr._testConfig.testConfigList)
       } else {
         testConfigList.unshift({
+          overrideLevel: curr.type,
           overrides: curr._testConfig,
           invocationDetails: curr.invocationDetails,
         })
@@ -130,23 +194,43 @@ export function getResolvedTestConfigOverride (test): ResolvedTestConfigOverride
 
   const testConfig = {
     testConfigList: testConfigList.filter(({ overrides }) => overrides !== undefined),
-    // collect test overrides to send to the dashboard api when @packages/server is ran in record mode
-    unverifiedTestConfig: _.reduce(testConfigList, (acc, { overrides }) => _.extend(acc, overrides), {}),
+    // collect test overrides to send to the Cypress Cloud api when @packages/server is ran in record mode
+    unverifiedTestConfig: _.reduce(testConfigList, (acc: Record<string, any>, { overrides }) => {
+      const result = _.extend({}, acc, overrides)
+
+      if (overrides?.expose) {
+        result.expose = {
+          ...acc.expose,
+          ...overrides.expose,
+        }
+      }
+
+      return result
+    }, {} as Record<string, any>),
   }
 
   return testConfig
 }
 
 export class TestConfigOverride {
-  private restoreTestConfigFn: Nullable<() => void> = null
+  private restoreTestConfigFn: Cypress.Nullable<() => void> = null
 
-  restoreAndSetTestConfigOverrides (test, config, env) {
-    if (this.restoreTestConfigFn) this.restoreTestConfigFn()
+  restoreAndSetTestConfigOverrides (test, config, expose: ExposeFn) {
+    if (this.restoreTestConfigFn) {
+      test._testConfig.applied = 'restoring'
+      this.restoreTestConfigFn()
+    }
 
-    const resolvedTestConfig = test._testConfig || {}
+    const resolvedTestConfig = test._testConfig || {
+      unverifiedTestConfig: [],
+    }
 
     if (Object.keys(resolvedTestConfig.unverifiedTestConfig).length > 0) {
-      this.restoreTestConfigFn = mutateConfiguration(resolvedTestConfig, config, env)
+      this.restoreTestConfigFn = mutateConfiguration(resolvedTestConfig, config, expose)
+    } else {
+      this.restoreTestConfigFn = null
     }
+
+    resolvedTestConfig.applied = 'complete'
   }
 }

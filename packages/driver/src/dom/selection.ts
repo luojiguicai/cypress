@@ -58,7 +58,7 @@ const _getSelectionBoundsFromContentEditable = (el) => {
   }
 
   const range = sel.getRangeAt(0)
-  let preCaretRange = range.cloneRange()
+  const preCaretRange = range.cloneRange()
 
   preCaretRange.selectNodeContents(el)
   preCaretRange.setEnd(range.endContainer, range.endOffset)
@@ -335,14 +335,38 @@ const _moveCursorUpOrDown = function (up: boolean, el: HTMLElement) {
     // on an input, instead of moving the cursor
     // we want to perform the native browser action
     // which is to increment the step/interval
-    if ($elements.isInputType(el, 'number')) {
+
+    const validInputTypes = [
+      'number',
+      'datetime-local',
+      'date',
+      'time',
+      'week',
+      'month',
+      'range',
+    ]
+
+    const check = validInputTypes.some((type) => $elements.isInputType(el, type))
+
+    if (check) {
       if (up) {
         if (typeof el.stepUp === 'function') {
+          const changeEvent = new Event('change')
+
+          const inputEvent = new Event('input')
+
           el.stepUp()
+          el.dispatchEvent(inputEvent)
+          el.dispatchEvent(changeEvent)
         }
       } else {
         if (typeof el.stepDown === 'function') {
+          const changeEvent = new Event('change')
+          const inputEvent = new Event('input')
+
           el.stepDown()
+          el.dispatchEvent(inputEvent)
+          el.dispatchEvent(changeEvent)
         }
       }
     }
@@ -420,12 +444,6 @@ const _moveCursorToLineStartOrEnd = function (toStart: boolean, el: HTMLElement)
 
         return
       }
-      // const doc = $document.getDocumentFromElement(el)
-      // console.log(doc.activeElement)
-      // $elements.callNativeMethod(doc, 'execCommand', 'selectall', false)
-      // $elements.callNativeMethod(el, 'select')
-      // _getSelectionByEl(el).ca
-      // toStart ? _getSelectionByEl(el).collapseToStart : _getSelectionByEl(el).collapseToEnd()
 
       if (isTextarea) {
         const bounds = _getSelectionBoundsFromTextarea(el)
@@ -515,7 +533,7 @@ const getSelectionBounds = function (el) {
   }
 }
 
-const _moveSelectionTo = function (toStart: boolean, el: HTMLElement, options = {}) {
+const _moveSelectionTo = function (toStart: boolean, el: HTMLElement, options: { onlyIfEmptySelection?: boolean } = {}) {
   const opts = _.defaults({}, options, {
     onlyIfEmptySelection: false,
   })
@@ -581,19 +599,7 @@ const _moveSelectionTo = function (toStart: boolean, el: HTMLElement, options = 
         $elements.callNativeMethod(doc, 'execCommand', 'selectAll', false, null)
       }
     } else {
-      let range
-
-      // Sometimes, selection.rangeCount is 0 when there is no selection.
-      // In that case, it fails in Chrome.
-      // We're creating a new range and add it to the selection to avoid the case.
-      if (selection.rangeCount === 0) {
-        range = doc.createRange()
-        selection.addRange(range)
-      } else {
-        range = selection.getRangeAt(0)
-      }
-
-      range.selectNodeContents(el)
+      selection.selectAllChildren(el)
     }
 
     toStart ? selection.collapseToStart() : selection.collapseToEnd()
@@ -602,9 +608,9 @@ const _moveSelectionTo = function (toStart: boolean, el: HTMLElement, options = 
   return
 }
 
-const moveSelectionToEnd = _.curry(_moveSelectionTo)(false)
+const moveSelectionToEnd = (el: HTMLElement, options?: { onlyIfEmptySelection?: boolean }) => _moveSelectionTo(false, el, options)
 
-const moveSelectionToStart = _.curry(_moveSelectionTo)(true)
+const moveSelectionToStart = (el: HTMLElement, options?: { onlyIfEmptySelection?: boolean }) => _moveSelectionTo(true, el, options)
 
 const replaceSelectionContents = function (el, key) {
   if ($elements.isContentEditable(el)) {
@@ -628,21 +634,6 @@ const replaceSelectionContents = function (el, key) {
 
     return
   }
-}
-
-const getCaretPosition = function (el) {
-  const bounds = getSelectionBounds(el)
-
-  if (bounds.start == null) {
-    // no selection
-    return null
-  }
-
-  if (bounds.start === bounds.end) {
-    return bounds.start
-  }
-
-  return null
 }
 
 const interceptSelect = function (this: any) {
@@ -733,10 +724,8 @@ export default {
   deleteRightOfCursor,
   deleteLeftOfCursor,
   selectAll,
-  deleteSelectionContents,
   moveSelectionToEnd,
   moveSelectionToStart,
-  getCaretPosition,
   moveCursorLeft,
   moveCursorRight,
   moveCursorUp,

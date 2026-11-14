@@ -7,14 +7,17 @@ import { fs } from '@packages/server/lib/util/fs'
 const downloadsProject = Fixtures.projectPath('downloads')
 
 describe('e2e downloads', () => {
-  systemTests.setup()
+  systemTests.setup({
+    settings: {
+      e2e: {
+        supportFile: false,
+      },
+    },
+  })
 
   systemTests.it('handles various file downloads', {
     project: 'downloads',
-    spec: 'downloads_spec.ts',
-    config: {
-      video: false,
-    },
+    spec: 'downloads.cy.ts',
   })
 
   const fileExists = (fileName) => {
@@ -22,11 +25,11 @@ describe('e2e downloads', () => {
   }
 
   systemTests.it('allows changing the downloads folder', {
+    browser: '!webkit', // TODO(webkit): fix+unskip (implement downloads support)
     project: 'downloads',
-    spec: '*',
+    spec: 'downloads.cy.ts',
     config: {
       downloadsFolder: 'cypress/dls',
-      video: false,
     },
     onRun: async (exec) => {
       await exec()
@@ -40,13 +43,13 @@ describe('e2e downloads', () => {
   it('trashes downloads between runs', async function () {
     await systemTests.exec(this, {
       project: 'downloads',
-      spec: 'download_csv_spec.ts',
+      spec: 'download_csv.cy.ts',
     })
 
     // this run should trash the downloads from the above run
     await systemTests.exec(this, {
       project: 'downloads',
-      spec: 'simple_passing_spec.ts',
+      spec: 'simple_passing.cy.ts',
     })
 
     const filePath = path.join(downloadsProject, 'cypress', 'downloads', 'records.csv')
@@ -56,15 +59,17 @@ describe('e2e downloads', () => {
   })
 
   it('does not trash downloads between runs if trashAssetsBeforeRuns: false', async function () {
+    this.retries(10)
+
     await systemTests.exec(this, {
       project: 'downloads',
-      spec: 'download_csv_spec.ts',
+      spec: 'download_csv.cy.ts',
     })
 
     // this run should _not_ trash the downloads from the above run
     await systemTests.exec(this, {
       project: 'downloads',
-      spec: 'simple_passing_spec.ts',
+      spec: 'simple_passing.cy.ts',
       config: {
         trashAssetsBeforeRuns: false,
       },

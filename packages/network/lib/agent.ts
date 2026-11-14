@@ -5,15 +5,60 @@ import _ from 'lodash'
 import net from 'net'
 import { getProxyForUrl } from 'proxy-from-env'
 import url from 'url'
-import { createRetryingSocket, getAddress } from './connect'
+import { ALPNProtocols, createRetryingSocket, getAddress } from './connect'
 import { lenientOptions } from './http-utils'
-import { ClientCertificateStore } from './client-certificates'
+import { clientCertificateStoreSingleton } from './client-certificates'
+import type { CaOptions } from './ca'
+import { getCaOptions } from './ca'
 
 const debug = debugModule('cypress:network:agent')
 const CRLF = '\r\n'
 const statusCodeRe = /^HTTP\/1.[01] (\d*)/
 
-export const clientCertificateStore = new ClientCertificateStore()
+let baseCaOptions: CaOptions | undefined
+const getCaOptionsAsync = async (): Promise<CaOptions> => {
+  try {
+    const options = await getCaOptions()
+
+    baseCaOptions = options
+
+    return options
+  } catch (error) {
+    debug('Error getting CA options', error)
+
+    // Errors reading the config are treated as warnings by npm and node and handled by those processes separately
+    // from what we're doing here.
+    return {} as CaOptions
+  }
+}
+let baseCaOptionsPromise: Promise<CaOptions> = getCaOptionsAsync()
+
+// This is for testing purposes only
+export const _resetBaseCaOptionsPromise = () => {
+  baseCaOptions = undefined
+  baseCaOptionsPromise = getCaOptionsAsync()
+}
+
+const mergeCAOptions = (options: https.RequestOptions, caOptions: CaOptions): https.RequestOptions => {
+  if (!caOptions.ca) {
+    return options
+  }
+
+  if (!options.ca) {
+    return {
+      ...options,
+      ca: caOptions.ca,
+    }
+  }
+
+  // First, normalize the options.ca option. It can be a string, a Buffer, an array of strings, or an array of Buffers
+  const caArray = _.castArray(options.ca).map((caOption) => caOption.toString())
+
+  return {
+    ...options,
+    ca: [...caArray, ...caOptions.ca],
+  }
+}
 
 type WithProxyOpts<RequestOptions> = RequestOptions & {
   proxy: string
@@ -24,6 +69,7 @@ type RequestOptionsWithProxy = WithProxyOpts<http.RequestOptions>
 
 type HttpsRequestOptions = https.RequestOptions & {
   minVersion?: 'TLSv1'
+  ALPNProtocols?: string[]
 }
 
 type HttpsRequestOptionsWithProxy = WithProxyOpts<HttpsRequestOptions>
@@ -38,7 +84,7 @@ export function buildConnectReqHead (hostname: string, port: string, proxy: url.
   connectReq.push(`Host: ${hostname}:${port}`)
 
   if (proxy.auth) {
-    connectReq.push(`Proxy-Authorization: basic ${Buffer.from(proxy.auth).toString('base64')}`)
+    connectReq.push(`Proxy-Authorization: Basic ${Buffer.from(proxy.auth).toString('base64')}`)
   }
 
   return connectReq.join(CRLF) + _.repeat(CRLF, 2)
@@ -63,7 +109,7 @@ export const createProxySock = (opts: CreateProxySockOpts, cb: CreateProxySockCb
   const isHttps = opts.proxy.protocol === 'https:'
   const port = opts.proxy.port || (isHttps ? 443 : 80)
 
-  let connectOpts: any = {
+  const connectOpts: any = {
     port: Number(port),
     host: opts.proxy.hostname,
     useTls: isHttps,
@@ -84,7 +130,7 @@ export const createProxySock = (opts: CreateProxySockOpts, cb: CreateProxySockCb
 
 export const isRequestHttps = (options: http.RequestOptions) => {
   // WSS connections will not have an href, but you can tell protocol from the defaultAgent
-  return _.get(options, '_defaultAgent.protocol') === 'https:' || (options.href || '').slice(0, 6) === 'https'
+  return _.get(options, '_defaultAgent.protocol') === 'https:' || options.protocol === 'https:' || (options.href || '').slice(0, 6) === 'https:'
 }
 
 export const isResponseStatusCode200 = (head: string) => {
@@ -97,26 +143,20 @@ export const isResponseStatusCode200 = (head: string) => {
 export const regenerateRequestHead = (req: http.ClientRequest) => {
   delete req._header
   req._implicitHeader()
-  if (req.output && req.output.length > 0) {
-    // the _header has already been queued to be written to the socket
-    const first = req.output[0]
-    const endOfHeaders = first.indexOf(_.repeat(CRLF, 2)) + 4
-
-    req.output[0] = req._header + first.substring(endOfHeaders)
-  }
 }
 
-const getFirstWorkingFamily = (
-  { port, host }: http.RequestOptions,
+// this function has to be sync via callback because it is called by the Agent.addRequest method, which expect a sync function
+export const getFirstWorkingFamily = (
+  { port, host }: Pick<http.RequestOptions, 'port' | 'host'>,
   familyCache: FamilyCache,
-  cb: Function,
+  cb: (family?: net.family) => void,
 ) => {
   // this is a workaround for localhost (and potentially others) having invalid
   // A records but valid AAAA records. here, we just cache the family of the first
   // returned A/AAAA record for a host that we can establish a connection to.
   // https://github.com/cypress-io/cypress/issues/112
 
-  const isIP = net.isIP(host)
+  const isIP = net.isIP(host) as net.family | 0
 
   if (isIP) {
     // isIP conveniently returns the family of the address
@@ -128,13 +168,15 @@ const getFirstWorkingFamily = (
     return cb()
   }
 
-  if (familyCache[host]) {
-    return cb(familyCache[host])
+  const cacheKey = `${host}:${port}`
+
+  if (familyCache[cacheKey]) {
+    return cb(familyCache[cacheKey])
   }
 
   return getAddress(port, host)
   .then((firstWorkingAddress: net.Address) => {
-    familyCache[host] = firstWorkingAddress.family
+    familyCache[cacheKey] = firstWorkingAddress.family
 
     return cb(firstWorkingAddress.family)
   })
@@ -154,21 +196,16 @@ export class CombinedAgent {
   }
 
   // called by Node.js whenever a new request is made internally
-  addRequest (req: http.ClientRequest, options: http.RequestOptions, port?: number, localAddress?: string) {
+  // NOTE: this function has to be sync via callback because it is called by the Agent.addRequest method, which expect a sync function
+  addRequest (req: http.ClientRequest, options: http.RequestOptions) {
     _.merge(req, lenientOptions)
 
-    // Legacy API: addRequest(req, host, port, localAddress)
-    // https://github.com/nodejs/node/blob/cb68c04ce1bc4534b2d92bc7319c6ff6dda0180d/lib/_http_agent.js#L148-L155
-    if (typeof options === 'string') {
-      // @ts-ignore
-      options = {
-        host: options,
-        port: port!,
-        localAddress,
-      }
-    }
-
     const isHttps = isRequestHttps(options)
+
+    // Ensure that HTTPS requests are using 443
+    if (isHttps && options.port === 80) {
+      options.port = 443
+    }
 
     if (!options.href) {
       // options.path can contain query parameters, which url.format will not-so-kindly urlencode for us...
@@ -179,28 +216,56 @@ export class CombinedAgent {
         hostname: options.host,
         port: options.port,
       }) + options.path
-
-      if (!options.uri) {
-        options.uri = url.parse(options.href)
-      }
     }
+
+    const uri = options.uri = options.uri ?? url.parse(options.href)
 
     debug('addRequest called %o', { isHttps, ..._.pick(options, 'href') })
 
-    return getFirstWorkingFamily(options, this.familyCache, (family: net.family) => {
+    return getFirstWorkingFamily(options, this.familyCache, (family?: net.family) => {
       options.family = family
 
       debug('got family %o', _.pick(options, 'family', 'href'))
 
       if (isHttps) {
-        _.assign(options, clientCertificateStore.getClientCertificateAgentOptionsForUrl(options.uri))
+        _.assign(options, clientCertificateStoreSingleton.getClientCertificateAgentOptionsForUrl(uri))
 
         return this.httpsAgent.addRequest(req, options)
       }
 
-      this.httpAgent.addRequest(req, options)
+      return this.httpAgent.addRequest(req, options)
     })
   }
+}
+
+/**
+ * Returns the proxy URL a request to `href` would go through, or an empty string if it
+ * would be dialed directly. Use this instead of `getProxyForUrl` when you need the proxy
+ * itself, since `getProxyForUrl` doesn't know about the `HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS`
+ * override below.
+ */
+export const getProxyOrTargetOverrideForUrl = (href: string): string => {
+  // HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS is used for Cypress in Cypress E2E testing and will
+  // force the parent Cypress server to treat the child Cypress server like a proxy without
+  // having HTTP_PROXY set and will force traffic ONLY bound to that origin to behave
+  // like a proxy
+  const targetHost = process.env.HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS
+
+  if (targetHost && href.includes(targetHost)) {
+    return targetHost
+  }
+
+  return getProxyForUrl(href)
+}
+
+/**
+ * Returns true if a request to `href` would actually be routed through a
+ * configured proxy. This respects the `NO_PROXY` environment variable (which
+ * Cypress populates with `localhost`, `127.0.0.1`, and `::1` by default), so
+ * URLs excluded from the proxy return false even when `HTTP_PROXY` is set.
+ */
+export const shouldProxyForUrl = (href: string): boolean => {
+  return Boolean(getProxyOrTargetOverrideForUrl(href))
 }
 
 class HttpAgent extends http.Agent {
@@ -214,8 +279,8 @@ class HttpAgent extends http.Agent {
   }
 
   addRequest (req: http.ClientRequest, options: http.RequestOptions) {
-    if (process.env.HTTP_PROXY) {
-      const proxy = getProxyForUrl(options.href)
+    if (process.env.HTTP_PROXY || process.env.HTTP_PROXY_TARGET_FOR_ORIGIN_REQUESTS) {
+      const proxy = getProxyOrTargetOverrideForUrl(options.href)
 
       if (proxy) {
         options.proxy = proxy
@@ -233,7 +298,6 @@ class HttpAgent extends http.Agent {
     const proxy = url.parse(options.proxy)
 
     // set req.path to the full path so the proxy can resolve it
-    // @ts-ignore: Cannot assign to 'path' because it is a constant or a read-only property.
     req.path = options.href
 
     delete req._header // so we can set headers again
@@ -254,7 +318,7 @@ class HttpAgent extends http.Agent {
 
     if (proxy.protocol === 'https:') {
       // gonna have to use the https module to reach the proxy, even though this is an http req
-      req.agent = this.httpsAgent
+      req.agent = this.httpsAgent as any
 
       return this.httpsAgent.addRequest(req, options)
     }
@@ -269,19 +333,55 @@ class HttpsAgent extends https.Agent {
     super(opts)
   }
 
-  createConnection (options: HttpsRequestOptions, cb: http.SocketCallback) {
+  async addRequest (req: http.ClientRequest, options: http.RequestOptions): Promise<void> {
+    const opts = options as https.RequestOptions
+
+    // Ensure we have a proper port defined otherwise node has assumed we are port 80
+    // (https://github.com/nodejs/node/blob/master/lib/_http_client.js#L164) since we are a combined agent
+    // rather than an http or https agent. This will cause issues with fetch requests (@cypress/request already handles it:
+    // https://github.com/cypress-io/request/blob/master/request.js#L301-L303)
+    if (!opts?.uri?.port && opts?.uri?.protocol === 'https:') {
+      opts.uri = {
+        ...opts.uri,
+        port: String(443),
+      }
+
+      opts.port = 443
+    }
+
+    if (baseCaOptions) {
+      super.addRequest(req, mergeCAOptions(opts, baseCaOptions) as http.RequestOptions)
+    } else {
+      await baseCaOptionsPromise.then((caOptions) => {
+        super.addRequest(req, mergeCAOptions(opts, caOptions) as http.RequestOptions)
+      })
+    }
+  }
+
+  createConnection (options: HttpsRequestOptions, cb?: any): any {
+    // Safe to set after the socket pool has keyed this request: `https.Agent.getName()`
+    // ignores ALPNProtocols, and every connection advertises the same list. Making the
+    // list conditional would need it folded into the key, or sockets would be reused
+    // across differing negotiations.
+    options.ALPNProtocols = [...ALPNProtocols]
+
     if (process.env.HTTPS_PROXY) {
       const proxy = getProxyForUrl(options.href)
 
       if (proxy) {
         options.proxy = <string>proxy
 
-        return this.createUpstreamProxyConnection(<HttpsRequestOptionsWithProxy>options, cb)
+        // If no callback is provided, we can't handle the async proxy connection
+        // Return the direct connection instead
+        if (!cb) {
+          return super.createConnection(options)
+        }
+
+        return this.createUpstreamProxyConnection(<HttpsRequestOptionsWithProxy>options, cb as any)
       }
     }
 
-    // @ts-ignore
-    cb(null, super.createConnection(options))
+    cb?.(null, super.createConnection(options) as any)
   }
 
   createUpstreamProxyConnection (options: HttpsRequestOptionsWithProxy, cb: http.SocketCallback) {
@@ -290,10 +390,10 @@ class HttpsAgent extends https.Agent {
     debug(`Creating proxied socket for ${options.href} through ${options.proxy}`)
 
     const proxy = url.parse(options.proxy)
-    const port = options.uri.port || '443'
-    const hostname = options.uri.hostname || 'localhost'
+    const port = options.uri?.port || '443'
+    const hostname = options.uri?.hostname || 'localhost'
 
-    createProxySock({ proxy, shouldRetry: options.shouldRetry }, (originalErr?, proxySocket?, triggerRetry?) => {
+    createProxySock({ proxy, shouldRetry: options.shouldRetry }, (originalErr?: Error, proxySocket?: net.Socket, triggerRetry?: (err: Error) => void) => {
       if (originalErr) {
         const err: any = new Error(`A connection to the upstream proxy could not be established: ${originalErr.message}`)
 
@@ -304,12 +404,12 @@ class HttpsAgent extends https.Agent {
       }
 
       const onClose = () => {
-        triggerRetry(new Error('ERR_EMPTY_RESPONSE: The upstream proxy closed the socket after connecting but before sending a response.'))
+        triggerRetry?.(new Error('ERR_EMPTY_RESPONSE: The upstream proxy closed the socket after connecting but before sending a response.'))
       }
 
       const onError = (err: Error) => {
-        triggerRetry(err)
-        proxySocket.destroy()
+        triggerRetry?.(err)
+        proxySocket?.destroy()
       }
 
       let buffer = ''
@@ -321,15 +421,15 @@ class HttpsAgent extends https.Agent {
 
         if (!_.includes(buffer, _.repeat(CRLF, 2))) {
           // haven't received end of headers yet, keep buffering
-          proxySocket.once('data', onData)
+          proxySocket?.once('data', onData)
 
           return
         }
 
         // we've now gotten enough of a response not to retry
         // connecting to the proxy
-        proxySocket.removeListener('error', onError)
-        proxySocket.removeListener('close', onClose)
+        proxySocket?.removeListener('error', onError)
+        proxySocket?.removeListener('close', onClose)
 
         if (!isResponseStatusCode200(buffer)) {
           return cb(new Error(`Error establishing proxy connection. Response from server was: ${buffer}`), undefined)
@@ -345,24 +445,36 @@ class HttpsAgent extends https.Agent {
             options.servername = hostname
           }
 
-          return cb(undefined, super.createConnection(options, undefined))
+          return cb(undefined, super.createConnection(options) as any)
         }
 
         cb(undefined, proxySocket)
       }
 
-      proxySocket.once('close', onClose)
-      proxySocket.once('error', onError)
-      proxySocket.once('data', onData)
+      proxySocket?.once('close', onClose)
+      proxySocket?.once('error', onError)
+      proxySocket?.once('data', onData)
 
       const connectReq = buildConnectReqHead(hostname, port, proxy)
 
-      proxySocket.setNoDelay(true)
-      proxySocket.write(connectReq)
+      proxySocket?.setNoDelay(true)
+      proxySocket?.write(connectReq)
     })
   }
 }
 
+// NODE_TLS_REJECT_UNAUTHORIZED is set to '0' in Cypress to cover
+// all traffic to the user's app and `agent` honors this by default.
+// Calls to the Cloud should use the `strictAgent` or `api/index`'s
+// request promise implementation instead as they override
+// this functionality to actually reject in unauthorized situations.
 const agent = new CombinedAgent()
 
+// This agent always rejects unauthorized certificates.
+const strictAgent = new CombinedAgent({}, {
+  rejectUnauthorized: true,
+})
+
 export default agent
+
+export { strictAgent }

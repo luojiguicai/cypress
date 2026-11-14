@@ -1,201 +1,110 @@
 import { observer } from 'mobx-react'
-import React, { Component, createRef, RefObject, MouseEvent } from 'react'
-// @ts-ignore
-import Tooltip from '@cypress/react-tooltip'
-import cs from 'classnames'
+import type { MouseEvent } from 'react'
+import React, { useCallback } from 'react'
+import { IconCypressStudio } from '@cypress-design/react-icon'
 
-import events, { Events } from '../lib/events'
-import appState, { AppState } from '../lib/app-state'
+import type { Events } from '../lib/events'
+import events from '../lib/events'
+import type { AppState } from '../lib/app-state'
+import appState from '../lib/app-state'
 import Collapsible from '../collapsible/collapsible'
-import { indent } from '../lib/util'
-import runnablesStore, { RunnablesStore } from '../runnables/runnables-store'
-import TestModel from './test-model'
-
-import scroller, { Scroller } from '../lib/scroller'
+import type TestModel from './test-model'
 import Attempts from '../attempts/attempts'
-
-interface StudioControlsProps {
-  events: Events
-  model: TestModel
-}
-
-interface StudioControlsState {
-  copySuccess: boolean
-}
-
-@observer
-class StudioControls extends Component<StudioControlsProps, StudioControlsState> {
-  static defaultProps = {
-    events,
-  }
-
-  state = {
-    copySuccess: false,
-  }
-
-  _cancel = (e: MouseEvent) => {
-    e.preventDefault()
-
-    this.props.events.emit('studio:cancel')
-  }
-
-  _save = (e: MouseEvent) => {
-    e.preventDefault()
-
-    this.props.events.emit('studio:save')
-  }
-
-  _copy = (e: MouseEvent) => {
-    e.preventDefault()
-
-    this.props.events.emit('studio:copy:to:clipboard', () => {
-      this.setState({ copySuccess: true })
-    })
-  }
-
-  _endCopySuccess = () => {
-    if (this.state.copySuccess) {
-      this.setState({ copySuccess: false })
-    }
-  }
-
-  render () {
-    const { studioIsNotEmpty } = this.props.model
-    const { copySuccess } = this.state
-
-    return (
-      <div className='studio-controls'>
-        <button className='studio-cancel' onClick={this._cancel}>Cancel</button>
-        <Tooltip
-          title={copySuccess ? 'Commands Copied!' : 'Copy Commands to Clipboard'}
-          className='cy-tooltip'
-          wrapperClassName='studio-copy-wrapper'
-          visible={!studioIsNotEmpty ? false : null}
-          updateCue={copySuccess}
-        >
-          <button
-            className={cs('studio-copy', {
-              'studio-copy-success': copySuccess,
-            })}
-            disabled={!studioIsNotEmpty}
-            onClick={this._copy}
-            onMouseLeave={this._endCopySuccess}
-          >
-            <i className={copySuccess ? 'fas fa-check' : 'far fa-copy'} />
-          </button>
-        </Tooltip>
-        <button className='studio-save' disabled={!studioIsNotEmpty} onClick={this._save}>Save Commands</button>
-      </div>
-    )
-  }
-}
+import StateIcon from '../lib/state-icon'
+import { LaunchStudioIcon } from '../components/LaunchStudioIcon'
+import { useScrollIntoView } from '../lib/useScrollIntoView'
+import { SelfHealedBadge } from '../lib/selfHealedBadge'
 
 interface TestProps {
-  events: Events
-  appState: AppState
-  runnablesStore: RunnablesStore
-  scroller: Scroller
+  events?: Events
+  appState?: AppState
   model: TestModel
+  studioEnabled: boolean
+  spec?: Cypress.Cypress['spec']
 }
 
-@observer
-class Test extends Component<TestProps> {
-  static defaultProps = {
-    events,
-    appState,
-    runnablesStore,
-    scroller,
-  }
+const Test: React.FC<TestProps> = observer(({ model, events: eventsProps = events, appState: appStateProps = appState, studioEnabled, spec }) => {
+  const { containerRef, isMounted, scrollIntoView } = useScrollIntoView({
+    appState: appStateProps,
+    testState: model.state,
+    isStudioActive: appStateProps.studioActive,
+  })
 
-  containerRef: RefObject<HTMLDivElement>
-
-  constructor (props: TestProps) {
-    super(props)
-
-    this.containerRef = createRef<HTMLDivElement>()
-  }
-
-  componentDidMount () {
-    this._scrollIntoView()
-  }
-
-  componentDidUpdate () {
-    this._scrollIntoView()
-    this.props.model.callbackAfterUpdate()
-  }
-
-  _scrollIntoView () {
-    const { appState, model, scroller } = this.props
-    const { state } = model
-
-    if (appState.autoScrollingEnabled && (appState.isRunning || appState.studioActive) && state !== 'processing') {
-      window.requestAnimationFrame(() => {
-        // since this executes async in a RAF the ref might be null
-        if (this.containerRef.current) {
-          scroller.scrollIntoView(this.containerRef.current as HTMLElement)
-        }
-      })
-    }
-  }
-
-  render () {
-    const { model } = this.props
-
-    return (
-      <Collapsible
-        containerRef={this.containerRef}
-        header={this._header()}
-        headerClass='runnable-wrapper'
-        headerStyle={{ paddingLeft: indent(model.level) }}
-        contentClass='runnable-instruments'
-        isOpen={model.isOpen}
-      >
-        {this._contents()}
-      </Collapsible>
-    )
-  }
-
-  _header () {
-    const { model } = this.props
-
-    return (<>
-      <i aria-hidden='true' className='runnable-state fas' />
-      <span className='runnable-title'>
-        <span>{model.title}</span>
-        <span className='visually-hidden'>{model.state}</span>
-      </span>
-      <span className='runnable-controls'>
-        <Tooltip placement='top' title='One or more commands failed' className='cy-tooltip'>
-          <i className='fas fa-exclamation-triangle runnable-controls-status' />
-        </Tooltip>
-        <Tooltip placement='right' title='Add Commands to Test' className='cy-tooltip'>
-          <a onClick={this._launchStudio} className='runnable-controls-studio'>
-            <i className='fas fa-magic' />
-          </a>
-        </Tooltip>
-      </span>
-    </>)
-  }
-
-  _contents () {
-    const { appState, model } = this.props
-
-    return (
-      <div style={{ paddingLeft: indent(model.level) }}>
-        <Attempts test={model} scrollIntoView={() => this._scrollIntoView()} />
-        { appState.studioActive && <StudioControls model={model} /> }
-      </div>
-    )
-  }
-
-  _launchStudio = (e: MouseEvent) => {
+  const _launchStudio = useCallback((e: MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
 
-    const { model, events } = this.props
+    eventsProps.emit('studio:init:test', { testId: model.id })
+  }, [eventsProps, model.id])
 
-    events.emit('studio:init:test', model.id)
+  React.useEffect(() => {
+    if (isMounted) {
+      model.callbackAfterUpdate()
+    }
+  }, [isMounted, model])
+
+  const _header = () => {
+    return (<>
+      <StateIcon aria-hidden className="runnable-state-icon" state={model.state} />
+      <span className='runnable-title'>
+        <span>{model.title}</span>
+        <span className='visually-hidden'>{model.state}</span>
+        {model.isSelfHealed && (
+          <SelfHealedBadge source='test' />
+        )}
+      </span>
+      {_controls()}
+    </>)
   }
-}
 
+  const _controls = () => {
+    const controls: Array<JSX.Element> = []
+
+    // Check if we're running all specs by looking at the spec relative path
+    const isRunningAllSpecs = spec?.relative === '__all'
+
+    if (studioEnabled && !appStateProps.studioActive && model.state !== 'pending' && !isRunningAllSpecs) {
+      controls.push(
+        <LaunchStudioIcon
+          key={`studio-command-${model}`}
+          content={
+            <div className='flex items-center py-[8px] px-[8px]'>
+              <div><IconCypressStudio className="mr-[10px]" /></div>
+              <div className='text-sm text-gray-700'>Edit in Studio</div>
+            </div>
+          }
+          onClick={_launchStudio}
+        />,
+      )
+    }
+
+    if (controls.length === 0) {
+      return null
+    }
+
+    return (
+      <span className='runnable-controls'>
+        {controls}
+      </span>
+    )
+  }
+
+  return (
+    <Collapsible
+      containerRef={containerRef}
+      header={_header()}
+      headerClass='runnable-wrapper'
+      contentClass='runnable-instruments'
+      isOpen={model.isOpen}
+      onOpenStateChangeRequested={(isOpen: boolean) => model.setIsOpen(isOpen)}
+      hideExpander
+    >
+      <div>
+        <Attempts test={model} scrollIntoView={scrollIntoView} />
+      </div>
+    </Collapsible>
+  )
+})
+
+Test.displayName = 'Test'
 export default Test

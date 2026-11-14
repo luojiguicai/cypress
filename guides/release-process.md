@@ -2,7 +2,7 @@
 
 These procedures concern the release process for the Cypress binary and `cypress` npm module.
 
-The `@cypress/`-namespaced NPM packages that live inside the [`/npm`](../npm) directory are automatically published to npm (with [`semantic-release`](https://semantic-release.gitbook.io/semantic-release/)) upon being merged into `master`. You can read more about this in [CONTRIBUTING.md](../CONTRIBUTING.md#independent-packages-ci-workflow).
+The `@cypress/`-namespaced NPM packages that live inside the [`/npm`](../npm) directory are automatically published to npm (with [`semantic-release`](https://semantic-release.org/intro/)) upon being merged into `develop`. You can read more about this in [CONTRIBUTING.md](../CONTRIBUTING.md#releases).
 
 [Anyone can build the binary and npm package locally](./building-release-artifacts.md), but you can only deploy the Cypress application and publish the npm module `cypress` if you are a member of the `cypress` npm organization.
 
@@ -11,53 +11,53 @@ The `@cypress/`-namespaced NPM packages that live inside the [`/npm`](../npm) di
 ### Prerequisites
 
 - Ensure you have the following permissions set up:
-  - An AWS account with permission to create AWS access keys for the Cypress CDN.
+  - An AWS account with permission to access and write to the AWS S3, i.e. the Cypress CDN.
   - Permissions for your npm account to publish the `cypress` package.
-  - Permissions to update releases in ZenHub.
 
-- Set up the following environment variables:
-  - Cypress AWS access key and secret in `aws_credentials_json`, which looks like this:
+- [Set up](https://cypress-io.atlassian.net/wiki/spaces/INFRA/pages/1534853121/AWS+SSO+Cypress) an AWS SSO profile with the [Team-CypressApp-Prod](https://cypress-io.atlassian.net/wiki/spaces/INFRA/pages/1534853121/AWS+SSO+Cypress#Team-CypressApp-Prod) role. The release scripts assumes the name of your profile is `prod`. Make sure to open the "App Developer" expando for some necessary config values. Your AWS config file should end up looking like the following:
 
-    ```text
-    aws_credentials_json='{"bucket":"cdn.cypress.io","folder":"desktop","key":"...","secret":"..."}'
+    ```
+    [profile prod]
+    sso_start_url = <start_url>
+    sso_region = <region>
+    sso_account_id = <account_id>
+    sso_role_name = <role_name>
+    region = <region>
+    cli_pager = <pager>
     ```
 
-    - A [GitHub token](https://github.com/settings/tokens) and a [CircleCI token](https://circleci.com/account/api) in `ci_json`:
+- Set up the following environment variables:
+  - For the `release-automations` step, you will need setup the following envs:
+    - GitHub token - Found in 1Password.
+    - The `cypress-bot` GitHub app credentials. Found in 1Password.
+    ```text
+    GITHUB_TOKEN="..."
+    GITHUB_APP_CYPRESS_INSTALLATION_ID=
+    GITHUB_APP_ID=
+    GITHUB_PRIVATE_KEY=
+    ```
 
-      ```text
-      ci_json='{"githubToken":"...","circleToken":"..."}'
-      ```
-
-  - You'll also need to put the GitHub token under its own variable and get a [ZenHub API token](https://app.zenhub.com/dashboard/tokens) for the `release-automations` step.
-
-      ```text
-      GITHUB_TOKEN="..."
-      ZENHUB_API_TOKEN="..."
-      ```
-
-  - The `cypress-bot` GitHub app credentials are also needed. Ask another team member who has done a deploy for those.
-
-      ```text
-      GITHUB_APP_CYPRESS_INSTALLATION_ID=
-      GITHUB_APP_ID=
-      GITHUB_PRIVATE_KEY=
-      ```
-
-  - For purging the Cloudflare cache (part of the `move-binaries` step), you'll need `CF_ZONEID` and `CF_TOKEN` set. These can be found in 1Password. If you don't have access, ask a team member who has done a deploy.
-
+  - For purging the Cloudflare cache (needed for the `prepare-release-artifacts` script in step 6 and `binary-release` in step 14), you'll need `CF_ZONEID` and `CF_TOKEN` set. These can be found in 1Password.
       ```text
       CF_ZONEID="..."
       CF_TOKEN="..."
       ```
 
-  - Tip: Use [as-a](https://github.com/bahmutov/as-a) to manage environment variables for different situations.
+- Ensure that you have the following repositories checked out locally and ready to contribute to:
+  - [`cypress-realworld-app`](https://github.com/cypress-io/cypress-realworld-app)
+  - [`cypress-documentation`](https://github.com/cypress-io/cypress-documentation)
+  - [`cypress-docker-images`](https://github.com/cypress-io/cypress-docker-images)
+  - [cypress-io/release-automations][release-automations]
+
+
+If you don't have access to 1Password, ask a team member who has done a deploy.
 
 ### Before Publishing a New Version
 
 In order to publish a new version of the `cypress` package to the npm registry, CI must build and test it across multiple platforms and test projects. CI is set up to do the following on every commit to `develop`:
 
 1. Build the npm package with the [next target version](./next-version.md) baked in.
-2. Build the Linux, Mac & Windows binaries on CircleCI.
+2. Build the Linux, Mac & Windows binaries on CircleCI. Linux x64 builds on every commit; Linux ARM64, Mac, and Windows build from the nightly schedule or a manual trigger (see below).
 3. Upload the binaries and the new npm package to the AWS S3 Bucket `cdn.cypress.io` under the "beta" folder.
 4. [Launch test projects](./testing-other-projects.md) using the newly-uploaded package & binary instead of installing from the npm registry.
 
@@ -67,162 +67,179 @@ of Cypress. You can see the progress of the test projects by opening the status 
 
 ![Screenshot of status checks](https://i.imgur.com/AsQwzgO.png)
 
-Once the `develop` branch for all test projects are reliably passing with the new changes, publishing can proceed.
+### Releasing a previous major
+
+A previous major is maintained on a `vN` branch, for example `v15`. The [next version](./next-version.md) is worked out from the newest published version of that major, found through the nearest `vN.*` tag on the branch, so a `v15` build produces `15.Y.Z` without setting `NEXT_VERSION`.
+
+Follow the same steps below. Where a step differs, it has a **Previous major** note. Most of the differences keep the `latest` npm tag, the download manifest, the `cypress/included:latest` image and the latest GitHub release on the current major.
+
+The `@cypress/`-namespaced npm packages are only released from `develop`. A fix to one of them reaches previous-major users through a `develop` release, as long as that package's `cypress` peer range still includes the previous major.
 
 ### Steps to Publish a New Version
 
 In the following instructions, "X.Y.Z" is used to denote the [next version of Cypress being published](./next-version.md).
 
-1. `develop` should contain all of the changes made in `master`. However, this occasionally may not be the case. Ensure that `master` does not have any additional commits that are not on `develop` and all auto-generated pull requests designed to merge master into develop have been successfully merged.
+_Note: It is advisable to notify the team that the `develop` branch is locked down prior to beginning the release process_
 
-2. If there is a new [`cypress-example-kitchensink`](https://github.com/cypress-io/cypress-example-kitchensink/releases) version, update the corresponding dependency in [`packages/example`](../packages/example) to that new version.
+1. Install and test the pre-release version to make sure everything is working. See [Install Pre-Release Version docs](https://docs.cypress.io/guides/references/advanced-installation#Install-pre-release-version) for more details.
+    - Install the new version:
+        - Globally: `npm install -g <cypress.tgz path>`
+        - or in a project: `npm i -D cypress@file:<cypress.tgz path>`
+    - Run a quick, manual smoke test:
+        - `cypress open`
+        - Go into a project, run a quick test, make sure things look right
+    - Optionally, install the new version into an established project and run the tests there
+        - [cypress-realworld-app](https://github.com/cypress-io/cypress-realworld-app) uses yarn and represents a typical consumer implementation.
+    - Optionally, do more thorough tests, for example test the new version of Cypress against the Cypress Cloud repo.
 
-3. Use the `move-binaries` script to move the binaries for `<commit sha>` from `beta` to the `desktop` folder for `<new target version>`. This also purges the cloudflare cache for this version.
+2. Ensure all changes to the links manifest to [`on.cypress.io`](https://github.com/cypress-io/cypress-services/tree/develop/packages/on) have been merged to `develop` and deployed.
+
+3. (optional) Create a Release PR -
+   Bump, submit, get approvals on, and merge a new PR. This PR should:
+    - Bump the [`packages/example`](../packages/example) dependency if there is a new [`cypress-example-kitchensink`](https://github.com/cypress-io/cypress-example-kitchensink/releases) version, and `yarn` to ensure the lockfile is up to date.
+    - Follow the writing the [Cypress Changelog release steps](./writing-the-cypress-changelog.md#release) to update the [`cli/CHANGELOG.md`](../cli/CHANGELOG.md).
+    - NOTE: If edits to the [`cli/CHANGELOG.md`](../cli/CHANGELOG.md) are not needed, nor is a new version of [`cypress-example-kitchensink`](https://github.com/cypress-io/cypress-example-kitchensink/releases), this step can be skipped and the last build off `develop` can be used below.
+
+4. Once the `develop` branch is passing in CI and you have confirmed the `cypress-bot` has commented on the commit with the pre-release versions for `darwin-x64`, `darwin-arm64`, `linux-x64`,`linux-arm64`, and `win32-x64`, publishing can proceed.
+
+    `darwin-x64`, `darwin-arm64`, `linux-arm64`, and `windows` don't build on every `develop` commit — they run from a nightly CircleCI Scheduled Pipeline instead (see [`.circleci/AGENTS.md`](../.circleci/AGENTS.md)). Merges to `develop` cut off at 8PM EST the day before a release. Wait for that night's scheduled build to land on the release sha, and confirm it's green, before starting release day. If the schedule missed the sha or failed, trigger it manually with `force-persist-artifacts=true` on that exact sha.
+
+    Tips for getting a green build:
+     - If the `windows` workflow is failing with timeout errors, you can retry from the last failed step.
+     - Sometimes a test can get stuck in a failing state between attempts on the `windows` workflow. In these cases, kicking off a full run of the workflow can help get it into a passing state.
+     - If the `linux-x64` workflow fails due to a flaky test but percy finalizes the build, you *must* restart the workflow from the failed steps. Restarting the entire workflow after a finalized Percy build can cause Percy to fail the next attempt with a "Build has already been finalized" error, requiring pushing a new commit to start fresh.
+
+    **Previous major**: a push to `vN` builds only Linux x64. Unless the weekly `vN` schedule already ran on the release sha, trigger a pipeline on it with `run-platform-workflows=true` to build the other four platforms.
+
+5. Log into AWS SSO with `aws sso login --profile <name_of_profile>`. If you have setup your credentials under a different profile than `prod`, be sure to set the `AWS_PROFILE` environment variable to that profile name for the remaining steps. For example, if you are using `production` instead of `prod`, do `export AWS_PROFILE=production`.
+
+6. Use the `prepare-release-artifacts` script (Mac/Linux only) to prepare the latest commit to a stable release. When you run this script, the following happens:
+    * the binaries for `<commit sha>` are moved from `beta` to the `desktop` folder for `<new target version>` in S3
+    * the Cloudflare cache for this version is purged
+    * the pre-prod `cypress.tgz` NPM package is converted to a stable NPM package ready for release
+    * if on MacOS, you will need to prefix the command with `COPYFILE_DISABLE=1` as OSX may include hidden files in the `.tgz` file of the binary
 
     ```shell
-    yarn move-binaries --sha <commit sha> --version <new target version>
+    yarn prepare-release-artifacts --sha <commit sha> --version <new target version>
     ```
 
-4. Publish the new npm package under the `dev` tag, using your personal npm account.
-    - To find the link to the package file `cypress.tgz`:
-        1. In GitHub, go to the latest commit (the one whose sha you used in the last step).
-            ![commit-link](https://user-images.githubusercontent.com/1157043/80608728-33fe6100-8a05-11ea-8b53-375303757b67.png)
-        2. Scroll down past the changes to the comments. The first comment should be a `cypress-bot` comment that includes a line beginning `npm install ...`. Grab the `https://cdn.../npm/X.Y.Z/<long sha>/cypress.tgz` link.
-            ![cdn-tgz-link](https://user-images.githubusercontent.com/1157043/80608736-3791e800-8a05-11ea-8d75-e4f80128e857.png)
-    - Publish to the npm registry straight from the URL:
+    You can pass `--dry-run` to see the commands this would run under the hood.
 
-        ```shell
-        npm publish https://cdn.cypress.io/beta/npm/X.Y.Z/<long sha>/cypress.tgz --tag dev
-        ```
-
-5. Double-check that the new version has been published under the `dev` tag using `npm info cypress` or [available-versions](https://github.com/bahmutov/available-versions). `latest` should still point to the previous version. Example output:
+    **Previous major**: pass the branch the build ran on, because the pre-release npm package is stored under it:
 
     ```shell
-    dist-tags:
-    dev: 3.4.0     latest: 3.3.2
+    yarn prepare-release-artifacts --sha <commit sha> --version <new target version> --branch vN
     ```
 
-6. Test `cypress@X.Y.Z` to make sure everything is working.
+7. Validate you are logged in to `npm` with `npm whoami`. Otherwise log in interactively with `npm login`, as the npm service account. The login prompts for a 2FA one-time password, so the service account must have 2FA enabled.
+   If you are not already a Cypress package maintainer, contact a team member who is to get you added.
+
+8. Publish the generated npm package under the `dev` tag, using the npm service account. Trusted publishing only works from CI, so the `cypress` package is published by hand. This step needs only the interactive 2FA login from the previous step. It does not use the `NPM_TOKEN` in the `org-npm-credentials` CircleCI context, and rotating or revoking that token does not affect it.
+
+    ```shell
+    npm publish /tmp/cypress-prod.tgz --tag dev
+    ```
+
+    **Previous major**: publish under the `latest-vN` tag instead of `dev`, so `dev` and `latest` keep pointing at the current major. Every release of that major reuses the tag, so leave it in place afterwards.
+
+    ```shell
+    npm publish /tmp/cypress-prod.tgz --tag latest-vN
+    ```
+
+9. Double-check that the new version has been published under the `dev` tag using `npm view cypress dist-tags`. The `latest` tag should still point to the previous version. Example output:
+
+    ```text
+    $ npm view cypress dist-tags
+    { latest: '14.5.3', dev: '14.5.4' }
+    ```
+
+    **Note**: It may take several minutes for `npm view` to reflect the latest version info.
+
+    **Previous major**: check that `latest-vN` points to the new version and that `latest` and `dev` haven't moved.
+
+10. Test `cypress@X.Y.Z` to make sure everything is working.
     - Install the new version: `npm install -g cypress@X.Y.Z`
     - Run a quick, manual smoke test:
         - `cypress open`
         - Go into a project, run a quick test, make sure things look right
-    - Optionally, do more thorough tests:
-        - Trigger test projects from the command line (if you have the appropriate permissions)
+    - Install the new version into an established project and run the tests there
+        - [cypress-realworld-app](https://github.com/cypress-io/cypress-realworld-app) uses yarn and represents a typical consumer implementation.
+    - Optionally, do more thorough tests, for example test the new version of Cypress against the Cypress Cloud repo.
 
-        ```shell
-        node scripts/test-other-projects.js --npm cypress@X.Y.Z --binary X.Y.Z
-        ```
-
-        - Test the new version of Cypress against the Cypress dashboard repo.
-
-7. Confirm that every issue labeled [stage: pending release](https://github.com/cypress-io/cypress/issues?q=label%3A%22stage%3A+pending+release%22+is%3Aclosed) has a ZenHub release set. **Tip:** there is a command in [`release-automations`](https://github.com/cypress-io/release-automations)'s `issues-in-release` tool to list and check such issues. Without a ZenHub release issues will not be included in the right changelog.
-
-8. Deploy the release-specific documentation and changelog in [cypress-documentation](https://github.com/cypress-io/cypress-documentation).
-    - If there is not already a release-specific PR open, create one. You can use [`release-automations`](https://github.com/cypress-io/release-automations)'s `issues-in-release` tool to generate a starting point for the changelog, based off of ZenHub:
-
-        ```shell
-        cd packages/issues-in-release
-        yarn do:changelog --release <release label>
-        ```
-
-    - Ensure the changelog is up-to-date and has the correct date.
+11. Review the release-specific documentation and changelog PR in [cypress-documentation](https://github.com/cypress-io/cypress-documentation). If there is not already a release-specific PR open, create one.
+    - Copy the changelog content for this version from the release PR above into `/docs/app/references/changelog.mdx`. Adjust any `docs.cypress.io` links to use host-relative paths.
+    - Add the release date in `_Released MMM DD, YYYY_` format below the version header in the `changelog.mdx` entry.
     - Merge any release-specific documentation changes into the main release PR.
     - You can view the doc's [branch deploy preview](https://github.com/cypress-io/cypress-documentation/blob/master/CONTRIBUTING.md#pull-requests) by clicking 'Details' on the PR's `netlify-cypress-docs/deploy-preview` GitHub status check.
-    - Merge this PR into `master` to deploy it to production.
 
-9. Make the new npm version the "latest" version by updating the dist-tag `latest` to point to the new version:
+    **Previous major**: the changelog is ordered by version, so the entry goes below the current major's sections, above the previous release of the same major.
+
+12. Create new Docker images in [`cypress-docker-images`](https://github.com/cypress-io/cypress-docker-images) with the new Cypress version and the latest stable browsers. Create one PR in which you update [factory/.env](https://github.com/cypress-io/cypress-docker-images/blob/master/factory/.env):
+    - `CYPRESS_VERSION` — the new Cypress version.
+    - `CHROME_VERSION` and `CHROME_FOR_TESTING_VERSION` — look each up separately. They come from different sources, so their latest stable versions often differ.
+    - `EDGE_VERSION`
+    - `FIREFOX_VERSION` — Firefox ships a new major version every 2 weeks, so expect this to have changed since the last release.
+    - `GECKODRIVER_VERSION` — only if a newer release exists.
+
+    Find each version at the link in the comment above it in `factory/.env`. If a browser is already on its latest stable version, say so in the PR description so reviewers know it was checked. Don't change `FACTORY_VERSION` or the factory CHANGELOG for these updates. Ensure the Docker images are reviewed and have passing tests before proceeding.
+
+    **Previous major**: don't touch `factory/.env`, since that would move `cypress/included:latest` back to the previous major. Instead, update only `CYPRESS_VERSION` in `factory/maintenance/N.env`, for example [factory/maintenance/15.env](https://github.com/cypress-io/cypress-docker-images/blob/master/factory/maintenance/15.env). Its browsers are pinned, so leave every other version alone. The PR's CI fails until the version is on npm, so rerun it after step 8. See [Maintenance releases](https://github.com/cypress-io/cypress-docker-images/blob/master/CONTRIBUTING.md#maintenance-releases).
+
+13. **Skip for a previous major**, since this would move `latest` back to the previous major. Make the new npm version the "latest" version by updating the dist-tag `latest` to point to the new version:
 
     ```shell
     npm dist-tag add cypress@X.Y.Z
     ```
 
-10. Run `binary-release` to update the [download server's manifest](https://download.cypress.io/desktop.json). This will also ensure the binary for the version is downloadable for each system.
+14. Run `binary-release` to update the [download server's manifest](https://download.cypress.io/desktop.json). This will also ensure the binary for the version is downloadable for each system.
 
     ```shell
     yarn binary-release --version X.Y.Z
     ```
 
-11. If needed, push out any updated changes to the links manifest to [`on.cypress.io`](https://github.com/cypress-io/cypress-services/tree/develop/packages/on).
+    **Previous major**: run it as usual. It leaves `desktop.json` on the current major when the released version is older, and prints `Leaving the manifest at <current version>`. It still checks that the version is downloadable.
 
-12. If needed, deploy the updated [`cypress-example-kitchensink`][cypress-example-kitchensink] to `example.cypress.io` by following [these instructions under "Deployment"](../packages/example/README.md).
+15. Merge the documentation PR from step 11 and the new docker image PR created in step 12 to release the image.
 
-13. Update the releases in [ZenHub](https://app.zenhub.com/workspaces/test-runner-5c3ea3baeb1e75374f7b0708/reports/release):
-    - Close the current release in ZenHub.
-    - Create a new patch release (and a new minor release, if this is a minor release) in ZenHub, and schedule them both to be completed 2 weeks from the current date.
-    - Move all issues that are still open from the current release to the appropriate future release.
+16. **Skip for a previous major.** If needed, deploy the updated [`cypress-example-kitchensink`][cypress-example-kitchensink] to `example.cypress.io` by following [these instructions under "Deployment"](../packages/example/README.md).
+    - Build `@packages/example` with `yarn workspace @packages/example build`
+    - Inspect the contents of `./packages/example/build` before deploying, and ensure it looks correct
+    - Run `yarn workspace @packages/example deploy`. This adds changes from `cypress-example-kitchensink` to a commit in the `gh-pages` branch, which will deploy to production with its own CI.
+    - Check the deployed site at `https://example.cypress.io` to ensure the new changes deployed correctly.
 
-14. Bump `version` in [`package.json`](package.json), commit it to `develop`, tag it with the version, and push the tag up:
-
+17. Once the release is complete, tag the commit that was released: the `<commit sha>` passed to `prepare-release-artifacts` in step 6.
     ```shell
-    git commit -am "release X.Y.Z [skip ci]"
-    git log --pretty=oneline
-    # copy sha of the previous commit
-    git tag -a vX.Y.Z <sha>
+    git fetch origin develop
+    git log -1 --oneline origin/develop # confirm it matches the step 6 sha
+    git tag -a vX.Y.Z -m vX.Y.Z <commit sha>
     git push origin vX.Y.Z
     ```
 
-15. Merge `develop` into `master` and push both branches up. Note: pushing to `master` will automatically publish any independent npm packages that have not yet been published.
+    **Previous major**: fetch and check `origin/vN` instead of `origin/develop`.
+
+18. Create a new [GitHub release](https://github.com/cypress-io/cypress/releases). Choose the tag you created previously and add contents to match previous releases.
+
+    **Previous major**: uncheck "Set as the latest release", or pass `--latest=false` to `gh release create`, so the current major stays the latest release.
+
+19. Add a comment to each GH issue that has been resolved with the new published version. Download the `releaseData.json` artifact from the `verify-release-readiness` CircleCI job and run the following command inside of [cypress-io/release-automations][release-automations]:
 
     ```shell
-    git push origin develop
-    git checkout master
-    git merge develop
-    git push origin master
+    npm run do:comment -- --release-data <path_to_releaseData.json>
     ```
 
-16. Inside of [cypress-io/release-automations][release-automations]:
-    - Publish GitHub release to [cypress-io/cypress/releases](https://github.com/cypress-io/cypress/releases) using package `set-releases`:
+20. Confirm there are no issues from the release with the label [stage: pending release](https://github.com/cypress-io/cypress/issues?q=label%3A%22stage%3A+pending+release%22+is%3Aclosed) left.
 
-        ```shell
-        cd packages/set-releases && npm run release-log -- --version X.Y.Z
-        ```
+21. Notify the team that `develop` is reopen. The release announcement to the [releases](https://cypressio.slack.com/archives/CQJB4V3QU) channel is automatically handled by the GitHub bot. If additional details are needed, they can posted as a reply to the release announcement.
 
-    - Add a comment to each GH issue that has been resolved with the new published version using package `issues-in-release`:
+22. If utilizing the `SKIP_RELEASE_CHANGELOG_VALIDATION_FOR_BRANCHES` to override and skip changelog validation for this release, change its value as needed or delete it from CircleCI so that subsequent releases and PRs will go through changelog validation.
 
-        ```shell
-        cd packages/issues-in-release && npm run do:comment -- --release X.Y.Z
-        ```
-
-    - Confirm there are no issues with the label [stage: pending release](https://github.com/cypress-io/cypress/issues?q=label%3A%22stage%3A+pending+release%22+is%3Aclosed) left
-
-17. Publish a new docker image in [`cypress-docker-images`](https://github.com/cypress-io/cypress-docker-images) under `included` for the new cypress version. Note: we use the base image with the Node version matching the bundled Node version. Instructions for updating `cypress-docker-images` can be found [here](https://github.com/cypress-io/cypress-docker-images/blob/master/CONTRIBUTING.md#add-new-included-image).
-
-18. Update example projects to the new version. For most projects, you can go to the Renovate dependency issue and check the box next to `Update dependency cypress to X.Y.Z`. It will automatically create a PR. Once it passes, you can merge it. Try updating at least the following projects:
-    - [cypress-example-todomvc](https://github.com/cypress-io/cypress-example-todomvc/issues/99)
-    - [cypress-example-todomvc-redux](https://github.com/cypress-io/cypress-example-todomvc-redux/issues/1)
-    - [cypress-example-realworld](https://github.com/cypress-io/cypress-example-realworld/issues/2)
+23. Check all `cypress-test-*` and `cypress-example-*` repositories, and if there is a branch named `x.y.z` for testing the features or fixes from the newly published version `x.y.z`, update that branch to refer to the newly published NPM version in `package.json`. Then, get the changes approved and merged into that project's main branch. For projects without a `x.y.z` branch, you can go to the Renovate dependency issue and check the box next to `Update dependency cypress to X.Y.Z`. It will automatically create a PR. Once it passes, you can merge it. Try updating at least the following projects:
+    - [cypress-realworld-app](https://github.com/cypress-io/cypress-realworld-app/issues/41)
     - [cypress-example-recipes](https://github.com/cypress-io/cypress-example-recipes/issues/225)
-    - [cypress-example-api-testing](https://github.com/cypress-io/cypress-example-api-testing/issues/15)
-    - [angular-pizza-creator](https://github.com/cypress-io/angular-pizza-creator/issues/5)
-    - [cypress-fiddle](https://github.com/cypress-io/cypress-fiddle/issues/5)
-    - [cypress-example-piechopper](https://github.com/cypress-io/cypress-example-piechopper/issues/75)
-    - [cypress-documentation](https://github.com/cypress-io/cypress-documentation/issues/1313)
-    - [cypress-example-docker-compose](https://github.com/cypress-io/cypress-example-docker-compose) - Doesn't have a Renovate issue, but will auto-create and auto-merge non-major Cypress updates as long as the tests pass.
 
-19. Check if any test or example repositories have a branch for testing the features or fixes from the newly published version `x.y.z`. The branch should also be named `x.y.z`. Check all `cypress-test-*` and `cypress-example-*` repositories, and if there is a branch named `x.y.z`, merge it into `master`.
+24. Be sure to rotate the `NPM_TOKEN` variable inside the `org-npm-credentials` context inside CircleCI. This token is separate from the interactive login used to publish `cypress`. If an npm token was created when logging in, please delete this token now.
 
-    **Test Repos**
-
-    - [cypress-test-tiny](https://github.com/cypress-io/cypress-test-tiny)
-    - [cypress-test-nested-projects](https://github.com/cypress-io/cypress-test-nested-projects)
-    - [cypress-test-example-repos](https://github.com/cypress-io/cypress-test-example-repos)
-    - [cypress-test-node-versions](https://github.com/cypress-io/cypress-test-node-versions)
-    - [cypress-test-module-api](https://github.com/cypress-io/cypress-test-module-api)
-    - [cypress-test-ci-environments](https://github.com/cypress-io/cypress-test-ci-environments)
-
-    **Example Repos**
-
-    - [cypress-example-todomvc](https://github.com/cypress-io/cypress-example-todomvc)
-    - [cypress-example-todomvc-redux](https://github.com/cypress-io/cypress-example-todomvc-redux)
-    - [cypress-example-realworld](https://github.com/cypress-io/cypress-example-realworld)
-    - [cypress-example-recipes](https://github.com/cypress-io/cypress-example-recipes)
-    - [cypress-example-docker-compose](https://github.com/cypress-io/cypress-example-docker-compose)
-    - [cypress-example-api-testing](https://github.com/cypress-io/cypress-example-api-testing)
-    - [cypress-example-piechopper](https://github.com/cypress-io/cypress-example-piechopper)
-    - [cypress-documentation](https://github.com/cypress-io/cypress-documentation)
-
-Take a break, you deserve it! :sunglasses:
+Take a break, you deserve it! 👉😎👉
 
 [release-automations]: https://github.com/cypress-io/release-automations
 [cypress-example-kitchensink]: https://github.com/cypress-io/cypress-example-kitchensink

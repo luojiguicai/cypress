@@ -1,39 +1,55 @@
-/* eslint-disable prefer-rest-params */
 import _ from 'lodash'
 import Promise from 'bluebird'
 import debugFn from 'debug'
-import { registerFetch } from 'unfetch'
 
-import $dom from '../dom'
 import $utils from './utils'
-import $errUtils, { ErrorFromProjectRejectionEvent } from './error_utils'
+import type { ErrorFromProjectRejectionEvent } from './error_utils'
+import $errUtils from './error_utils'
 import $stackUtils from './stack_utils'
 
-import { create as createChai, IChai } from '../cy/chai'
-import { create as createXhr, IXhr } from '../cy/xhrs'
-import { create as createJQuery, IJQuery } from '../cy/jquery'
-import { create as createAliases, IAliases } from '../cy/aliases'
+import type { IChai } from '../cy/chai'
+import { create as createChai } from '../cy/chai'
+import type { IJQuery } from '../cy/jquery'
+import { create as createJQuery } from '../cy/jquery'
+import type { IAliases } from '../cy/aliases'
+import { create as createAliases } from '../cy/aliases'
 import { extend as extendEvents } from './events'
-import { create as createEnsures, IEnsures } from '../cy/ensures'
-import { create as createFocused, IFocused } from '../cy/focused'
-import { create as createMouse, Mouse } from '../cy/mouse'
+import type { IFocused } from '../cy/focused'
+import { create as createFocused } from '../cy/focused'
+import type { Mouse } from '../cy/mouse'
+import { create as createMouse } from '../cy/mouse'
 import { Keyboard } from '../cy/keyboard'
-import { create as createLocation, ILocation } from '../cy/location'
-import { create as createAssertions, IAssertions } from '../cy/assertions'
+import type { ILocation } from '../cy/location'
+import { create as createLocation } from '../cy/location'
+import type { IAssertions } from '../cy/assertions'
+import { create as createAssertions } from '../cy/assertions'
 import { bindToListeners } from '../cy/listeners'
 import { $Chainer } from './chainer'
-import { create as createTimer, ITimer } from '../cy/timers'
-import { create as createTimeouts, ITimeouts } from '../cy/timeouts'
-import { create as createRetries, IRetries } from '../cy/retries'
-import { create as createStability, IStability } from '../cy/stability'
-import $selection from '../dom/selection'
-import { create as createSnapshots, ISnapshots } from '../cy/snapshots'
+import type { ITimer } from '../cy/timers'
+import { create as createTimer } from '../cy/timers'
+import type { ITimeouts } from '../cy/timeouts'
+import { create as createTimeouts } from '../cy/timeouts'
+import type { IRetries } from '../cy/retries'
+import { create as createRetries } from '../cy/retries'
+import type { IStability } from '../cy/stability'
+import { create as createStability } from '../cy/stability'
+import type { ISnapshots } from '../cy/snapshots'
+import { create as createSnapshots } from '../cy/snapshots'
 import { $Command } from './command'
 import { CommandQueue } from './command_queue'
 import { initVideoRecorder } from '../cy/video-recorder'
 import { TestConfigOverride } from '../cy/testConfigOverrides'
+import type { IOverrides } from '../cy/overrides'
+import { create as createOverrides } from '../cy/overrides'
 import { historyNavigationTriggeredHashChange } from '../cy/navigation'
 import { EventEmitter2 } from 'eventemitter2'
+import { handleCrossOriginCookies } from '../cross-origin/events/cookies'
+import { trackTopUrl } from '../util/trackTopUrl'
+import $sourceMapUtils from './source_map_utils'
+
+import type { ICypress } from '../cypress'
+import type { ICookies } from './cookies'
+import type { StateFunc, SubjectChain, QueryFunction } from './state'
 
 const debugErrors = debugFn('cypress:driver:errors')
 
@@ -47,8 +63,7 @@ const getContentWindow = ($autIframe) => {
 
 const setWindowDocumentProps = function (contentWindow, state) {
   state('window', contentWindow)
-
-  return state('document', contentWindow.document)
+  state('document', contentWindow.document)
 }
 
 function __stackReplacementMarker (fn, ctx, args) {
@@ -57,21 +72,35 @@ function __stackReplacementMarker (fn, ctx, args) {
 
 declare let top: WindowProxy & { __alreadySetErrorHandlers__: boolean }
 
+const _noopOnerrorGet = function () {}
+const _noopOnerrorSet = function () {}
+
 // We only set top.onerror once since we make it configurable:false
-// but we update cy instance every run (page reload or rerun button)
+// but we update cy and Cypress instances every run (page reload or rerun button).
+// Both are module-level so that onTopError does NOT close over the Cypress
+// parameter from the first setTopOnError call — which would permanently retain
+// that Cypress instance (and everything it holds) via the top.addEventListener
+// event listener, preventing GC after reruns.
 let curCy: $Cy | null = null
+let curCypress: ICypress | null = null
 const setTopOnError = function (Cypress, cy: $Cy) {
   if (curCy) {
     curCy = cy
+    curCypress = Cypress
 
     return
   }
 
   curCy = cy
+  curCypress = Cypress
 
-  // prevent overriding top.onerror twice when loading more than one
-  // instance of test runner.
-  if (top.__alreadySetErrorHandlers__) {
+  try {
+    // prevent overriding top.onerror twice when loading more than one
+    // instance of test runner.
+    if (top.__alreadySetErrorHandlers__) {
+      return
+    }
+  } catch (err) {
     return
   }
 
@@ -82,7 +111,7 @@ const setTopOnError = function (Cypress, cy: $Cy) {
     // in some callbacks like for cy.intercept, we catch the errors and then
     // rethrow them, causing them to get caught by the top frame
     // but they came from the spec, so we need to differentiate them
-    const isSpecError = $errUtils.isSpecError(Cypress.config('spec'), err)
+    const isSpecError = $errUtils.isSpecError(curCypress!.config('spec'), err)
 
     const handled = curCy!.onUncaughtException({
       err,
@@ -93,7 +122,7 @@ const setTopOnError = function (Cypress, cy: $Cy) {
 
     debugErrors('uncaught top error: %o', originalErr)
 
-    $errUtils.logError(Cypress, handlerType, originalErr, handled)
+    $errUtils.logError(curCypress!, handlerType, originalErr, handled)
 
     // return undefined so the browser does its default
     // uncaught exception behavior (logging to console)
@@ -104,8 +133,8 @@ const setTopOnError = function (Cypress, cy: $Cy) {
 
   // prevent Mocha from setting top.onerror
   Object.defineProperty(top, 'onerror', {
-    set () {},
-    get () {},
+    set: _noopOnerrorSet,
+    get: _noopOnerrorGet,
     configurable: false,
     enumerable: true,
   })
@@ -115,17 +144,41 @@ const setTopOnError = function (Cypress, cy: $Cy) {
   top.__alreadySetErrorHandlers__ = true
 }
 
-export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssertions, IRetries, IJQuery, ILocation, ITimer, IChai, IXhr, IAliases, IEnsures, ISnapshots, IFocused {
+const ensureRunnable = (cy, cmd) => {
+  if (!cy.state('runnable')) {
+    $errUtils.throwErrByPath('miscellaneous.outside_test_with_cmd', {
+      args: { cmd },
+    })
+  }
+}
+
+type ICyFocused = Omit<
+  IFocused,
+  'documentHasFocus' | 'interceptFocus' | 'interceptBlur'
+>
+
+type ICySnapshots = Omit<
+  ISnapshots,
+  'onCssModified' | 'onBeforeWindowLoad'
+>
+
+// How many times each runnable has started. Hooks are reused across tests and retries,
+// so this tells a completion from an earlier run apart from one for the current run.
+const runnableRuns = new WeakMap<object, number>()
+
+export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssertions, IRetries, IJQuery, ILocation, ITimer, IChai, IAliases, ICySnapshots, ICyFocused {
   id: string
   specWindow: any
-  state: any
+  state: StateFunc
   config: any
-  Cypress: any
-  Cookies: any
+  Cypress: ICypress
+  Cookies: ICookies
+
   devices: {
     keyboard: Keyboard
     mouse: Mouse
   }
+
   queue: CommandQueue
 
   timeout: ITimeouts['timeout']
@@ -138,10 +191,13 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
   verifyUpcomingAssertions: IAssertions['verifyUpcomingAssertions']
 
   retry: IRetries['retry']
+  retryIfCommandAUTOriginMismatch: IRetries['retryIfCommandAUTOriginMismatch']
 
+  $$: IJQuery['$$']
   getRemotejQueryInstance: IJQuery['getRemotejQueryInstance']
 
   getRemoteLocation: ILocation['getRemoteLocation']
+  getCrossOriginRemoteLocation: ILocation['getCrossOriginRemoteLocation']
 
   fireBlur: IFocused['fireBlur']
   fireFocus: IFocused['fireFocus']
@@ -152,9 +208,6 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
   expect: IChai['expect']
 
-  getIndexedXhrByAlias: IXhr['getIndexedXhrByAlias']
-  getRequestsByAlias: IXhr['getRequestsByAlias']
-
   addAlias: IAliases['addAlias']
   getAlias: IAliases['getAlias']
   getNextAlias: IAliases['getNextAlias']
@@ -162,34 +215,15 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
   aliasNotFoundFor: IAliases['aliasNotFoundFor']
   getXhrTypeByAlias: IAliases['getXhrTypeByAlias']
 
-  ensureElement: IEnsures['ensureElement']
-  ensureAttached: IEnsures['ensureAttached']
-  ensureWindow: IEnsures['ensureWindow']
-  ensureDocument: IEnsures['ensureDocument']
-  ensureElDoesNotHaveCSS: IEnsures['ensureElDoesNotHaveCSS']
-  ensureElementIsNotAnimating: IEnsures['ensureElementIsNotAnimating']
-  ensureNotDisabled: IEnsures['ensureNotDisabled']
-  ensureVisibility: IEnsures['ensureVisibility']
-  ensureStrictVisibility: IEnsures['ensureStrictVisibility']
-  ensureNotHiddenByAncestors: IEnsures['ensureNotHiddenByAncestors']
-  ensureExistence: IEnsures['ensureExistence']
-  ensureElExistence: IEnsures['ensureElExistence']
-  ensureDescendents: IEnsures['ensureDescendents']
-  ensureValidPosition: IEnsures['ensureValidPosition']
-  ensureScrollability: IEnsures['ensureScrollability']
-  ensureNotReadonly: IEnsures['ensureNotReadonly']
-
   createSnapshot: ISnapshots['createSnapshot']
   detachDom: ISnapshots['detachDom']
   getStyles: ISnapshots['getStyles']
 
-  // Private methods
   resetTimer: ReturnType<typeof createTimer>['reset']
+  resetStability: ReturnType<typeof createStability>['reset']
+  overrides: IOverrides
 
-  ensureSubjectByType: ReturnType<typeof createEnsures>['ensureSubjectByType']
-  ensureRunnable: ReturnType<typeof createEnsures>['ensureRunnable']
-
-  onCssModified: ReturnType<typeof createSnapshots>['onCssModified']
+  // Private methods
   onBeforeWindowLoad: ReturnType<typeof createSnapshots>['onBeforeWindowLoad']
 
   documentHasFocus: ReturnType<typeof createFocused>['documentHasFocus']
@@ -197,9 +231,10 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
   interceptBlur: ReturnType<typeof createFocused>['interceptBlur']
 
   private testConfigOverride: TestConfigOverride
-  private commandFns: Record<string, Function> = {}
+  private commandFns: Record<string, (...args: any[]) => any> = {}
+  private queryFns: Record<string, (...args: any[]) => any> = {}
 
-  constructor (specWindow, Cypress, Cookies, state, config) {
+  constructor (specWindow: SpecWindow, Cypress: ICypress, Cookies: ICookies, state: StateFunc, config: ICypress['config']) {
     super()
 
     state('specWindow', specWindow)
@@ -210,26 +245,28 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     this.config = config
     this.Cypress = Cypress
     this.Cookies = Cookies
-    initVideoRecorder(Cypress)
+    // The constructor can't wait on recording, and initVideoRecorder swallows its own errors
+    void initVideoRecorder(Cypress)
 
     this.testConfigOverride = new TestConfigOverride()
 
     // bind methods
-    this.$$ = this.$$.bind(this)
     this.isCy = this.isCy.bind(this)
     this.fail = this.fail.bind(this)
     this.isStopped = this.isStopped.bind(this)
     this.stop = this.stop.bind(this)
     this.reset = this.reset.bind(this)
     this.addCommandSync = this.addCommandSync.bind(this)
-    this.addChainer = this.addChainer.bind(this)
     this.addCommand = this.addCommand.bind(this)
+    this.addQuery = this.addQuery.bind(this)
     this.now = this.now.bind(this)
-    this.replayCommandsFrom = this.replayCommandsFrom.bind(this)
     this.onBeforeAppWindowLoad = this.onBeforeAppWindowLoad.bind(this)
     this.onUncaughtException = this.onUncaughtException.bind(this)
     this.setRunnable = this.setRunnable.bind(this)
-    this.cleanup = this.cleanup.bind(this)
+    this.getSubjectFromChain = this.getSubjectFromChain.bind(this)
+    this.setSubjectForChainer = this.setSubjectForChainer.bind(this)
+    this.subject = this.subject.bind(this)
+    this.subjectChain = this.subjectChain.bind(this)
 
     // init traits
 
@@ -238,10 +275,11 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     this.timeout = timeouts.timeout
     this.clearTimeout = timeouts.clearTimeout
 
-    const statility = createStability(Cypress, state)
+    const stability = createStability(Cypress, state)
 
-    this.isStable = statility.isStable
-    this.whenStable = statility.whenStable
+    this.isStable = stability.isStable
+    this.whenStable = stability.whenStable
+    this.resetStability = stability.reset
 
     const assertions = createAssertions(Cypress, this)
 
@@ -255,14 +293,17 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     const retries = createRetries(Cypress, state, this.timeout, this.clearTimeout, this.whenStable, onFinishAssertions)
 
     this.retry = retries.retry
+    this.retryIfCommandAUTOriginMismatch = retries.retryIfCommandAUTOriginMismatch
 
     const jquery = createJQuery(state)
 
+    this.$$ = jquery.$$
     this.getRemotejQueryInstance = jquery.getRemotejQueryInstance
 
     const location = createLocation(state)
 
     this.getRemoteLocation = location.getRemoteLocation
+    this.getCrossOriginRemoteLocation = location.getCrossOriginRemoteLocation
 
     const focused = createFocused(state)
 
@@ -291,11 +332,6 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
     this.expect = expect
 
-    const xhr = createXhr(state)
-
-    this.getIndexedXhrByAlias = xhr.getIndexedXhrByAlias
-    this.getRequestsByAlias = xhr.getRequestsByAlias
-
     const aliases = createAliases(this)
 
     this.addAlias = aliases.addAlias
@@ -305,38 +341,17 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     this.aliasNotFoundFor = aliases.aliasNotFoundFor
     this.getXhrTypeByAlias = aliases.getXhrTypeByAlias
 
-    const ensures = createEnsures(state, this.expect)
-
-    this.ensureElement = ensures.ensureElement
-    this.ensureAttached = ensures.ensureAttached
-    this.ensureWindow = ensures.ensureWindow
-    this.ensureDocument = ensures.ensureDocument
-    this.ensureElDoesNotHaveCSS = ensures.ensureElDoesNotHaveCSS
-    this.ensureElementIsNotAnimating = ensures.ensureElementIsNotAnimating
-    this.ensureNotDisabled = ensures.ensureNotDisabled
-    this.ensureVisibility = ensures.ensureVisibility
-    this.ensureStrictVisibility = ensures.ensureStrictVisibility
-    this.ensureNotHiddenByAncestors = ensures.ensureNotHiddenByAncestors
-    this.ensureExistence = ensures.ensureExistence
-    this.ensureElExistence = ensures.ensureElExistence
-    this.ensureDescendents = ensures.ensureDescendents
-    this.ensureValidPosition = ensures.ensureValidPosition
-    this.ensureScrollability = ensures.ensureScrollability
-    this.ensureNotReadonly = ensures.ensureNotReadonly
-
-    this.ensureSubjectByType = ensures.ensureSubjectByType
-    this.ensureRunnable = ensures.ensureRunnable
-
     const snapshots = createSnapshots(this.$$, state)
 
     this.createSnapshot = snapshots.createSnapshot
     this.detachDom = snapshots.detachDom
     this.getStyles = snapshots.getStyles
 
-    this.onCssModified = snapshots.onCssModified
     this.onBeforeWindowLoad = snapshots.onBeforeWindowLoad
 
-    this.queue = new CommandQueue(state, this.timeout, this.whenStable, this.cleanup, this.fail, this.isCy)
+    this.overrides = createOverrides(state, config, focused, snapshots)
+
+    this.queue = new CommandQueue(state, stability, this)
 
     setTopOnError(Cypress, this)
 
@@ -344,14 +359,21 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     specWindow.cy = this
 
     extendEvents(this)
-  }
 
-  $$ (selector, context) {
-    if (context == null) {
-      context = this.state('document')
+    Cypress.on('enqueue:command', (attrs: Cypress.EnqueuedCommandAttributes) => {
+      this.enqueue($Command.create(attrs))
+    })
+
+    // clears out any extra tabs/windows between tests
+    Cypress.on('test:before:run:async', () => {
+      return Cypress.backend('close:extra:targets')
+    })
+
+    if (!Cypress.isCrossOriginSpecBridge) {
+      trackTopUrl()
     }
 
-    return $dom.query(selector, context)
+    handleCrossOriginCookies(Cypress)
   }
 
   isCy (val) {
@@ -363,6 +385,11 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
   }
 
   fail (err, options: { async?: boolean } = {}) {
+    // if an onFail handler is provided, call this in its place (currently used for cross-origin support)
+    if (this.state('onFail')) {
+      return this.state('onFail')(err)
+    }
+
     // this means the error has already been through this handler and caught
     // again. but we don't need to run it through again, so we can re-throw
     // it and it will fail the test as-is
@@ -386,10 +413,16 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
     err.stack = $stackUtils.normalizedStack(err)
 
+    let userInvocationStack = err.crossOriginUserInvocationStack
+
+    if (!userInvocationStack) {
+      userInvocationStack = $errUtils.getUserInvocationStack(err, this.state)
+    }
+
     err = $errUtils.enhanceStack({
       err,
-      userInvocationStack: $errUtils.getUserInvocationStack(err, this.state),
-      projectRoot: this.config('projectRoot'),
+      userInvocationStack,
+      projectRoot: $sourceMapUtils.getSourceMapProjectRoot(),
     })
 
     err = $errUtils.processErr(err, this.config)
@@ -399,11 +432,9 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     // store the error on state now
     this.state('error', err)
 
-    const cy = this
-
-    const finish = function (err) {
+    const finish = (err) => {
       // if the test has a (done) callback, we fail the test with that
-      const d = cy.state('done')
+      const d = this.state('done')
 
       if (d) {
         return d(err)
@@ -412,7 +443,7 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
       // if this failure was asynchronously called (outside the promise chain)
       // but the promise chain is still active, reject it. if we're inside
       // the promise chain, this isn't necessary and will actually mess it up
-      const r = cy.state('reject')
+      const r = this.state('reject')
 
       if (options.async && r) {
         return r(err)
@@ -438,10 +469,12 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     //    then it should fail
     // 4. and tests without a done will pass
 
-    // if we dont have a "fail" handler
+    // if we don't have a "fail" handler
     // 1. callback with state("done") when async
     // 2. throw the error for the promise chain
     try {
+      this.Cypress.state('logGroupIds', []) // reset log groups so assertions are at the top level
+
       // collect all of the callbacks for 'fail'
       rets = this.Cypress.action('cy:fail', err, this.state('runnable'))
     } catch (cyFailErr: any) {
@@ -463,7 +496,7 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
   initialize ($autIframe) {
     this.state('$autIframe', $autIframe)
 
-    // dont need to worry about a try/catch here
+    // don't need to worry about a try/catch here
     // because this is during initialize and its
     // impossible something is wrong here
     setWindowDocumentProps(getContentWindow($autIframe), this.state)
@@ -481,7 +514,7 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     // when we find ourselves in a cross origin situation, then our
     // proxy has not injected Cypress.action('window:before:load')
     // so Cypress.onBeforeAppWindowLoad() was never called
-    return $autIframe.on('load', () => {
+    return $autIframe.on('load', async () => {
       if (historyNavigationTriggeredHashChange(this.state)) {
         // Skip load event.
         // Chromium 97+ triggers fires iframe onload for cross-origin-initiated same-document
@@ -496,28 +529,99 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
       // if setting these props failed then we know we're in a cross origin failure
       try {
-        setWindowDocumentProps(getContentWindow($autIframe), this.state)
+        const autWindow = getContentWindow($autIframe)
 
-        // we may need to update the url now
-        this.urlNavigationEvent('load')
+        let isRunnerAbleToCommunicateWithAUT: boolean
 
-        // we normally DONT need to reapply contentWindow listeners
-        // because they would have been automatically applied during
-        // onBeforeAppWindowLoad, but in the case where we visited
-        // about:blank in a visit, we do need these
-        this.contentWindowListeners(getContentWindow($autIframe))
+        try {
+          // Test to see if we can communicate with the AUT.
+          // eslint-disable-next-line chai-friendly/no-unused-expressions -- reading href throws when the AUT is cross-origin
+          autWindow.location.href
+          isRunnerAbleToCommunicateWithAUT = true
+        } catch (err: any) {
+          isRunnerAbleToCommunicateWithAUT = false
+        }
 
-        this.Cypress.action('app:window:load', this.state('window'))
+        // If the runner can communicate, we should setup all events, otherwise just setup the window and fire the load event.
+        if (isRunnerAbleToCommunicateWithAUT) {
+          if (this.Cypress.isBrowser('webkit')) {
+            // WebKit's unhandledrejection event will sometimes not fire within the AUT
+            // due to a documented bug: https://bugs.webkit.org/show_bug.cgi?id=187822
+            // To ensure that the event will always fire (and always report these
+            // unhandled rejections to the user), we patch the AUT's Error constructor
+            // to enqueue a no-op microtask when executed, which ensures that the unhandledrejection
+            // event handler will be executed if this Error is uncaught.
+            const originalError = autWindow.Error
 
-        // we are now stable again which is purposefully
-        // the last event we call here, to give our event
-        // listeners time to be invoked prior to moving on
-        return this.isStable(true, 'load')
-      } catch (err) {
+            autWindow.Error = function __CyWebKitError (...args) {
+              autWindow.queueMicrotask(() => { })
+
+              return originalError.apply(this, args)
+            }
+          }
+
+          setWindowDocumentProps(autWindow, this.state)
+
+          // we may need to update the url now
+          this.urlNavigationEvent('load')
+
+          // we normally DON'T need to reapply contentWindow listeners
+          // because they would have been automatically applied during
+          // onBeforeAppWindowLoad, but in the case where we visited
+          // about:blank in a visit, we do need these
+          this.contentWindowListeners(autWindow)
+        } else {
+          this.state('window', autWindow)
+          this.state('document', undefined)
+          // we may need to update the url now
+          this.urlNavigationEvent('load')
+        }
+
+        // stability is signalled after the window:load event to give event
+        // listeners time to be invoked prior to moving on, but not if
+        // there is a cross-origin error and the cy.origin API is
+        // not utilized
+        try {
+          // Get the location even if we're cross origin.
+          const remoteLocation = await this.getCrossOriginRemoteLocation()
+
+          cy.state('autLocation', remoteLocation)
+          this.Cypress.action('app:window:load', this.state('window'), remoteLocation.href)
+
+          this.Cypress.primaryOriginCommunicator.toAllSpecBridges('window:load', { url: remoteLocation.href })
+        } catch (err: any) {
+          // this catches errors thrown by user-registered event handlers
+          // for `window:load`. this is used in the `catch` below so they
+          // aren't mistaken as cross-origin errors
+          // If this is a cypress error, pass it on through.
+          if (!$errUtils.isCypressErr(err)) {
+            err.isFromWindowLoadEvent = true
+          }
+
+          throw err
+        } finally {
+          this.isStable(true, 'load')
+        }
+      } catch (err: any) {
+        if (err.isFromWindowLoadEvent) {
+          delete err.isFromWindowLoadEvent
+
+          // the user's window:load handler threw an error, so propagate that
+          // and fail the test
+          const r = this.state('reject')
+
+          if (r) {
+            return r(err)
+          }
+        }
+
+        // we failed setting the remote window props which
+        // means the page navigated to a different origin
+
         let e = err
 
         // we failed setting the remote window props
-        // which means we're in a cross domain failure
+        // which means we're in a cross origin failure
         // check first to see if you have a callback function
         // defined and let the page load change the error
         const onpl = this.state('onPageLoadErr')
@@ -526,12 +630,15 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
           e = onpl(e)
         }
 
-        // and now reject with it
-        const r = this.state('reject')
+        this.Cypress.emit('internal:window:load', {
+          type: 'cross:origin:failure',
+          error: e,
+        })
 
-        if (r) {
-          return r(e)
-        }
+        // need async:true since this is outside the command queue promise
+        // chain and cy.fail needs to know to use the reference to the
+        // last command to reject it
+        this.fail(e, { async: true })
       }
     })
   }
@@ -545,17 +652,23 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     return this.doneEarly()
   }
 
+  cancelPendingCommands () {
+    this.queue.endEarly({ canceled: false })
+  }
+
   // reset is called before each test
   reset (test) {
     try {
       const s = this.state()
 
       const backup = {
+        test,
         window: s.window,
         document: s.document,
         $autIframe: s.$autIframe,
         specWindow: s.specWindow,
         activeSessions: s.activeSessions,
+        isProtocolEnabled: s.isProtocolEnabled,
       }
 
       // reset state back to empty object
@@ -567,15 +680,18 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
       this.queue.reset()
       this.queue.clear()
       this.resetTimer()
-      this.testConfigOverride.restoreAndSetTestConfigOverrides(test, this.Cypress.config, this.Cypress.env)
-
+      this.resetStability()
       this.removeAllListeners()
+      this.testConfigOverride.restoreAndSetTestConfigOverrides(test, this.Cypress.config, this.Cypress.expose)
     } catch (err) {
       this.fail(err)
     }
   }
 
   addCommandSync (name, fn) {
+    // normalizedUserInvocationStack drops this wrapper's frame from user stacks by
+    // the name the browser infers from `cy[name] = function`, so keep that shape
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- see above
     const cy = this
 
     cy[name] = function () {
@@ -583,53 +699,85 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     }
   }
 
-  addChainer (name, fn) {
-    // add this function to our chainer class
-    return $Chainer.add(name, fn)
+  runQueue () {
+    cy.queue.run()
   }
 
   addCommand ({ name, fn, type, prevSubject }) {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- the user-stack filter matches `cy[name]`, see addCommandSync
     const cy = this
 
-    // TODO: prob don't need this anymore
     this.commandFns[name] = fn
 
     const wrap = function (firstCall) {
-      fn = cy.commandFns[name]
-      const wrapped = wrapByType(fn, firstCall)
+      if (type === 'parent') {
+        return (chainerId, ...args) => fn.apply(cy.runnableCtx(name), args)
+      }
+
+      const wrapped = function (chainerId, ...args) {
+        // push the subject into the args
+        if (firstCall) {
+          cy.validateFirstCall(name, args, prevSubject)
+        }
+
+        args = cy.pushSubject(name, args, prevSubject, chainerId)
+
+        return fn.apply(cy.runnableCtx(name), args)
+      }
 
       wrapped.originalFn = fn
 
       return wrapped
     }
 
-    const wrapByType = function (fn, firstCall) {
-      if (type === 'parent') {
-        return fn
+    const cyFn = wrap(true)
+    const chainerFn = wrap(false)
+
+    const callback = (chainer, userInvocationStack, args, privilegeVerification, firstCall = false) => {
+      // dont enqueue / inject any new commands if
+      // onInjectCommand returns false
+      const onInjectCommand = cy.state('onInjectCommand')
+
+      if (_.isFunction(onInjectCommand) && onInjectCommand.call(cy, name, ...args) === false) {
+        return
       }
 
-      // child, dual, assertion, utility command
-      // pushes the previous subject into them
-      // after verifying its of the correct type
-      return function (...args) {
-        // push the subject into the args
-        args = cy.pushSubjectAndValidate(name, args, firstCall, prevSubject)
-
-        return fn.apply(cy.runnableCtx(name), args)
-      }
+      cy.enqueue($Command.create({
+        name,
+        args,
+        type,
+        chainerId: chainer.chainerId,
+        userInvocationStack,
+        fn: firstCall ? cyFn : chainerFn,
+        privilegeVerification,
+      }))
     }
 
-    cy[name] = function (...args) {
-      const userInvocationStack = $stackUtils.captureUserInvocationStack(cy.specWindow.Error)
+    $Chainer.add(name, callback)
 
-      cy.ensureRunnable(name)
+    cy[name] = function (...args) {
+      ensureRunnable(cy, name)
+
+      // for privileged commands invoked from the spec, the privileged channel
+      // returns a function the command calls with its options to verify them
+      // with the server before sending its websocket message to run them
+      const privilegeVerification = Cypress.emitMap('command:invocation', { name, args })
 
       // this is the first call on cypress
       // so create a new chainer instance
-      const chain = $Chainer.create(name, userInvocationStack, cy.specWindow, args)
+      const chainer = new $Chainer(cy.specWindow)
 
-      // store the chain so we can access it later
-      cy.state('chain', chain)
+      if (cy.state('chainerId')) {
+        cy.linkSubject(chainer.chainerId, cy.state('chainerId'))
+      }
+
+      let userInvocationStack = $stackUtils.captureUserInvocationStack(cy.specWindow.Error)
+
+      if (cy.state('originUserInvocationStack')) {
+        userInvocationStack = $stackUtils.mergeCrossOriginUserInvocationStack(userInvocationStack, cy.state('originUserInvocationStack'))
+      }
+
+      callback(chainer, userInvocationStack, args, privilegeVerification, true)
 
       // if we are in the middle of a command
       // and its return value is a promise
@@ -661,107 +809,98 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
           cy.warnMixingPromisesAndCommands()
         }
 
-        cy.queue.run()
+        cy.runQueue()
       }
 
-      return chain
+      return chainer
     }
+  }
 
-    return this.addChainer(name, (chainer, userInvocationStack, args) => {
-      const { firstCall, chainerId } = chainer
+  addQuery ({ name, fn }) {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- the user-stack filter matches `cy[name]`, see addCommandSync
+    const cy = this
 
+    this.queryFns[name] = fn
+
+    const callback = (chainer, userInvocationStack, args, privilegeVerification) => {
       // dont enqueue / inject any new commands if
       // onInjectCommand returns false
       const onInjectCommand = cy.state('onInjectCommand')
-      const injected = _.isFunction(onInjectCommand)
 
-      if (injected) {
-        if (onInjectCommand.call(cy, name, ...args) === false) {
-          return
-        }
+      if (_.isFunction(onInjectCommand) && onInjectCommand.call(cy, name, ...args) === false) {
+        return
       }
 
-      cy.enqueue({
+      // Queries are functions that accept args (which is called once each time the command is used in the spec
+      // file), which return a function that accepts the subject (which is potentially called any number of times).
+      // The outer function is used to store any needed state needed by a particular instance of the command, such as
+      // a Cypress.log() instance, while the inner one (queryFn here) is the one that determines the next subject.
+
+      // We enqueue the outer function as the "cypress command". See command_queue.ts for details on how this is
+      // invoked and the inner function retried.
+      const command = $Command.create({
         name,
         args,
-        type,
-        chainerId,
+        chainerId: chainer.chainerId,
         userInvocationStack,
-        injected,
-        fn: wrap(firstCall),
+        query: true,
       })
 
-      return true
-    })
+      const cyFn = function (chainerId, ...args) {
+        return fn.apply(command, args)
+      }
+
+      cyFn.originalFn = fn
+      command.set('fn', cyFn)
+      command.set('privilegeVerification', privilegeVerification)
+
+      cy.enqueue(command)
+    }
+
+    $Chainer.add(name, callback)
+
+    cy[name] = function (...args) {
+      ensureRunnable(cy, name)
+
+      // for privileged commands invoked from the spec, the privileged channel
+      // returns a function the command calls with its options to verify them
+      // with the server before sending its websocket message to run them
+      const privilegeVerification = Cypress.emitMap('command:invocation', { name, args })
+
+      // this is the first call on cypress
+      // so create a new chainer instance
+      const chainer = new $Chainer(cy.specWindow)
+
+      if (cy.state('chainerId')) {
+        cy.linkSubject(chainer.chainerId, cy.state('chainerId'))
+      }
+
+      let userInvocationStack = $stackUtils.captureUserInvocationStack(cy.specWindow.Error)
+
+      if (cy.state('originUserInvocationStack')) {
+        userInvocationStack = $stackUtils.mergeCrossOriginUserInvocationStack(userInvocationStack, cy.state('originUserInvocationStack'))
+      }
+
+      callback(chainer, userInvocationStack, args, privilegeVerification)
+
+      // if we're the first call onto a cy
+      // command, then kick off the run
+      if (!cy.state('promise')) {
+        cy.runQueue()
+      }
+
+      return chainer
+    }
   }
 
-  now (name, ...args) {
+  now (name: string, ...args: any[]): Promise<any> | QueryFunction {
+    if (this.queryFns[name]) {
+      return this.queryFns[name].apply(this.state('current'), args)
+    }
+
     return Promise.resolve(
       this.commandFns[name].apply(this, args),
     )
-  }
-
-  replayCommandsFrom (current) {
-    const cy = this
-
-    // reset each chainerId to the
-    // current value
-    const chainerId = this.state('chainerId')
-
-    const insert = function (command) {
-      command.set('chainerId', chainerId)
-
-      // clone the command to prevent
-      // mutating its properties
-      return cy.enqueue(command.clone())
-    }
-
-    // - starting with the aliased command
-    // - walk up to each prev command
-    // - until you reach a parent command
-    // - or until the subject is in the DOM
-    // - from that command walk down inserting
-    //   every command which changed the subject
-    // - coming upon an assertion should only be
-    //   inserted if the previous command should
-    //   be replayed
-
-    const commands = cy.getCommandsUntilFirstParentOrValidSubject(current)
-
-    if (commands) {
-      let initialCommand = commands.shift()
-
-      const commandsToInsert = _.reduce(commands, (memo, command, index) => {
-        const push = () => {
-          return memo.push(command)
-        }
-
-        if (!(command.get('type') !== 'assertion')) {
-          // if we're an assertion and the prev command
-          // is in the memo, then push this one
-          if (memo.includes(command.get('prev'))) {
-            push()
-          }
-        } else if (!(command.get('subject') === initialCommand.get('subject'))) {
-          // when our subjects dont match then
-          // reset the initialCommand to this command
-          // so the next commands can compare against
-          // this one to figure out the changing subjects
-          initialCommand = command
-
-          push()
-        }
-
-        return memo
-      }, [initialCommand])
-
-      for (let c of commandsToInsert) {
-        insert(c)
-      }
-    }
-
-    // prevent loop comprehension
-    return null
   }
 
   onBeforeAppWindowLoad (contentWindow) {
@@ -774,7 +913,7 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
     this.contentWindowListeners(contentWindow)
 
-    this.wrapNativeMethods(contentWindow)
+    this.overrides.wrapNativeMethods(contentWindow)
 
     this.onBeforeWindowLoad()
   }
@@ -792,10 +931,10 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     // don't do anything if we don't have a current runnable
     if (!runnable) return
 
-    // uncaught exceptions should be only be catchable in the AUT (app)
-    // or if in component testing mode, since then the spec frame and
-    // AUT frame are the same
-    if (frameType === 'app' || this.config('componentTesting')) {
+    // uncaught exceptions should only be catchable in the AUT (app); errors
+    // from the spec fail the test outright. Component testing runs the spec
+    // inside the AUT frame, so its errors already arrive here as 'app'.
+    if (frameType === 'app') {
       try {
         const results = this.Cypress.action('app:uncaught:exception', err, runnable, promise)
 
@@ -835,13 +974,8 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
     // reset the promise again
     this.state('promise', undefined)
-
     this.state('hookId', hookId)
-
     this.state('runnable', runnable)
-
-    this.state('test', $utils.getTestFromRunnable(runnable))
-
     this.state('ctx', runnable.ctx)
 
     const { fn } = runnable
@@ -850,6 +984,16 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
       return runnable.fn = fn
     }
 
+    const run = (runnableRuns.get(runnable) ?? 0) + 1
+
+    runnableRuns.set(runnable, run)
+
+    // Once a newer run of this runnable has started (a retry clears mocha's timedOut on the
+    // reused hook), mocha would count a late done() or promise from this run as a second
+    // completion of the new run and fail it, so those are dropped.
+    const isStaleRun = () => runnableRuns.get(runnable) !== run
+
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- runnable.fn forwards its own `this` and `arguments` to the user's test function
     const cy = this
 
     runnable.fn = function () {
@@ -877,6 +1021,10 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
           const originalDone = arguments[0]
 
           arguments[0] = (done = function (err) {
+            if (isStaleRun()) {
+              return null
+            }
+
             // TODO: handle no longer error when ended early
             cy.doneEarly()
 
@@ -939,7 +1087,19 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
             cy.warnMixingPromisesAndCommands()
           }
 
-          return ret
+          const customPromise = ret
+
+          return new Promise((resolve, reject) => {
+            customPromise.then((value) => {
+              if (!isStaleRun()) {
+                resolve(value)
+              }
+            }, (err) => {
+              if (!isStaleRun()) {
+                reject(err)
+              }
+            })
+          })
         }
 
         // if we're cy or we've enqueued commands
@@ -971,66 +1131,6 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     }
   }
 
-  private wrapNativeMethods (contentWindow) {
-    try {
-      // return null to trick contentWindow into thinking
-      // its not been iframed if modifyObstructiveCode is true
-      if (this.config('modifyObstructiveCode')) {
-        Object.defineProperty(contentWindow, 'frameElement', {
-          get () {
-            return null
-          },
-        })
-      }
-
-      const cy = this
-
-      contentWindow.HTMLElement.prototype.focus = function (focusOption) {
-        return cy.interceptFocus(this, contentWindow, focusOption)
-      }
-
-      contentWindow.HTMLElement.prototype.blur = function () {
-        return cy.interceptBlur(this)
-      }
-
-      contentWindow.SVGElement.prototype.focus = function (focusOption) {
-        return cy.interceptFocus(this, contentWindow, focusOption)
-      }
-
-      contentWindow.SVGElement.prototype.blur = function () {
-        return cy.interceptBlur(this)
-      }
-
-      contentWindow.HTMLInputElement.prototype.select = function () {
-        return $selection.interceptSelect.call(this)
-      }
-
-      contentWindow.document.hasFocus = function () {
-        return cy.documentHasFocus.call(this)
-      }
-
-      const cssModificationSpy = function (original, ...args) {
-        cy.onCssModified(this.href)
-
-        return original.apply(this, args)
-      }
-
-      const { insertRule } = contentWindow.CSSStyleSheet.prototype
-      const { deleteRule } = contentWindow.CSSStyleSheet.prototype
-
-      contentWindow.CSSStyleSheet.prototype.insertRule = _.wrap(insertRule, cssModificationSpy)
-      contentWindow.CSSStyleSheet.prototype.deleteRule = _.wrap(deleteRule, cssModificationSpy)
-
-      if (this.config('experimentalFetchPolyfill')) {
-        // drop "fetch" polyfill that replaces it with XMLHttpRequest
-        // from the app iframe that we wrap for network stubbing
-        contentWindow.fetch = registerFetch(contentWindow)
-        // flag the polyfill to test this experimental feature easier
-        this.state('fetchPolyfilled', true)
-      }
-    } catch (error) { } // eslint-disable-line no-empty
-  }
-
   private warnMixingPromisesAndCommands () {
     const title = this.state('runnable').fullTitle()
 
@@ -1040,7 +1140,7 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
   }
 
   private runnableCtx (name) {
-    this.ensureRunnable(name)
+    ensureRunnable(this, name)
 
     return this.state('runnable').ctx
   }
@@ -1049,38 +1149,13 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
     return this.Cypress.action('app:navigation:changed', `page navigation event (${event})`)
   }
 
-  private cleanup () {
-    // cleanup could be called during a 'stop' event which
-    // could happen in between a runnable because they are async
-    if (this.state('runnable')) {
-      // make sure we reset the runnable's timeout now
-      this.state('runnable').resetTimeout()
-    }
-
-    // if a command fails then after each commands
-    // could also fail unless we clear this out
-    this.state('commandIntermediateValue', undefined)
-
-    // reset the nestedIndex back to null
-    this.state('nestedIndex', null)
-
-    // also reset recentlyReady back to null
-    this.state('recentlyReady', null)
-
-    // and forcibly move the index needle to the
-    // end in case we have after / afterEach hooks
-    // which need to run
-    return this.state('index', this.queue.length)
-  }
-
   private contentWindowListeners (contentWindow) {
-    const cy = this
-
     bindToListeners(contentWindow, {
       // eslint-disable-next-line @cypress/dev/arrow-body-multiline-braces
       onError: (handlerType) => (event) => {
         const { originalErr, err, promise } = $errUtils.errorFromUncaughtEvent(handlerType, event) as ErrorFromProjectRejectionEvent
-        const handled = cy.onUncaughtException({
+
+        const handled = this.onUncaughtException({
           err,
           promise,
           handlerType,
@@ -1089,157 +1164,258 @@ export class $Cy extends EventEmitter2 implements ITimeouts, IStability, IAssert
 
         debugErrors('uncaught AUT error: %o', originalErr)
 
-        $errUtils.logError(cy.Cypress, handlerType, originalErr, handled)
+        $errUtils.logError(this.Cypress, handlerType, originalErr, handled)
 
         // return undefined so the browser does its default
         // uncaught exception behavior (logging to console)
         return undefined
       },
-      onHistoryNav (delta) {
-        cy.state('navHistoryDelta', delta)
+      onHistoryNav: (delta) => {
+        this.state('navHistoryDelta', delta)
       },
-      onSubmit (e) {
-        return cy.Cypress.action('app:form:submitted', e)
+      onSubmit: (e) => {
+        return this.Cypress.action('app:form:submitted', e)
       },
-      onBeforeUnload (e) {
-        cy.isStable(false, 'beforeunload')
+      onLoad: () => { },
+      onBeforeUnload: (e) => {
+        this.isStable(false, 'beforeunload')
 
-        cy.Cookies.setInitial()
+        this.Cookies.setInitial()
 
-        cy.resetTimer()
+        this.resetTimer()
 
-        cy.Cypress.action('app:window:before:unload', e)
+        this.Cypress.action('app:window:before:unload', e)
 
         // return undefined so our beforeunload handler
         // doesn't trigger a confirmation dialog
         return undefined
       },
-      onUnload (e) {
-        return cy.Cypress.action('app:window:unload', e)
+      onUnload: (e) => {
+        return this.Cypress.action('app:window:unload', e)
       },
-      onNavigation (...args) {
-        return cy.Cypress.action('app:navigation:changed', ...args)
+      onNavigation: (...args) => {
+        return this.Cypress.action('app:navigation:changed', ...args)
       },
-      onAlert (str) {
-        return cy.Cypress.action('app:window:alert', str)
+      onAlert: (str) => {
+        return this.Cypress.action('app:window:alert', str)
       },
-      onConfirm (str) {
-        const results = cy.Cypress.action('app:window:confirm', str)
+      onConfirm: (str) => {
+        const results = this.Cypress.action('app:window:confirm', str)
 
         // return false if ANY results are false
         // else true
         const ret = !_.some(results, returnedFalse)
 
-        cy.Cypress.action('app:window:confirmed', str, ret)
+        this.Cypress.action('app:window:confirmed', str, ret)
 
         return ret
       },
     })
   }
 
-  private enqueue (obj) {
-    // if we have a nestedIndex it means we're processing
-    // nested commands and need to insert them into the
-    // index past the current index as opposed to
-    // pushing them to the end we also dont want to
-    // reset the run defer because splicing means we're
-    // already in a run loop and dont want to create another!
-    // we also reset the .next property to properly reference
-    // our new obj
+  private enqueue (command: $Command) {
+    this.queue.enqueue(command)
 
-    // we had a bug that would bomb on custom commands when it was the
-    // first command. this was due to nestedIndex being undefined at that
-    // time. so we have to ensure to check that its any kind of number (even 0)
-    // in order to know to insert it into the existing array.
-    let nestedIndex = this.state('nestedIndex')
-
-    // if this is a number, then we know we're about to insert this
-    // into our commands and need to reset next + increment the index
-    if (_.isNumber(nestedIndex)) {
-      this.state('nestedIndex', (nestedIndex += 1))
-    }
-
-    // we look at whether or not nestedIndex is a number, because if it
-    // is then we need to insert inside of our commands, else just push
-    // it onto the end of the queue
-    const index = _.isNumber(nestedIndex) ? nestedIndex : this.queue.length
-
-    this.queue.insert(index, $Command.create(obj))
-
-    return this.Cypress.action('cy:command:enqueued', obj)
+    return this.Cypress.action('cy:command:enqueued', command.attributes)
   }
 
-  // TODO: Replace any with Command type.
-  private getCommandsUntilFirstParentOrValidSubject (command, memo: any[] = []) {
-    if (!command) {
-      return null
+  private validateFirstCall (name, args, prevSubject: string[]) {
+    // if we have a prevSubject then error
+    // since we're invoking this improperly
+    if (prevSubject && !([] as string[]).concat(prevSubject).includes('optional')) {
+      const stringifiedArg = $utils.stringifyActual(args[0])
+
+      $errUtils.throwErrByPath('miscellaneous.invoking_child_without_parent', {
+        args: {
+          cmd: name,
+          args: _.isString(args[0]) ? `"${stringifiedArg}"` : stringifiedArg,
+        },
+      })
     }
-
-    // push these onto the beginning of the commands array
-    memo.unshift(command)
-
-    // break and return the memo
-    if ((command.get('type') === 'parent') || $dom.isAttached(command.get('subject'))) {
-      return memo
-    }
-
-    return this.getCommandsUntilFirstParentOrValidSubject(command.get('prev'), memo)
   }
 
   // TODO: make string[] more
-  private pushSubjectAndValidate (name, args, firstCall, prevSubject: string[]) {
-    if (firstCall) {
-      // if we have a prevSubject then error
-      // since we're invoking this improperly
-      if (prevSubject && !([] as string[]).concat(prevSubject).includes('optional')) {
-        const stringifiedArg = $utils.stringifyActual(args[0])
+  private pushSubject (name, args, prevSubject: string[], chainerId) {
+    const subject = this.subject(chainerId)
 
-        $errUtils.throwErrByPath('miscellaneous.invoking_child_without_parent', {
-          args: {
-            cmd: name,
-            args: _.isString(args[0]) ? `\"${stringifiedArg}\"` : stringifiedArg,
-          },
-        })
-      }
-
-      // else if this is the very first call
-      // on the chainer then make the first
-      // argument undefined (we have no subject)
-      this.state('subject', undefined)
-    }
-
-    const subject = this.state('subject')
-
-    if (prevSubject) {
+    if (prevSubject !== undefined) {
       // make sure our current subject is valid for
       // what we expect in this command
-      this.ensureSubjectByType(subject, prevSubject)
+
+      // @ts-expect-error - ensure.isType expects a Chainable, not the $Cy instance
+      Cypress.ensure.isType(subject, prevSubject as any, this.state('current').get('name'), this)
     }
 
     args.unshift(subject)
 
-    this.Cypress.action('cy:next:subject:prepared', subject, args, firstCall)
-
     return args
   }
 
-  private doneEarly () {
-    this.queue.stop()
+  /*
+   * Use `subject()` to get the current subject. It reads from cy.state('subjects'), but the format and details of
+   * determining this should be considered an internal implementation detail of Cypress, subject to change at any time.
+   *
+   * See subjectChain() for more details on state('subjects').
+   */
+  subject (chainerId?: string) {
+    const subjectChain: SubjectChain | undefined = this.subjectChain(chainerId)
 
-    // we only need to worry about doneEarly when
-    // it comes from a manual event such as stopping
-    // Cypress or when we yield a (done) callback
-    // and could arbitrarily call it whenever we want
-    const p = this.state('promise')
+    return this.getSubjectFromChain(subjectChain)
+  }
 
-    // if our outer promise is pending
-    // then cancel outer and inner
-    // and set canceled to be true
-    if (p && p.isPending()) {
-      this.state('canceled', true)
-      this.state('cancel')()
+  /*
+   * Use subjectChain() to get a subjectChain, which you can later pass into getSubjectFromChain() to resolve
+   * the array into a specific DOM element or other value. It reads from cy.state('subjects'), but the format and
+   * details of determining this should be considered an internal implementation detail of Cypress, subject to change
+   * at any time.
+   *
+   * Currently, state('subjects') is an object, mapping chainerIds to the current subject and queries for that
+   * chainer. For example, it might look like:
+   *
+   * {
+   *   'ch-http://localhost:3500-2': ['foobar'],
+   *   'ch-http://localhost:3500-4': [<input>],
+   *   'ch-http://localhost:3500-4': [undefined, f(), f()],
+   * }
+   *
+   * A subject chain - the return value of this function - is one of these entries: a primitive value, followed by
+   * 0 or more functions operating on this value.
+   *
+   * Do not read cy.state('subjects') directly; This is what subject() or subjectChain() are for, turning this
+   * structure into a usable subject.
+   */
+  subjectChain (chainerId: string = this.state('chainerId')) {
+    return (this.state('subjects') || {} as Record<string, SubjectChain>)[chainerId]
+  }
+
+  /* Given a chain of functions, return the actual subject. `subjectChain` might look like any of:
+   * []
+   * [<input>]
+   * ['foobar', f()]
+   * [undefined, f(), f()]
+   */
+  getSubjectFromChain (subjectChain: SubjectChain | null | undefined) {
+    if (!subjectChain) {
+      return
     }
 
-    return this.cleanup()
+    // If we're getting the subject of a previous command, then any log messages have already
+    // been added to the command log; We don't want to re-add them every time we query
+    // the current subject.
+    cy.state('onBeforeLog', () => false)
+
+    let subject = subjectChain[0]
+
+    try {
+      for (let i = 1; i < subjectChain.length; i++) {
+        subject = subjectChain[i](subject)
+      }
+    } finally {
+      cy.state('onBeforeLog', null)
+    }
+
+    return subject
+  }
+
+  /*
+   * Cypress executes commands asynchronously, and those commands can contain other commands - this means that there
+   * are times when an outer chainer might have as its subject the (as of yet unresolved) return value of the inner
+   * chain of commands.
+   *
+   * cy.state('subjectLinks') is where we store that connection. The exact contents should be considered an internal
+   * implementation detail - do not read or alter it directly, but prefer the public interface (linkSubject and
+   * breakSubjectLinksToCurrentChainer).
+   *
+   * In the current implementation, subjectLinks might look like:
+   * {
+   *   'ch-http://localhost:3500-4': 'ch-http://localhost:3500-2',
+   * }
+   *
+   * indicating that when we eventually resolve the subject of ch--4, it should *also* be used as the subject for
+   * ch--2 - for example, `cy.then(() => { return cy.get('foo') }).log()`. The inner chainer (ch--4,
+   * `cy.get('foo')`) is linked to the outer chainer (ch--2) - when we eventually .get('foo'), the resolved value
+   * becomes the new subject for the outer chainer.
+   *
+   * Whenever we are in the middle of resolving one chainer and a new one is created, Cypress links the inner chainer
+   * to the outer one. This is *usually* desireable, allowing simple constructs like
+   * `cy.then(() => { return cy.get('foo') }).log()` to function intuitively.
+   *
+   * But you don't always want to use the inner chainer's subject for the outer chainer. Consider:
+   * `cy.then(() => { cy.get('foo').click(); return 'success' }).log()`
+   *
+   * In this case, we want to break the connection between the inner chainer and the outer one, so that we can
+   * instead use the return value as the new subject. Is this case, you'll want cy.breakSubjectLinksToCurrentChainer().
+   */
+  linkSubject (childChainerId: string, parentChainerId: string) {
+    const links = this.state('subjectLinks') || {} as Record<string, string>
+
+    links[childChainerId] = parentChainerId
+    this.state('subjectLinks', links)
+  }
+
+  /*
+   * You should call breakSubjectLinksToCurrentChainer() when the following are *both* true:
+   *   1. A command callback may contain cypress commands.
+   *   2. You do not want to use the subject of those commands as the new subject of the parent command chain.
+   *
+   * In this case, call the function directly before returning the new subject, after any new cypress commands have
+   * been added to the queue. See `cy.linkSubject()` for more details about how links are created.
+   */
+  breakSubjectLinksToCurrentChainer () {
+    const chainerId = this.state('chainerId')
+    const links = this.state('subjectLinks') || {} as Record<string, string>
+
+    this.state('subjectLinks', _.omitBy(links, (l) => l === chainerId))
+  }
+
+  /*
+   * setSubjectForChainer should be considered an internal implementation detail of Cypress. Do not use it directly
+   * outside of the Cypress codebase. It is currently used only by the command_queue, and if you think it's needed
+   * elsewhere, consider if there's a way you can use existing functionality to achieve it instead.
+   *
+   * The command_queue calls setSubjectForChainer after a command has finished resolving, when we have the
+   * final (non-$Chainer, non-promise) return value. This value becomes the current $Chainer's new subjectChain - and
+   * the new subjectChain for any chainers it's linked to (see cy.linkSubject for details on that process).
+   */
+  setSubjectForChainer (chainerId: string, subjectChain: SubjectChain) {
+    const cySubjects = this.state('subjects') || {} as Record<string, SubjectChain>
+
+    cySubjects[chainerId] = subjectChain
+    this.state('subjects', cySubjects)
+
+    const links = this.state('subjectLinks') || {} as Record<string, string>
+
+    if (links[chainerId]) {
+      this.setSubjectForChainer(links[chainerId], subjectChain)
+    }
+  }
+
+  /*
+   * addQueryToChainer should be considered an internal implementation detail of Cypress. Do not use it directly
+   * outside of the Cypress codebase. It is currently used only by the command_queue, and if you think it's needed
+   * elsewhere, consider if there's a way you can use existing functionality to achieve it instead.
+   *
+   * The command_queue calls addQueryToChainer after a query returns a function. This function is
+   * is appended to the subject chain (which begins with 'undefined' if no previous subject exists), and used
+   * to resolve cy.subject() as needed.
+   */
+  addQueryToChainer (chainerId: string, queryFn: (subject: any) => any) {
+    const cySubjects = this.state('subjects') || {} as Record<string, SubjectChain>
+
+    const subject = (cySubjects[chainerId] || [undefined]) as SubjectChain
+
+    subject.push(queryFn)
+    cySubjects[chainerId] = subject
+    this.state('subjects', cySubjects)
+
+    const links = this.state('subjectLinks') || {} as Record<string, string>
+
+    if (links[chainerId]) {
+      this.setSubjectForChainer(links[chainerId], cySubjects[chainerId])
+    }
+  }
+
+  private doneEarly () {
+    this.queue.endEarly({ canceled: true })
   }
 }

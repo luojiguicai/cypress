@@ -1,0 +1,347 @@
+import { loadSpec } from './support/spec-loader'
+
+describe('src/cypress/runner', () => {
+  describe('tests finish with correct state', () => {
+    it('simple 1 test', () => {
+      loadSpec({
+        filePath: 'runner/simple-single-test.runner.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+    })
+
+    it('simple 1 global test', () => {
+      loadSpec({
+        filePath: 'runner/simple-single-global-test.runner.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+    })
+
+    it('simple 3 tests', () => {
+      loadSpec({
+        filePath: 'runner/three-simple-tests.runner.cy.js',
+        passCount: 3,
+        failCount: 0,
+      })
+    })
+
+    it('simple fail', () => {
+      loadSpec({
+        filePath: 'runner/simple-fail.runner.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      // render exactly one error
+      cy.reporter().find('.runnable-err:contains(AssertionError)').should('have.length', 1)
+    })
+
+    it('pass fail pass fail', () => {
+      loadSpec({
+        filePath: 'runner/pass-fail-pass-fail.runner.cy.js',
+        passCount: 2,
+        failCount: 2,
+      })
+    })
+
+    it('fail pass', () => {
+      loadSpec({
+        filePath: 'runner/fail-pass.runner.cy.js',
+        passCount: 1,
+        failCount: 1,
+      })
+    })
+
+    it('no tests', () => {
+      loadSpec({
+        filePath: 'runner/no-tests.runner.cy.js',
+        passCount: 0,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('No tests found.').should('be.visible')
+      cy.reporter().contains('p', 'Cypress could not detect tests in this file.').should('be.visible')
+    })
+
+    it('executes nested suite', () => {
+      loadSpec({
+        filePath: 'runner/nested-suite.runner.cy.js',
+        passCount: 3,
+        failCount: 0,
+      })
+    })
+
+    it('simple fail, catch cy.on(fail)', () => {
+      loadSpec({
+        filePath: 'runner/catch-fail.runner.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+    })
+
+    it('pins cy assertion when clicked', () => {
+      loadSpec({
+        filePath: 'runner/simple-cy-assert.runner.cy.js',
+        passCount: 1,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('li.command-name-assert', 'assert')
+      .find('.command-wrapper')
+      .should('not.have.class', 'command-is-pinned')
+      .click()
+      .should('have.class', 'command-is-pinned')
+    })
+
+    it('correctly resets highlight toggle state when pinning new command', () => {
+      loadSpec({
+        filePath: 'runner/simple-cy-snapshot.runner.cy.js',
+        passCount: 3,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('clicks button').click()
+
+      // pin command that features highlights
+      cy.reporter().contains('li.command-name-click', 'click')
+      .find('.command-wrapper')
+      .should('not.have.class', 'command-is-pinned')
+      .click()
+      .should('have.class', 'command-is-pinned')
+
+      // disable highlights
+      cy.findByLabelText('Highlights')
+      .should('have.attr', 'aria-checked', 'true')
+      .click()
+      .should('have.attr', 'aria-checked', 'false')
+
+      // pin another command, expect highlights be enabled for new snapshot
+      cy.reporter().contains('li.command-name-get', 'get')
+      .find('.command-wrapper')
+      .should('not.have.class', 'command-is-pinned')
+      .click()
+      .should('have.class', 'command-is-pinned')
+
+      cy.findByLabelText('Highlights')
+      .should('have.attr', 'aria-checked', 'true')
+    })
+
+    it('correctly resets named snapshot toggle state when pinning new command', () => {
+      loadSpec({
+        filePath: 'runner/simple-cy-snapshot.runner.cy.js',
+        passCount: 3,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('clicks button').click()
+
+      // pin command that features multiple snapshots
+      cy.reporter().contains('li.command-name-click', 'click')
+      .find('.command-wrapper')
+      .click()
+      .should('have.class', 'command-is-pinned')
+
+      // change active snapshot
+      cy.get('[data-cy-active-snapshot-toggle="true"').should('contain', 'before')
+      cy.get('[data-cy="snapshot-toggle"]').contains('after').click()
+      cy.get('[data-cy-active-snapshot-toggle="true"').should('contain', 'after')
+
+      // pin another command, expect active snapshot index to be reset
+      cy.reporter().contains('li.command-name-type', 'type')
+      .find('.command-wrapper')
+      .click()
+      .should('have.class', 'command-is-pinned')
+
+      cy.get('[data-cy-active-snapshot-toggle="true"').should('contain', 'before')
+    })
+
+    it('renders spec name and runtime in header', () => {
+      loadSpec({
+        filePath: 'runner/simple-cy-assert.runner.cy.js',
+        passCount: 1,
+        failCount: 0,
+        hasPreferredIde: true,
+      })
+
+      cy.withCtx((ctx, o) => {
+        o.sinon.stub(ctx.actions.file, 'openFile')
+      })
+
+      cy.reporter().find('[data-cy="runnable-options-button"]').click()
+      cy.reporter().find('[data-cy="more-options-runnable-popover"]').should('be.visible')
+      cy.reporter().find('[data-cy="runnable-popover-open-ide"]').click()
+
+      cy.withCtx((ctx, o) => {
+        expect(ctx.actions.file.openFile).to.have.been.calledWith(o.sinon.match(/simple-cy-assert\.runner\.cy\.js$/), 1, 1)
+      })
+
+      cy.reporter().find('[data-cy="runnable-header"] [data-cy="spec-duration"]').should('exist')
+    })
+
+    describe('hook failures', () => {
+      describe('test failures w/ hooks', () => {
+        it('test [only]', () => {
+          loadSpec({
+            filePath: 'runner/test-only.runner.cy.js',
+            passCount: 1,
+            failCount: 0,
+          })
+        })
+
+        it('test [pending]', () => {
+          loadSpec({
+            filePath: 'runner/test-pending.runner.cy.js',
+            passCount: 0,
+            failCount: 0,
+            pendingCount: 3,
+          })
+        })
+
+        it('fail with [before]', () => {
+          loadSpec({
+            filePath: 'runner/fail-with-before.runner.cy.js',
+            passCount: 1,
+            failCount: 1,
+          })
+        })
+
+        it('fail with [after]', () => {
+          loadSpec({
+            filePath: 'runner/fail-with-after.runner.cy.js',
+            passCount: 1,
+            failCount: 1,
+          })
+        })
+
+        it('fail with all hooks', () => {
+          loadSpec({
+            filePath: 'runner/fail-with-all-hooks.runner.cy.js',
+            passCount: 0,
+            failCount: 1,
+          })
+        })
+      })
+    })
+  })
+
+  describe('other specs', () => {
+    it('simple failing hook spec', () => {
+      loadSpec({
+        filePath: 'runner/failing-hooks.runner.cy.js',
+        passCount: 1,
+        failCount: 3,
+        pendingCount: 1,
+      })
+
+      cy.reporter().contains('.test', 'never gets here').should('have.class', 'runnable-failed')
+      cy.reporter().contains('.command', 'beforeEach').find('.command-state-failed')
+      cy.reporter().contains('.runnable-err', 'beforeEach').scrollIntoView().should('be.visible')
+
+      cy.reporter().contains('.test', 'is pending').should('have.class', 'runnable-pending')
+
+      cy.reporter().contains('.test', 'fails this').should('have.class', 'runnable-failed')
+      cy.reporter().contains('.command', 'afterEach').find('.command-state-failed')
+      cy.reporter().contains('.runnable-err', 'afterEach').scrollIntoView().should('be.visible')
+
+      cy.reporter().contains('.test', 'does not run this').should('have.class', 'runnable-processing')
+
+      cy.reporter().contains('.test', 'runs this').should('have.class', 'runnable-passed')
+
+      cy.reporter().contains('.test', 'fails on this').should('have.class', 'runnable-failed')
+      cy.reporter().contains('.command', 'after').find('.command-state-failed')
+      cy.reporter().contains('.runnable-err', 'after').scrollIntoView().should('be.visible')
+    })
+
+    it('async timeout spec', () => {
+      loadSpec({
+        filePath: 'runner/async-timeout.runner.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+    })
+
+    it('scrolls each command into view', () => {
+      loadSpec({
+        filePath: 'runner/scrolls-command-log.runner.cy.js',
+        passCount: 0,
+        failCount: 1,
+      })
+
+      cy.reporter().find('.command-number-column:contains(25)').should('be.visible')
+    })
+
+    it('file with empty suites only displays no tests found', () => {
+      loadSpec({
+        filePath: 'runner/empty-suites.runner.cy.js',
+        passCount: 0,
+        failCount: 0,
+      })
+
+      cy.reporter().contains('No tests found')
+    })
+  })
+
+  describe('reporter interaction', () => {
+    // https://github.com/cypress-io/cypress/issues/8621
+    it('user can stop test execution', () => {
+      loadSpec({
+        filePath: 'runner/stop-execution.runner.cy.js',
+      })
+
+      // Wait for the command to start running (ensure it's in retry mode)
+      // The command will be retrying cy.get('.not-exist')
+      cy.reporter().find('.command-state-pending, .command-state-running', { timeout: 5000 })
+
+      // Click the stop button to stop execution
+      cy.reporter().find('.stop').click()
+
+      // Verify the UI updates immediately - stop button disappears, restart appears
+      cy.reporter().find('.stop', { timeout: 100 }).should('not.exist')
+      cy.reporter().find('.restart', { timeout: 100 }).should('be.visible')
+
+      // Wait for the error message to appear - it may take time to propagate
+      cy.reporter().find('.runnable-err-message', { timeout: 5000 })
+      .should('not.contain', 'ran afterEach even though specs were stopped')
+      .and('contain', 'Cypress test was stopped while running this command.')
+    })
+
+    it('leaves the aut in place after stopping mid-run, and can still pin a snapshot', () => {
+      // set up by hand rather than with loadSpec/runSpec: both settle on the run's final
+      // state, and this spec deliberately hangs until it is stopped
+      cy.scaffoldProject('runner-e2e-specs')
+      cy.openProject('runner-e2e-specs')
+      cy.startAppServer()
+      cy.visitApp('specs/runner?file=cypress/e2e/runner/stop-preserves-aut.runner.cy.js')
+
+      cy.reporter({ timeout: 30000 }).find('[data-cy="runnable-header"]', { timeout: 30000 }).should('contain', 'stop-preserves-aut.runner.cy.js')
+
+      // the spec stops itself. The reset-page decision is made while the stopped test runs its
+      // after-run hooks, so wait for that error before asserting on the page — otherwise this
+      // passes on a page that simply has not been reset yet
+      cy.reporter().find('.runnable-err-message', { timeout: 30000 })
+      .should('contain', 'Cypress test was stopped while running this command.')
+
+      cy.reporter().find('.restart', { timeout: 30000 }).should('be.visible')
+
+      // the stopped test is not the last one in the suite, but nothing runs after a stop, so
+      // the page is kept rather than reset to about:blank for test isolation
+      cy.get('iframe.aut-iframe').its('0.contentDocument.body').then(cy.wrap).within(() => {
+        cy.get('input').should('exist')
+      })
+
+      // only the running test is expanded, so open the completed one to reach its commands
+      cy.reporter().find('.runnable-title:contains(completed test)').click()
+      cy.reporter().find('.command-name-type .command-number-column').first().click()
+      cy.reporter().find('.command-pin').should('exist')
+
+      // the pin lands on the command's "before" snapshot; the typed value is what distinguishes
+      // the restored "after" snapshot from the live page, which is also on the fixture
+      cy.contains('[data-testid="snapshot-controls"] button', 'after').click()
+
+      cy.get('iframe.aut-iframe').its('0.contentDocument.body').then(cy.wrap).within(() => {
+        cy.get('input').should('have.value', 'pinned')
+      })
+    })
+  })
+})

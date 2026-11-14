@@ -7,43 +7,39 @@ exports['e2e server sent events / passes'] = `
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Cypress:    1.2.3                                                                              │
   │ Browser:    FooBrowser 88                                                                      │
-  │ Specs:      1 found (server_sent_events_spec.js)                                               │
-  │ Searched:   cypress/integration/server_sent_events_spec.js                                     │
+  │ Specs:      1 found (server_sent_events.cy.js)                                                 │
+  │ Searched:   cypress/e2e/server_sent_events.cy.js                                               │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                     
-  Running:  server_sent_events_spec.js                                                      (1 of 1)
+  Running:  server_sent_events.cy.js                                                        (1 of 1)
 
 
   server sent events
     ✓ does not crash
+    ✓ receives the stream when a response handler changes the content-type
+    ✓ reads SSE framing from a fetch ReadableStream before cancelling
     ✓ aborts proxied connections to prevent client connection buildup
 
 
-  2 passing
+  4 passing
 
 
   (Results)
 
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Tests:        2                                                                                │
-  │ Passing:      2                                                                                │
+  │ Tests:        4                                                                                │
+  │ Passing:      4                                                                                │
   │ Failing:      0                                                                                │
   │ Pending:      0                                                                                │
   │ Skipped:      0                                                                                │
   │ Screenshots:  0                                                                                │
-  │ Video:        true                                                                             │
+  │ Video:        false                                                                            │
   │ Duration:     X seconds                                                                        │
-  │ Spec Ran:     server_sent_events_spec.js                                                       │
+  │ Spec Ran:     server_sent_events.cy.js                                                         │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-  (Video)
-
-  -  Started processing:  Compressing to 32 CRF                                                     
-  -  Finished processing: /XXX/XXX/XXX/cypress/videos/server_sent_events_spec.js.mp4      (X second)
 
 
 ====================================================================================================
@@ -53,9 +49,9 @@ exports['e2e server sent events / passes'] = `
 
        Spec                                              Tests  Passing  Failing  Pending  Skipped  
   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ ✔  server_sent_events_spec.js               XX:XX        2        2        -        -        - │
+  │ ✔  server_sent_events.cy.js                 XX:XX        4        4        -        -        - │
   └────────────────────────────────────────────────────────────────────────────────────────────────┘
-    ✔  All specs passed!                        XX:XX        2        2        -        -        -  
+    ✔  All specs passed!                        XX:XX        4        4        -        -        -  
 
 
 `

@@ -1,10 +1,12 @@
 import { basename } from 'path'
 import _ from 'lodash'
+import mime from 'mime'
 
 import $dom from '../../../dom'
 import $errUtils from '../../../cypress/error_utils'
 import $actionability from '../../actionability'
 import { addEventCoords, dispatch } from './trigger'
+import { runPrivilegedCommand } from '../../../util/privileged_channel'
 
 /* dropzone.js relies on an experimental, nonstandard API, webkitGetAsEntry().
  * https://developer.mozilla.org/en-US/docs/Web/API/DataTransferItem/webkitGetAsEntry
@@ -19,7 +21,7 @@ import { addEventCoords, dispatch } from './trigger'
  * override webkitGetAsEntry() throws an error.
  *
  */
-const tryMockWebkit = (item) => {
+const tryMockWebKit = (item) => {
   try {
     item.webkitGetAsEntry = () => {
       return {
@@ -34,11 +36,18 @@ const tryMockWebkit = (item) => {
   return item
 }
 
-const createDataTransfer = (files: Cypress.FileReferenceObject[]): DataTransfer => {
-  const dataTransfer = new DataTransfer()
+const createDataTransfer = (files: Cypress.FileReferenceObject[], eventTarget: JQuery<any>): DataTransfer => {
+  // obtain a reference to the `targetWindow` so we can use the right instances of the `File` and `DataTransfer` classes
+  const targetWindow = (eventTarget[0] as HTMLElement).ownerDocument.defaultView || window
+  const dataTransfer = new targetWindow.DataTransfer()
 
-  files.forEach(({ contents, fileName = '', lastModified = Date.now() }) => {
-    const file = new File([contents], fileName, { lastModified })
+  files.forEach(({
+    contents,
+    fileName = '',
+    mimeType = mime.getType(fileName) || '',
+    lastModified = Date.now(),
+  }) => {
+    const file = new targetWindow.File([contents], fileName, { lastModified, type: mimeType })
 
     dataTransfer.items.add(file)
   })
@@ -50,7 +59,7 @@ const createDataTransfer = (files: Cypress.FileReferenceObject[]): DataTransfer 
   // also cannot be constructed, so we have to use an array instead.
   Object.defineProperty(dataTransfer, 'items', {
     get () {
-      return _.map(oldItems, tryMockWebkit)
+      return _.map(oldItems, tryMockWebKit)
     },
   })
 
@@ -71,6 +80,16 @@ const createDataTransfer = (files: Cypress.FileReferenceObject[]): DataTransfer 
 interface InternalSelectFileOptions extends Cypress.SelectFileOptions {
   _log: any
   $el: JQuery
+  eventTarget: JQuery
+}
+
+interface FilePathObject {
+  fileName?: string
+  index: number
+  isFilePath: boolean
+  lastModified?: number
+  mimeType?: string
+  path: string
 }
 
 const ACTIONS = {
@@ -119,15 +138,17 @@ export default (Commands, Cypress, cy, state, config) => {
       return
     }
 
-    if (aliasObj.subject == null) {
+    const contents = cy.getSubjectFromChain(aliasObj.subjectChain)
+
+    if (contents == null) {
       $errUtils.throwErrByPath('selectFile.invalid_alias', {
         onFail: options._log,
-        args: { alias: file.contents, subject: aliasObj.subject },
+        args: { alias: file.contents, subject: contents },
       })
     }
 
-    if ($dom.isElement(aliasObj.subject)) {
-      const subject = $dom.stringify(aliasObj.subject)
+    if ($dom.isElement(contents)) {
+      const subject = $dom.stringify(contents)
 
       $errUtils.throwErrByPath('selectFile.invalid_alias', {
         onFail: options._log,
@@ -136,39 +157,71 @@ export default (Commands, Cypress, cy, state, config) => {
     }
 
     return {
+      fileName: aliasObj.fileName,
       ...file,
-      contents: aliasObj.subject,
+      contents,
     }
   }
 
-  // Uses backend read:file rather than cy.readFile because we don't want to retry
-  // loading a specific file until timeout, but rather retry the selectFile command as a whole
-  const handlePath = async (file, options) => {
-    return Cypress.backend('read:file', file.contents, { encoding: null })
-    .then(({ contents }) => {
-      return {
-      // We default to the filename on the path, but allow them to override
-        fileName: basename(file.contents),
-        ...file,
-        contents: Buffer.from(contents),
-      }
+  const readFiles = async (filePaths, options) => {
+    if (!filePaths.length) return []
+
+    // This reads the file with privileged access in the same manner as
+    // cy.readFile(). We call directly into the backend rather than calling
+    // cy.readFile() directly because we don't want to retry loading a specific
+    // file until timeout, but rather retry the selectFile command as a whole
+    return runPrivilegedCommand({
+      commandName: 'selectFile',
+      cy,
+      Cypress: (Cypress as unknown) as InternalCypress.Cypress,
+      options: {
+        files: filePaths,
+      },
+    })
+    .then((results) => {
+      return results.map((result) => {
+        return {
+          // We default to the filename on the path, but allow them to override
+          fileName: basename(result.path),
+          ...result,
+          contents: Cypress.Buffer.from(result.contents),
+        }
+      })
     })
     .catch((err) => {
+      if (err.isNonSpec) {
+        $errUtils.throwErrByPath('miscellaneous.non_spec_invocation', {
+          args: { cmd: 'selectFile' },
+        })
+      }
+
       if (err.code === 'ENOENT') {
         $errUtils.throwErrByPath('files.nonexistent', {
-          args: { cmd: 'selectFile', file: file.contents, filePath: err.filePath },
+          args: { cmd: 'selectFile', file: err.originalFilePath, filePath: err.filePath },
         })
       }
 
       $errUtils.throwErrByPath('files.unexpected_error', {
         onFail: options._log,
-        args: { cmd: 'selectFile', action: 'read', file, filePath: err.filePath, error: err.message },
+        args: { cmd: 'selectFile', action: 'read', file: err.originalFilePath, filePath: err.filePath, error: err.message },
       })
     })
   }
 
+  const getFilePathObject = (file, index) => {
+    return {
+      encoding: null,
+      fileName: file.fileName,
+      index,
+      isFilePath: true,
+      lastModified: file.lastModified,
+      mimeType: file.mimeType,
+      path: file.contents,
+    }
+  }
+
   /*
-   * Turns a user-provided file - a string shorthand, Buffer, or object
+   * Turns a user-provided file - a string shorthand, ArrayBuffer, or object
    * into an object of form {
    *   contents,
    *   fileName?,
@@ -179,8 +232,8 @@ export default (Commands, Cypress, cy, state, config) => {
    * we warn them and suggest how to fix it.
    */
   const parseFile = (options) => {
-    return async (file: any, index: number, filesArray: any[]): Promise<Cypress.FileReferenceObject> => {
-      if (typeof file === 'string' || Buffer.isBuffer(file)) {
+    return (file: any, index: number, filesArray: any[]): Cypress.FileReferenceObject | FilePathObject => {
+      if (typeof file === 'string' || ArrayBuffer.isView(file)) {
         file = { contents: file }
       }
 
@@ -200,10 +253,13 @@ export default (Commands, Cypress, cy, state, config) => {
       }
 
       if (typeof file.contents === 'string') {
-        file = handleAlias(file, options) ?? await handlePath(file, options)
+        // if not an alias, an object representing that the file is a path that
+        // needs to be read from disk. contents are an empty string to they
+        // it skips the next check
+        file = handleAlias(file, options) ?? getFilePathObject(file, index)
       }
 
-      if (!_.isString(file.contents) && !Buffer.isBuffer(file.contents)) {
+      if (!file.isFilePath && !_.isString(file.contents) && !ArrayBuffer.isView(file.contents)) {
         file.contents = JSON.stringify(file.contents)
       }
 
@@ -211,28 +267,42 @@ export default (Commands, Cypress, cy, state, config) => {
     }
   }
 
+  async function collectFiles (files, options) {
+    const filesCollection = ([] as (Cypress.FileReference | FilePathObject)[]).concat(files).map(parseFile(options))
+    // if there are any file paths, read them from the server in one go
+    const filePaths = filesCollection.filter((file) => (file as FilePathObject).isFilePath)
+    const filePathResults = await readFiles(filePaths, options)
+
+    // stitch them back into the collection
+    filePathResults.forEach((filePathResult) => {
+      filesCollection[filePathResult.index] = _.pick(filePathResult, 'contents', 'fileName', 'mimeType', 'lastModified')
+    })
+
+    return filesCollection as Cypress.FileReferenceObject[]
+  }
+
   Commands.addAll({ prevSubject: 'element' }, {
-    async selectFile (subject: JQuery<any>, files: Cypress.FileReference | Cypress.FileReference[], options: Partial<InternalSelectFileOptions>): Promise<JQuery> {
+    async selectFile (subject: JQuery<any>, files: Cypress.FileReference | Cypress.FileReference[], options: Partial<InternalSelectFileOptions>, ...extras: never[]): Promise<JQuery> {
       options = _.defaults({}, options, {
         action: 'select',
         log: true,
         $el: subject,
+        eventTarget: subject,
       })
 
-      if (options.log) {
-        options._log = Cypress.log({
-          $el: options.$el,
-          timeout: options.timeout,
-          consoleProps () {
-            return {
-              'Target': $dom.getElements(options.$el),
-              Elements: options.$el?.length,
-            }
-          },
-        })
+      options._log = Cypress.log({
+        $el: options.$el,
+        hidden: options.log === false,
+        timeout: options.timeout,
+        consoleProps () {
+          return {
+            'Target': $dom.getElements(options.$el),
+            Elements: options.$el?.length,
+          }
+        },
+      })
 
-        options._log.snapshot('before', { next: 'after' })
-      }
+      options._log?.snapshot('before', { next: 'after' })
 
       if (!options.action || !ACTIONS[options.action]) {
         $errUtils.throwErrByPath('selectFile.invalid_action', {
@@ -248,37 +318,47 @@ export default (Commands, Cypress, cy, state, config) => {
         })
       }
 
-      let eventTarget = subject
+      const getEventTargetFromSubject = (subject) => {
+        let eventTarget = subject
 
-      // drag-drop always targets the subject directly, but select
-      // may switch <label> -> <input> element
-      if (options.action === 'select') {
-        if (eventTarget.is('label')) {
-          eventTarget = $dom.getInputFromLabel(eventTarget)
+        if (options.action === 'select') {
+          if (eventTarget.is('label')) {
+            eventTarget = $dom.getInputFromLabel(eventTarget)
+          }
+
+          if (eventTarget.length < 1 || !$dom.isInputType(eventTarget, 'file')) {
+            const node = $dom.stringify(options.$el)
+
+            $errUtils.throwErrByPath('selectFile.not_file_input', {
+              onFail: options._log,
+              args: { node },
+            })
+          }
         }
 
-        if (eventTarget.length < 1 || !$dom.isInputType(eventTarget, 'file')) {
-          const node = $dom.stringify(options.$el)
-
-          $errUtils.throwErrByPath('selectFile.not_file_input', {
-            onFail: options._log,
-            args: { node },
-          })
+        if (!options.force) {
+          Cypress.ensure.isNotDisabled(eventTarget, 'selectFile', options._log)
         }
-      }
 
-      if (!options.force) {
-        cy.ensureNotDisabled(eventTarget, options._log)
+        return eventTarget
       }
 
       // Make sure files is an array even if the user only passed in one
-      const filesArray = await Promise.all(([] as Cypress.FileReference[]).concat(files).map(parseFile(options)))
+      const filesArray = await collectFiles(files, options)
+      const subjectChain = cy.subjectChain()
 
       // We verify actionability on the subject, rather than the eventTarget,
       // in order to allow for a hidden <input> with a visible <label>
       // Similarly, this is why we implement something similar, but not identical to,
       // cy.trigger() to dispatch our events.
       await $actionability.verify(cy, subject, config, options, {
+        subjectFn () {
+          subject = cy.getSubjectFromChain(subjectChain)
+          options.eventTarget = getEventTargetFromSubject(subject)
+
+          return subject
+        },
+
         onScroll ($el, type) {
           Cypress.action('cy:scrolled', $el, type)
         },
@@ -295,9 +375,9 @@ export default (Commands, Cypress, cy, state, config) => {
             })
           }
 
-          const dataTransfer = createDataTransfer(filesArray)
+          const dataTransfer = createDataTransfer(filesArray, options.eventTarget as JQuery<HTMLElement>)
 
-          ACTIONS[options.action as string](eventTarget.get(0), dataTransfer, coords, state)
+          ACTIONS[options.action as string](options.eventTarget?.get(0), dataTransfer, coords, state)
 
           return $elToClick
         },

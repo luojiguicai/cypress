@@ -1,0 +1,218 @@
+import type { FoundBrowser, Editor, AllowedState, AllModeOptions, TestingType, BrowserStatus, PACKAGE_MANAGERS, AuthStateName, StudioLifecycleManagerShape, CyPromptLifecycleManagerShape, Maybe } from '@packages/types'
+import { CT_FRAMEWORKS, resolveComponentFrameworkDefinition } from '@packages/scaffold-config'
+import type { WizardBundler, ErroredFramework } from '@packages/scaffold-config'
+import type { NexusGenObjects } from '../gen/nxs.gen'
+// tslint:disable-next-line no-implicit-dependencies - electron dep needs to be defined
+import type { App, BrowserWindow } from 'electron'
+import type { SocketIONamespace, SocketIOServer, CDPSocketServer } from '@packages/socket'
+import type { Server } from 'http'
+import type { ErrorWrapperSource } from '@packages/errors'
+import type { EventCollectorSource, GitDataSource } from '../sources'
+import { machineId as getMachineId } from 'node-machine-id'
+
+export interface AuthenticatedUserShape {
+  id?: string //Cloud user id
+  name?: string
+  email?: string
+  authToken?: string
+  projectSlug?: string
+}
+
+export interface ProjectShape {
+  projectRoot: string
+  savedState?: () => Promise<AllowedState>
+}
+
+interface ServersDataShape {
+  appServer?: Maybe<Server>
+  appServerPort?: Maybe<number>
+  appSocketServer?: Maybe<SocketIOServer>
+  appSocketNamespace?: Maybe<SocketIONamespace>
+  cdpSocketServer?: CDPSocketServer | undefined
+  cdpSocketNamespace?: CDPSocketServer | undefined
+  gqlServer?: Maybe<Server>
+  gqlServerPort?: Maybe<number>
+  gqlSocketServer?: Maybe<SocketIONamespace>
+  /**
+   * graphql-ws `useServer` dispose — must run before `gqlServer.destroy()` so
+   * protocol clients close before the HTTP server tears down sockets.
+   */
+  gqlGraphqlWsDispose?: Maybe<() => Promise<void>>
+}
+
+export interface DevStateShape {
+  refreshState: null | string
+}
+
+interface LocalSettingsDataShape {
+  refreshing: Promise<Editor[]> | null
+  availableEditors: Editor[]
+  preferences: AllowedState
+}
+
+interface AppDataShape {
+  isGlobalMode: boolean
+  browsers: ReadonlyArray<FoundBrowser> | null
+  projects: ProjectShape[]
+  nodePath: Maybe<string>
+  browserStatus: BrowserStatus
+  browserUserAgent: string | null
+  relaunchBrowser: boolean
+}
+
+export interface WizardDataShape {
+  chosenBundler: WizardBundler | null
+  chosenFramework: Cypress.ResolvedComponentFrameworkDefinition | null
+  chosenManualInstall: boolean
+  detectedBundler: WizardBundler | null
+  detectedFramework: Cypress.ResolvedComponentFrameworkDefinition | null
+  frameworks: Cypress.ResolvedComponentFrameworkDefinition[]
+  erroredFrameworks: ErroredFramework[]
+}
+
+interface ElectronShape {
+  app: App | null
+  browserWindow: BrowserWindow | null
+}
+
+export interface AuthStateShape {
+  name?: AuthStateName
+  message?: string
+  browserOpened: boolean
+}
+
+interface ForceReconfigureProjectDataShape {
+  e2e?: boolean | null
+  component?: boolean | null
+}
+
+interface Diagnostics {
+  error: ErrorWrapperSource | null
+  warnings: ErrorWrapperSource[]
+}
+
+interface CloudDataShape {
+  testsForRunResults?: Record<string, string[]>
+  metadata?: {
+    id?: string
+    name?: string
+  }
+}
+
+interface RecordingInfo {
+  runId?: string
+  instanceId?: string
+}
+
+export interface CoreDataShape {
+  cliBrowser: string | null
+  cliTestingType: string | null
+  activeBrowser: FoundBrowser | null
+  machineId: Promise<string | null>
+  machineBrowsers: Promise<FoundBrowser[]> | null
+  allBrowsers: Promise<FoundBrowser[]> | null
+  servers: ServersDataShape
+  hasInitializedMode: 'run' | 'open' | null
+  cloudGraphQLError: ErrorWrapperSource | null
+  dev: DevStateShape
+  localSettings: LocalSettingsDataShape
+  app: AppDataShape
+  currentProject: string | null
+  currentProjectGitInfo: GitDataSource | null
+  currentTestingType: TestingType | null
+  diagnostics: Diagnostics
+  wizard: WizardDataShape
+  user: AuthenticatedUserShape | null
+  electron: ElectronShape
+  authState: AuthStateShape
+  scaffoldedFiles: NexusGenObjects['ScaffoldedFile'][] | null
+  packageManager: typeof PACKAGE_MANAGERS[number]
+  forceReconfigureProject: ForceReconfigureProjectDataShape | null
+  versionData: {
+    latestVersion: Promise<string>
+    npmMetadata: Promise<Record<string, string>>
+  } | null
+  cloudProject: CloudDataShape
+  eventCollectorSource: EventCollectorSource | null
+  didBrowserPreviouslyHaveUnexpectedExit: boolean
+  studioLifecycleManager?: StudioLifecycleManagerShape
+  cyPromptLifecycleManager?: CyPromptLifecycleManagerShape
+  currentRecordingInfo: RecordingInfo
+  autoProvisionedProjectId: string | null
+}
+
+/**
+ * All state for the app should live here for now
+ */
+export function makeCoreData (modeOptions: Partial<AllModeOptions> = {}): CoreDataShape {
+  return {
+    servers: {},
+    cliBrowser: modeOptions.browser ?? null,
+    cliTestingType: modeOptions.testingType ?? null,
+    machineId: machineId(),
+    machineBrowsers: null,
+    allBrowsers: null,
+    hasInitializedMode: null,
+    cloudGraphQLError: null,
+    dev: {
+      refreshState: null,
+    },
+    app: {
+      isGlobalMode: Boolean(modeOptions.global),
+      browsers: null,
+      projects: [],
+      nodePath: modeOptions.userNodePath,
+      browserStatus: 'closed',
+      browserUserAgent: null,
+      relaunchBrowser: false,
+    },
+    localSettings: {
+      availableEditors: [],
+      preferences: {},
+      refreshing: null,
+    },
+    authState: {
+      browserOpened: false,
+    },
+    currentProject: modeOptions.projectRoot ?? null,
+    diagnostics: { error: null, warnings: [] },
+    currentProjectGitInfo: null,
+    currentTestingType: modeOptions.testingType ?? null,
+    wizard: {
+      chosenBundler: null,
+      chosenFramework: null,
+      chosenManualInstall: false,
+      detectedBundler: null,
+      detectedFramework: null,
+      // TODO: API to add third party frameworks to this list.
+      frameworks: CT_FRAMEWORKS.map((framework) => resolveComponentFrameworkDefinition(framework)),
+      erroredFrameworks: [],
+    },
+    activeBrowser: null,
+    user: null,
+    electron: {
+      app: null,
+      browserWindow: null,
+    },
+    scaffoldedFiles: null,
+    packageManager: 'npm',
+    forceReconfigureProject: null,
+    versionData: null,
+    cloudProject: {
+      testsForRunResults: {},
+    },
+    eventCollectorSource: null,
+    didBrowserPreviouslyHaveUnexpectedExit: false,
+    studioLifecycleManager: undefined,
+    currentRecordingInfo: {},
+    autoProvisionedProjectId: null,
+  }
+
+  async function machineId (): Promise<string | null> {
+    try {
+      return await getMachineId()
+    } catch (error) {
+      return null
+    }
+  }
+}

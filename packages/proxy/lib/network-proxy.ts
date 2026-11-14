@@ -1,5 +1,13 @@
-import { Http, ServerCtx } from './http'
+import { telemetry } from '@packages/telemetry'
+import type { ServerCtx } from './http'
+import { Http } from './http'
 import type { BrowserPreRequest } from './types'
+import type { ForHttpIntercept } from '@packages/network-interception'
+import type Protocol from 'devtools-protocol'
+import type { ServiceWorkerClientEvent } from './http/util/service-worker-manager'
+import type { ResourceType, RequestCredentialLevel } from './resourceTypeAndCredentialManager'
+import { resourceTypeAndCredentialManager } from './resourceTypeAndCredentialManager'
+import { proxyHttpCodec } from './adapters/http-codec'
 
 export class NetworkProxy {
   http: Http
@@ -8,23 +16,101 @@ export class NetworkProxy {
     this.http = new Http(opts)
   }
 
-  addPendingBrowserPreRequest (preRequest: BrowserPreRequest) {
-    this.http.addPendingBrowserPreRequest(preRequest)
+  get codec () {
+    return proxyHttpCodec
   }
 
-  handleHttpRequest (req, res) {
-    this.http.handle(req, res)
+  withIntercept <TRequest, TResponse> (
+    networkInterception: ForHttpIntercept<TRequest, TResponse>,
+  ) {
+    this.http.networkInterception = networkInterception
+
+    return this
   }
 
-  handleSourceMapRequest (req, res) {
-    this.http.handleSourceMapRequest(req, res)
+  async addPendingBrowserPreRequest (preRequest: BrowserPreRequest) {
+    await this.http.addPendingBrowserPreRequest(preRequest)
+  }
+
+  removePendingBrowserPreRequest (requestId: string) {
+    this.http.removePendingBrowserPreRequest(requestId)
+  }
+
+  getPendingBrowserPreRequests () {
+    return this.http.getPendingBrowserPreRequests()
+  }
+
+  addPendingUrlWithoutPreRequest (url: string) {
+    this.http.addPendingUrlWithoutPreRequest(url)
+  }
+
+  updateServiceWorkerRegistrations (data: Protocol.ServiceWorker.WorkerRegistrationUpdatedEvent) {
+    this.http.updateServiceWorkerRegistrations(data)
+  }
+
+  updateServiceWorkerVersions (data: Protocol.ServiceWorker.WorkerVersionUpdatedEvent) {
+    this.http.updateServiceWorkerVersions(data)
+  }
+
+  updateServiceWorkerClientSideRegistrations (data: { scriptURL: string, initiatorOrigin: string }) {
+    this.http.updateServiceWorkerClientSideRegistrations(data)
+  }
+
+  handleServiceWorkerClientEvent (event: ServiceWorkerClientEvent) {
+    this.http.handleServiceWorkerClientEvent(event)
+  }
+
+  async handleHttpRequest (req, res) {
+    const span = telemetry.startSpan({
+      name: 'network:proxy:handleHttpRequest',
+      opts: {
+        attributes: {
+          'network:proxy:url': req.proxiedUrl,
+          'network:proxy:contentType': req.get('content-type'),
+        },
+      },
+      isVerbose: true,
+    })
+
+    await this.http.handleHttpRequest(req, res, span || undefined).finally(() => {
+      span?.end()
+    })
   }
 
   setHttpBuffer (buffer) {
     this.http.setBuffer(buffer)
   }
 
-  reset () {
-    this.http.reset()
+  reset (options: { resetBetweenSpecs: boolean } = { resetBetweenSpecs: false }) {
+    this.http.reset(options)
+  }
+
+  /**
+   * Releases long-lived timers owned by this proxy. Used when replacing the
+   * CDP Fetch NetworkProxy so prior PreRequests sweep intervals do not leak.
+   */
+  dispose () {
+    this.http.preRequests.dispose()
+    this.reset({ resetBetweenSpecs: true })
+  }
+
+  setProtocolManager (protocolManager) {
+    this.http.setProtocolManager(protocolManager)
+  }
+
+  setPreRequestTimeout (timeout) {
+    this.http.setPreRequestTimeout(timeout)
+  }
+
+  setCredentials ({ url, resourceType, credentialStatus }: {
+    url: string
+    resourceType: ResourceType
+    credentialStatus: RequestCredentialLevel
+  }): void {
+    resourceTypeAndCredentialManager.set({ url, resourceType, credentialStatus })
+  }
+
+  clearCredentials (): void {
+    resourceTypeAndCredentialManager.clear()
   }
 }

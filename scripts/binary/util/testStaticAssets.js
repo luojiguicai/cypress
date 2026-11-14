@@ -1,10 +1,8 @@
-/* eslint-disable arrow-body-style */
-
 const la = require('lazy-ass')
 const fs = require('fs-extra')
 const _ = require('lodash')
 const glob = require('glob')
-const chalk = require('chalk').default
+const chalk = require('chalk')
 const Promise = require('bluebird')
 const { stripIndent } = require('common-tags')
 
@@ -29,7 +27,7 @@ const testStaticAssets = async (buildResourcePath) => {
       testAssetStrings: [
         [
           (str) => !str.split('\n').slice(-1)[0].includes('//# sourceMappingURL'),
-          'sourcemaps were detected, ensure `web-config/webpack.base.config.ts` does not have sourcemaps enabled in production',
+          'sourcemaps were detected, ensure `web-config/webpack.config.base.ts` does not have sourcemaps enabled in production',
         ],
       ],
       minLineCount: 5000,
@@ -47,23 +45,8 @@ const testStaticAssets = async (buildResourcePath) => {
         ['-ms-', 20],
       ],
     }),
-
     testPackageStaticAssets({
-      assetGlob: `${buildResourcePath}/packages/desktop-gui/dist/index.html`,
-      goodStrings: [
-        // make sure webpack is run with NODE_ENV=production
-        `window.env = 'production'`,
-      ],
-    }),
-    testPackageStaticAssets({
-      assetGlob: `${buildResourcePath}/packages/desktop-gui/dist/app.js`,
-      goodStrings: [
-        // make sure webpack is run with NODE_ENV=production
-        'react.production.min.js',
-      ],
-    }),
-    testPackageStaticAssets({
-      assetGlob: `${buildResourcePath}/packages/socket/node_modules/socket.io-parser/dist/binary.js`,
+      assetGlob: `${buildResourcePath}/packages/socket/node_modules/socket.io-parser/build/cjs/binary.js`,
       badStrings: [
         'pack.data = _deconstructPacket(packetData, buffers);',
       ],
@@ -72,22 +55,50 @@ const testStaticAssets = async (buildResourcePath) => {
       ],
     }),
     testPackageStaticAssets({
-      assetGlob: `${buildResourcePath}/packages/socket/node_modules/engine.io-parser/lib/encodePacket.browser.js`,
+      assetGlob: `${buildResourcePath}/packages/socket/node_modules/engine.io-parser/build/cjs/encodePacket.browser.js`,
       badStrings: [
-        'return callback(data instanceof ArrayBuffer ? data : data.buffer);',
+        '(data instanceof ArrayBuffer || isView(data))',
       ],
       goodStrings: [
         'This extra check is made because the "instanceof ArrayBuffer" check does not work',
-        'return callback((data instanceof ArrayBuffer || isArrayBuffer(data)) ? data : data.buffer);',
+        '(data instanceof ArrayBuffer || isArrayBuffer(data) || isView(data))',
       ],
     }),
     testPackageStaticAssets({
-      assetGlob: `${buildResourcePath}/node_modules/winston/lib/winston/common.js`,
+      assetGlob: `${buildResourcePath}/packages/server/node_modules/geckodriver/dist/install.js`,
       badStrings: [
-        `if (target.padLevels) {`,
+        'await download()',
       ],
       goodStrings: [
-        `if (target.hasOwnProperty('padLevels') && target.padLevels) {`,
+        'download()',
+      ],
+    }),
+    testPackageStaticAssets({
+      assetGlob: `${buildResourcePath}/packages/server/node_modules/edgedriver/dist/install.js`,
+      badStrings: [
+        'await download()',
+      ],
+      goodStrings: [
+        'download()',
+      ],
+    }),
+    testPackageStaticAssets({
+      assetGlob: `${buildResourcePath}/packages/server/node_modules/@wdio/protocols/build/index.js`,
+      badStrings: [
+        'name: "addon"',
+        'description: "base64 string of the add on file"',
+      ],
+      goodStrings: [
+        'name: "path"',
+        'description: "path to the extension"',
+      ],
+    }),
+    testPackageStaticAssets({
+      assetGlob: `${buildResourcePath}/packages/server/node_modules/@wdio/utils/build/node.js`,
+      badStrings: [],
+      goodStrings: [
+        `log.setLevel(debugModule.enabled('cypress-verbose:server:browsers:webdriver') ? 'info' : 'silent')`,
+        `log2.setLevel(debugModule.enabled('cypress-verbose:server:browsers:webdriver') ? 'info' : 'silent')`,
       ],
     }),
   ])
@@ -158,9 +169,8 @@ function includesCount (string, subString) {
 
   let n = 0
   let pos = 0
-  let step = subString.length
+  const step = subString.length
 
-  // eslint-disable-next-line
   while (true) {
     pos = string.indexOf(subString, pos)
     if (pos >= 0) {

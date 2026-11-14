@@ -1,0 +1,71 @@
+import path from 'path'
+import os from 'os'
+import { ensureDir, remove } from 'fs-extra'
+import Debug from 'debug'
+import { resolveCypressCacheRoot } from '../../util/cypress-cache'
+
+const debug = Debug('cypress:server:cloud:bundles:cache-root')
+
+const BUNDLES_DIRNAME = 'bundles'
+
+const getBundleCacheRoot = (): string => {
+  return path.join(resolveCypressCacheRoot(), BUNDLES_DIRNAME)
+}
+
+export const getBundleCacheDir = (kind: 'cy-prompt' | 'studio'): string => {
+  return path.join(getBundleCacheRoot(), kind)
+}
+
+export const getFallbackBundleCacheDir = (kind: 'cy-prompt' | 'studio'): string => {
+  return path.join(os.tmpdir(), 'cypress-cache', BUNDLES_DIRNAME, kind)
+}
+
+export const isPermissionError = (err: unknown): err is NodeJS.ErrnoException => {
+  const code = (err as NodeJS.ErrnoException | null)?.code
+
+  return code === 'EACCES' || code === 'EPERM' || code === 'EROFS'
+}
+
+const randomSuffix = (): string => Math.random().toString(36).substring(2, 15)
+
+// `ensureDir` is a no-op on an existing directory and never checks whether we can
+// write into it, so confirm writability by creating (and removing) a sentinel
+// child — the same `mkdir`-of-a-child operation the bundle flow later performs.
+// The `.staging-` prefix means a probe left behind by a failed cleanup is reaped
+// by sweepOrphanStaging rather than lingering forever.
+const ensureDirWritable = async (dir: string): Promise<void> => {
+  await ensureDir(dir)
+
+  const probe = path.join(dir, `.staging-probe-${randomSuffix()}`)
+
+  await ensureDir(probe)
+  await remove(probe).catch(() => { /* best-effort cleanup */ })
+}
+
+export const ensureWritableFallbackBundleCacheDir = async (kind: 'cy-prompt' | 'studio'): Promise<string> => {
+  const fallback = getFallbackBundleCacheDir(kind)
+
+  await ensureDirWritable(fallback)
+
+  return fallback
+}
+
+// Ensure a writable bundle cache dir, returning the directory that was created.
+// When the configured Cypress cache folder is not writable (e.g. a root-owned or
+// read-only cache in locked-down CI), fall back to the OS temp dir rather than
+// failing outright.
+export const ensureWritableBundleCacheDir = async (kind: 'cy-prompt' | 'studio'): Promise<string> => {
+  const primary = getBundleCacheDir(kind)
+
+  try {
+    await ensureDirWritable(primary)
+
+    return primary
+  } catch (err) {
+    if (!isPermissionError(err)) throw err
+
+    debug('bundle cache dir %s not writable (%s); falling back to %s', primary, err.code, getFallbackBundleCacheDir(kind))
+
+    return ensureWritableFallbackBundleCacheDir(kind)
+  }
+}

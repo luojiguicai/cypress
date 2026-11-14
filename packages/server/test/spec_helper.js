@@ -1,25 +1,30 @@
-require('../lib/environment')
+/* eslint-disable no-console */
+const { enable, mockElectron } = require('./mockery_helper')
 
+const { configureLongStackTraces } = require('../lib/environment')
+
+configureLongStackTraces()
 const chai = require('chai')
 
 chai.use(require('chai-subset'))
 
-global.root = '../../'
+global.IS_TEST = true
 global.supertest = require('supertest')
 global.nock = require('nock')
 global.expect = chai.expect
 global.mockery = require('mockery')
 global.proxyquire = require('proxyquire')
 global.sinon = require('sinon')
+
 const _ = require('lodash')
-const Promise = require('bluebird')
-const path = require('path')
-const cache = require('../lib/cache')
+const cache = require('../lib/cache').cache
 
 require('chai')
 .use(require('@cypress/sinon-chai'))
 .use(require('chai-uuid'))
 .use(require('chai-as-promised'))
+
+const { GracefulExit } = require('../lib/util/graceful-exit')
 
 if (process.env.UPDATE) {
   throw new Error('You\'re using UPDATE=1 which is the old way of updating snapshots.\n\nThe correct environment variable is SNAPSHOT_UPDATE=1')
@@ -59,13 +64,15 @@ const {
 } = sinon
 
 sinon.useFakeTimers = function (...args) {
-  sinon._clock = useFakeTimers.apply(sinon, args)
+  const clock = useFakeTimers.apply(sinon, args)
+
+  sinon._clock = clock
+
+  return clock
 }
 
 sinon.restore = function (...args) {
-  let c
-
-  c = sinon._clock
+  const c = sinon._clock
 
   if (c) {
     c.restore()
@@ -74,32 +81,32 @@ sinon.restore = function (...args) {
   return restore.apply(sinon, args)
 }
 
-mockery.enable({
-  warnOnUnregistered: false,
-})
+enable(mockery)
 
-// stub out the entire electron object for our stub
-// we must use an absolute path here because of the way mockery internally loads this
-// module - meaning the first time electron is required it'll use this path string
-// so because its required from a separate module we must use an absolute reference to it
-mockery.registerSubstitute(
-  'electron',
-  path.join(__dirname, './support/helpers/electron_stub'),
-)
-
-// stub out electron's original-fs module which is available when running in electron
-mockery.registerMock('original-fs', {})
-
-before(function () {
-  if (hasOnly) {
-    this.test.parent._onlyTests = [true]
-  }
-})
+mockElectron(mockery)
 
 // appData.ensure()
 
-beforeEach(function () {
+const { setCtx, getCtx, clearCtx, makeDataContext } = require('../lib/makeDataContext')
+
+before(async function () {
+  if (hasOnly) {
+    this.test.parent._onlyTests = [true]
+  }
+
+  await clearCtx()
+  setCtx(makeDataContext({}))
+})
+
+beforeEach(async function () {
+  GracefulExit.resetForTesting()
+  await clearCtx()
+  setCtx(makeDataContext({}))
   this.originalEnv = originalEnv
+
+  if (!nock.isActive()) {
+    nock.activate()
+  }
 
   nock.disableNetConnect()
   nock.enableNetConnect(/localhost/)
@@ -109,7 +116,14 @@ beforeEach(function () {
   return cache.remove()
 })
 
-afterEach(() => {
+afterEach(async () => {
+  try {
+    await getCtx()._reset()
+  } catch (e) {
+    console.error('CAUGHT ERROR calling ctx._reset:')
+    console.error(e)
+  }
+  await clearCtx()
   sinon.restore()
 
   nock.cleanAll()

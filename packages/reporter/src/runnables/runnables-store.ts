@@ -1,21 +1,24 @@
+import type { TestFilter } from '@packages/types'
 import _ from 'lodash'
-import { action, observable } from 'mobx'
-import AgentModel, { AgentProps } from '../agents/agent-model'
-import CommandModel, { CommandProps } from '../commands/command-model'
-import { HookProps } from '../hooks/hook-model'
-import appState, { AppState } from '../lib/app-state'
-import scroller, { Scroller } from '../lib/scroller'
-import RouteModel, { RouteProps } from '../routes/route-model'
-import TestModel, { TestProps, UpdatableTestProps, UpdateTestCallback } from '../test/test-model'
-import RunnableModel from './runnable-model'
-import SuiteModel, { SuiteProps } from './suite-model'
-import { SessionProps } from '../sessions/sessions-model'
+import { action, observable, makeObservable } from 'mobx'
+import type { AgentProps } from '../agents/agent-model'
+import type { CommandProps } from '../commands/command-model'
+import type { HookProps } from '../hooks/hook-model'
+import type { AppState } from '../lib/app-state'
+import appState from '../lib/app-state'
+import type { Scroller } from '../lib/scroller'
+import scroller from '../lib/scroller'
+import type { RouteProps } from '../routes/route-model'
+import type { TestProps, UpdatableTestProps, UpdateTestCallback } from '../test/test-model'
+import TestModel from '../test/test-model'
+import type RunnableModel from './runnable-model'
+import type { SuiteProps } from './suite-model'
+import SuiteModel from './suite-model'
 
 const defaults = {
   hasSingleTest: false,
   hasTests: false,
   isReady: false,
-
   attemptingShowSnapshot: false,
   showingSnapshot: false,
 }
@@ -25,32 +28,36 @@ interface Props {
   scroller: Scroller
 }
 
-export type LogProps = AgentProps | CommandProps | RouteProps | SessionProps
+export type LogProps = AgentProps | CommandProps | RouteProps
 
 export type RunnableArray = Array<TestModel | SuiteModel>
-
-export type Log = AgentModel | CommandModel | RouteModel
 
 export interface RootRunnable {
   hooks?: Array<HookProps>
   tests?: Array<TestProps>
   suites?: Array<SuiteProps>
+  testFilter?: TestFilter
+  totalTests?: number
+  totalUnfilteredTests?: number
 }
 
 type RunnableType = 'test' | 'suite'
 type TestOrSuite<T> = T extends TestProps ? TestProps : SuiteProps
 
 export class RunnablesStore {
-  @observable isReady = defaults.isReady
-  @observable runnables: RunnableArray = []
+  isReady = defaults.isReady
+  runnables: RunnableArray = []
   /**
-   * Stores a list of all the runables files where the reporter
+   * Stores a list of all the runnables files where the reporter
    * has passed without any specific order.
    *
    * key: spec FilePath
-   * content: RunableArray
+   * content: RunnableArray
    */
-  @observable runnablesHistory: Record<string, RunnableArray> = {}
+  runnablesHistory: Record<string, RunnableArray> = {}
+  totalTests: number = 0
+  totalUnfilteredTests: number = 0
+  testFilter: TestFilter
 
   runningSpec: string | null = null
 
@@ -62,13 +69,22 @@ export class RunnablesStore {
   [key: string]: any
 
   _tests: Record<string, TestModel> = {}
-  _logs: Record<string, Log> = {}
   _runnablesQueue: Array<RunnableModel> = []
 
   attemptingShowSnapshot = defaults.attemptingShowSnapshot
   showingSnapshot = defaults.showingSnapshot
 
   constructor ({ appState, scroller }: Props) {
+    makeObservable(this, {
+      isReady: observable,
+      runnables: observable,
+      runnablesHistory: observable,
+      totalTests: observable,
+      totalUnfilteredTests: observable,
+      testFilter: observable,
+      setRunningSpec: action,
+    })
+
     this.appState = appState
     this.scroller = scroller
   }
@@ -81,6 +97,10 @@ export class RunnablesStore {
 
     this.hasTests = numTests > 0
     this.hasSingleTest = numTests === 1
+    this.totalTests = numTests
+
+    this.totalUnfilteredTests = rootRunnable.totalUnfilteredTests || 0
+    this.testFilter = rootRunnable.testFilter
 
     this._finishedInitialRendering()
   }
@@ -103,17 +123,65 @@ export class RunnablesStore {
     return type === 'suite' ? this._createSuite(props as SuiteProps, level) : this._createTest(props as TestProps, level)
   }
 
+  _getImmediateParentSuiteTitle (level: number): { parentTitle: string } {
+    // Get parent suite titles by traversing up the queue
+    const parentTitles: string[] = []
+
+    // Find the immediate parent suite by looking for the last suite at a lower level
+    const parentLevel = level - 1
+
+    for (let i = this._runnablesQueue.length - 1; i >= 0; i--) {
+      const runnable = this._runnablesQueue[i]
+
+      if ('type' in runnable && runnable.type === 'suite' && runnable.level === parentLevel && runnable.title) {
+        // Add this parent's title
+        parentTitles.unshift(runnable.title)
+        break
+      }
+    }
+
+    // Combine parent titles with current suite title
+    // Combine parent titles
+    const parentTitle = [...parentTitles].join(' > ')
+
+    return { parentTitle }
+  }
+
   _createSuite (props: SuiteProps, level: number) {
-    const suite = new SuiteModel(props, level)
+    const { parentTitle } = this._getImmediateParentSuiteTitle(level)
+
+    // Create new props with the hierarchical title
+    const hierarchicalTitle = parentTitle ? `${parentTitle} > ${props.title}` : props.title
+
+    const suiteProps = {
+      ...props,
+      title: hierarchicalTitle,
+    }
+
+    if (parentTitle) {
+      suiteProps.parentTitle = parentTitle
+    }
+
+    const suite = new SuiteModel(suiteProps, level)
 
     this._runnablesQueue.push(suite)
-    suite.children = this._createRunnableChildren(props, ++level)
+    suite.children = this._createRunnableChildren(props, level + 1)
 
     return suite
   }
 
   _createTest (props: TestProps, level: number) {
-    const test = new TestModel(props, level, this)
+    const { parentTitle } = this._getImmediateParentSuiteTitle(level)
+
+    const testProps = {
+      ...props,
+    }
+
+    if (parentTitle) {
+      testProps.parentTitle = parentTitle
+    }
+
+    const test = new TestModel(testProps, level, this)
 
     this._runnablesQueue.push(test)
     this._tests[test.id] = test
@@ -152,9 +220,9 @@ export class RunnablesStore {
     })
   }
 
-  runnableFinished (props: TestProps) {
+  runnableFinished (props: TestProps, isInteractive: boolean) {
     this._withTest(props.id, (test) => {
-      test.finish(props)
+      test.finish(props, isInteractive)
     })
   }
 
@@ -162,9 +230,9 @@ export class RunnablesStore {
     return this._tests[id]
   }
 
-  addLog (log: LogProps) {
-    this._withTest(log.testId, (test) => {
-      test.addLog(log)
+  addLog (props: LogProps) {
+    this._withTest(props.testId, (test) => {
+      test.addLog(props)
     })
   }
 
@@ -197,9 +265,9 @@ export class RunnablesStore {
     this.runnablesHistory = {}
     this._tests = {}
     this._runnablesQueue = []
+    this.totalTests = 0
   }
 
-  @action
   setRunningSpec (specPath: string) {
     const previousSpec = this.runningSpec
 

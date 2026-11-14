@@ -18,6 +18,16 @@ const onServer = function (app, srv) {
 }
 
 const onSSEServer = (app) => {
+  app.get('/sse/finite', (req, res) => {
+    res.set({
+      'Access-Control-Allow-Origin': '*',
+      'Content-Type': 'text/event-stream',
+    })
+
+    res.write('data: one\n\n')
+    setTimeout(() => res.end('data: two\n\n'), 100)
+  })
+
   return app.get('/sse', function (req, res) {
     let int
 
@@ -43,8 +53,8 @@ const onSSEServer = (app) => {
       return this.sseStream.write({
         data: `${i}`,
       })
-    }
-    , 100)
+    },
+     100)
   })
 }
 
@@ -67,7 +77,8 @@ describe('e2e server sent events', () => {
 
   // https://github.com/cypress-io/cypress/issues/1440
   systemTests.it('passes', {
-    spec: 'server_sent_events_spec.js',
+    browser: '!webkit', // TODO(webkit): fix+unskip
+    spec: 'server_sent_events.cy.js',
     snapshot: true,
   })
 })

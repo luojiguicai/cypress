@@ -1,4 +1,3 @@
-// @ts-nocheck
 import _ from 'lodash'
 import capitalize from 'underscore.string/capitalize'
 import methods from 'methods'
@@ -8,13 +7,24 @@ import $ from 'jquery'
 import $dom from '../dom'
 import $jquery from '../dom/jquery'
 import { $Location } from './location'
+import $errUtils from './error_utils'
+
+const customProtocolRegex = /^[^:/]+:\/{1,3}/
+// Find 'namespace' values (like `_N_E` for Next apps) without adjusting relative paths (like `../`)
+const webpackDevtoolNamespaceRegex = /webpack:\/{2}([^.]*)?\.\//
 
 const tagOpen = /\[([a-z\s='"-]+)\]/g
 const tagClosed = /\[\/([a-z]+)\]/g
-const quotesRe = /('|")/g
+
+// `methods` derives its list from Node's `http.METHODS` when it is imported.
+// In the browser bundle there is no `http` module, so it falls back to a static
+// snapshot that predates newer standardized methods such as QUERY. Union those
+// in so validation matches regardless of the runtime doing the check.
+const additionalHttpMethods = ['query']
+const validHttpMethods = new Set([...methods, ...additionalHttpMethods].map((method) => method.toLowerCase()))
 
 const defaultOptions = {
-  delay: 10,
+  delay: 0,
   force: false,
   timeout: null,
   interval: null,
@@ -46,12 +56,18 @@ const USER_FRIENDLY_TYPE_DETECTORS = _.map([
   [_.stubTrue, 'unknown'],
 ], ([fn, type]) => {
   return [fn, _.constant(type)]
-})
+}) as unknown as [(val: any) => boolean, (val: any) => string][]
 
 export default {
   warning (msg) {
     // eslint-disable-next-line no-console
     return console.warn(`Cypress Warning: ${msg}`)
+  },
+
+  throwErrByPath (errPath: string, args: any) {
+    return $errUtils.throwErrByPath(errPath, {
+      args,
+    })
   },
 
   log (...msgs) {
@@ -71,6 +87,18 @@ export default {
     }
   },
 
+  monkeypatchBeforeAsync (origFn, fn) {
+    return async function () {
+      const newArgs = await fn.apply(this, arguments)
+
+      if (newArgs !== undefined) {
+        return origFn.apply(this, newArgs)
+      }
+
+      return origFn.apply(this, arguments)
+    }
+  },
+
   unwrapFirst (val) {
     // this method returns the first item in an array
     // and if its still a jquery object, then we return
@@ -78,7 +106,7 @@ export default {
     const item = [].concat(val)[0]
 
     if ($jquery.isJquery(item)) {
-      return item.first()
+      return (item as JQuery<any>).first()
     }
 
     return item
@@ -98,7 +126,7 @@ export default {
     throw new Error(`The switch/case value: '${value}' did not match any cases: ${keys.join(', ')}.`)
   },
 
-  reduceProps (obj, props = []) {
+  reduceProps (obj, props: readonly string[] = []) {
     if (!obj) {
       return null
     }
@@ -147,19 +175,25 @@ export default {
     return obj
   },
 
-  stringifyActualObj (obj) {
+  stringifyActualObj (obj, visited?: WeakSet<any>) {
+    // Ensure visited is always a WeakSet - create new one if not provided or invalid
+    const visitedSet = (visited && visited instanceof WeakSet) ? visited : new WeakSet()
+
     obj = this.normalizeObjWithLength(obj)
 
     const str = _.reduce(obj, (memo, value, key) => {
-      memo.push(`${`${key}`.toLowerCase()}: ${this.stringifyActual(value)}`)
+      memo.push(`${`${key}`.toLowerCase()}: ${this.stringifyActual(value, visitedSet)}`)
 
       return memo
-    }, [])
+    }, [] as string[])
 
     return `{${str.join(', ')}}`
   },
 
-  stringifyActual (value) {
+  stringifyActual (value, visited?: WeakSet<any>) {
+    // Ensure visited is always a WeakSet - create new one if not provided or invalid
+    const visitedSet = (visited && visited instanceof WeakSet) ? visited : new WeakSet()
+
     if ($dom.isDom(value)) {
       return $dom.stringify(value, 'short')
     }
@@ -169,13 +203,30 @@ export default {
     }
 
     if (_.isArray(value)) {
+      // Check for circular reference first to prevent infinite recursion
+      if (visitedSet.has(value)) {
+        return '[Circular]'
+      }
+
       const len = value.length
 
       if (len > 3) {
+        // Add to visited set to prevent infinite recursion in nested structures
+        visitedSet.add(value)
+
         return `Array[${len}]`
       }
 
-      return `[${_.map(value, _.bind(this.stringifyActual, this)).join(', ')}]`
+      // For arrays with length <= 3, recurse into elements
+      // Add to visited set before recursing
+      visitedSet.add(value)
+
+      const result = `[${_.map(value, (item) => this.stringifyActual(item, visitedSet)).join(', ')}]`
+
+      // Note: We don't remove from visited set because WeakSet automatically handles cleanup
+      // and we want to detect circular references even after the first level
+
+      return result
     }
 
     if (_.isRegExp(value)) {
@@ -185,17 +236,33 @@ export default {
     if (_.isObject(value)) {
       // Cannot use $dom.isJquery here because it causes infinite recursion.
       if (value instanceof $) {
-        return `jQuery{${value.length}}`
+        return `jQuery{${(value as JQueryStatic).length}}`
+      }
+
+      // Check for circular reference first to prevent infinite recursion
+      if (visitedSet.has(value)) {
+        return '[Circular]'
       }
 
       const len = _.keys(value).length
 
       if (len > 2) {
+        // Add to visited set to prevent infinite recursion in nested structures
+        visitedSet.add(value)
+
         return `Object{${len}}`
       }
 
+      // Add to visited set before recursing
+      visitedSet.add(value)
+
       try {
-        return this.stringifyActualObj(value)
+        const result = this.stringifyActualObj(value, visitedSet)
+
+        // Note: We don't remove from visited set because WeakSet automatically handles cleanup
+        // and we want to detect circular references even after the first level
+
+        return result
       } catch (err) {
         return String(value)
       }
@@ -224,7 +291,7 @@ export default {
     return _
     .chain(values)
     .map(_.bind(this.stringifyActual, this))
-    .without(undefined)
+    .filter((value) => value !== undefined)
     .join(', ')
     .value()
   },
@@ -268,12 +335,6 @@ export default {
     }
   },
 
-  escapeQuotes (text) {
-    // convert to str and escape any single
-    // or double quotes
-    return (`${text}`).replace(quotesRe, '\\$1')
-  },
-
   normalizeNumber (num) {
     const parsed = Number(num)
 
@@ -286,7 +347,7 @@ export default {
   },
 
   isValidHttpMethod (str) {
-    return _.isString(str) && _.includes(methods, str.toLowerCase())
+    return _.isString(str) && validHttpMethods.has(str.toLowerCase())
   },
 
   addTwentyYears () {
@@ -320,8 +381,18 @@ export default {
     return Math.sqrt((deltaX * deltaX) + (deltaY * deltaY))
   },
 
-  getTestFromRunnable (r) {
-    return r.ctx.currentTest || r
+  getTestFromRunnable (r: Mocha.Runnable) {
+    return r.ctx?.currentTest || r
+  },
+
+  getTestAttemptFromRunnable (r: Mocha.Runnable | undefined) {
+    // Returns 0 (not undefined) when there is no runnable; log consumers treat
+    // missing retry as the first attempt.
+    if (!r) {
+      return 0
+    }
+
+    return this.getTestFromRunnable(r)._currentRetry || 0
   },
 
   memoize (func, cacheInstance = new Map()) {
@@ -355,7 +426,7 @@ export default {
 
   // normalize more than {maxNewLines} new lines into
   // exactly {replacementNumLines} new lines
-  normalizeNewLines (str, maxNewLines, replacementNumLines) {
+  normalizeNewLines (str, maxNewLines, replacementNumLines?) {
     const moreThanMaxNewLinesRe = new RegExp(`\\n{${maxNewLines},}`)
     const replacementWithNumLines = replacementNumLines ?? maxNewLines
 
@@ -385,9 +456,19 @@ export default {
     ```
   */
   decodeBase64Unicode (str) {
-    return decodeURIComponent(atob(str).split('').map((char) => {
-      return `%${(`00${char.charCodeAt(0).toString(16)}`).slice(-2)}`
-    }).join(''))
+    // Inline source maps can be very large, so decode into a single byte array:
+    // a string per byte can exhaust the renderer's heap. `fatal` makes invalid
+    // UTF-8 throw so callers can fall back instead of getting replacement
+    // characters, and `ignoreBOM` keeps a leading byte order mark so the result
+    // is exactly the encoded text.
+    const binary = atob(str)
+    const bytes = new Uint8Array(binary.length)
+
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   },
 
   /**
@@ -396,7 +477,7 @@ export default {
   */
   encodeBase64Unicode (str) {
     return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (match, p1) => {
-      return String.fromCharCode(`0x${p1}`)
+      return String.fromCharCode(Number(`0x${p1}`))
     }))
   },
 
@@ -405,6 +486,31 @@ export default {
   },
 
   isPromiseLike (ret) {
-    return ret && _.isFunction(ret.then)
+    return ret && _.isObject(ret) && 'then' in ret && _.isFunction(ret.then) && 'catch' in ret && _.isFunction(ret.catch)
+  },
+
+  stripCustomProtocol (filePath: string) {
+    if (!filePath) {
+      return
+    }
+
+    // if the file path (after all said and done)
+    // still starts with "http://" or "https://" then
+    // it is an URL and we have no idea how it maps
+    // to a physical file location on disk. Let it be.
+    const httpProtocolRegex = /^https?:\/\//
+
+    if (httpProtocolRegex.test(filePath)) {
+      return
+    }
+
+    // Check the path to see if custom namespaces have been applied and, if so, remove them
+    // For example, in Next.js we end up with paths like `_N_E/pages/index.cy.js`, and we
+    // need to strip off the `_N_E` so that "Open in IDE" links work correctly
+    if (webpackDevtoolNamespaceRegex.test(filePath)) {
+      return filePath.replace(webpackDevtoolNamespaceRegex, '')
+    }
+
+    return filePath.replace(customProtocolRegex, '')
   },
 }

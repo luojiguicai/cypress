@@ -1,32 +1,58 @@
-.fa { &:not(.fa-spin) { animation: none; } }
+@import "../lib/mixins.scss";
+
+$status-border-width: 2px;
+$open-test-border-padding: 3px;
+$dotted-line-left-padding: 19px;
+
+@mixin dotted-line {
+  content: "";
+  position: absolute;
+  left: $dotted-line-left-padding;
+  bottom: -$open-test-border-padding;
+  height: calc(100% - 23px);
+  border-left: 1px dotted $gray-800;
+  z-index: 1;
+}
+
+.fa {
+  &:not(.fa-spin) {
+    animation: none;
+  }
+}
 
 .reporter {
   min-height: 0; // needed for firefox or else scrolling gets funky
 
   .container {
-    box-shadow: 0 1px 2px #aaa;
+    background-color: $gray-1100;
     flex-grow: 2;
     overflow-y: auto;
   }
 
   .wrap {
-    box-shadow: 0 1px 2px #aaa;
-    margin-bottom: 40px;
     padding-left: 0;
     width: 100%;
+    margin-bottom: 16px;
+    margin-top: 4px;
   }
 
   .runnables {
     padding-left: 0;
+    display: flex;
+    flex-direction: column;
+
+    .last-test-margin-bottom {
+      margin-bottom: 16px;
+    }
   }
 
   .no-tests {
-    background-color: #f5f5f5;
+    background-color: $gray-1100;
     min-height: 20px;
     padding: 24px;
 
     h2 {
-      color: #e94f5f;
+      color: $red-400;
       font-size: 1.3em;
       font-weight: 500;
       line-height: 1.4;
@@ -34,7 +60,7 @@
     }
 
     h3 {
-      color: #3386d4;
+      color: $indigo-400;
       font-size: 1.2em;
       font-weight: 500;
       line-height: 1.4;
@@ -46,17 +72,13 @@
       font-size: 1.1em;
 
       &.text-muted {
-        color: #b4b5bc;
+        color: $gray-600;
       }
     }
 
     a {
-      color: #3386d4;
+      color: $indigo-300;
       cursor: pointer;
-    }
-
-    i {
-      margin-right: 5px;
     }
 
     hr {
@@ -64,222 +86,346 @@
       margin-bottom: 1.6em;
       border: none;
       height: 1px;
-      color: #dadade;
-      background-color: #dadade;
+      color: $gray-900;
+      background-color: $gray-900;
     }
 
-    .open-studio,
-    .open-studio-desc {
-      display: none;
-    }
-  }
+    svg {
+      margin-right: 5px;
+      vertical-align: text-top;
 
-  &.experimental-studio-enabled .no-tests .open-studio,
-  &.experimental-studio-enabled .no-tests .open-studio-desc {
-    display: inline;
+      &.warning-icon {
+        margin-top: 2px;
+      }
+
+      .icon-light {
+        fill: $indigo-600;
+      }
+    }
   }
 
   .runnable {
     width: 100%;
-    color: #6c6c6c;
-    background-color: #fff;
-    overflow: auto;
+    color: $gray-400;
+    background-color: $gray-1100;
     line-height: 18px;
-    padding-left: 0;
 
     .runnable-wrapper {
-      border-left: 5px solid transparent;
+      border-radius: 4px;
+      border-left: $status-border-width solid transparent;
       padding: 0;
 
+      .button-hover-shadow {
+        @include button-hover-shadow(
+          $linear-gradient: linear-gradient(90deg, rgba(22, 24, 39, 0) 5.39%, #161827 31.97%),
+          $width: 130px
+        );
+      }
+
       .collapsible-header {
-        &:focus {
+        &:hover,
+        &:focus-visible {
+          .header-icon {
+            display: none;
+          }
+
+          .header-collapsible-indicator {
+            display: flex;
+          }
+
+          .launch-studio-button {
+            opacity: 1 !important;
+          }
+
+          .button-hover-shadow {
+            opacity: 1 !important;
+          }
+        }
+
+        &:hover {
           .collapsible-header-inner {
-            background-color: #f7f8f9;
+            background-color: $gray-900;
+          }
+        }
+
+        &:focus-visible {
+          outline: 0;
+
+          .collapsible-header-inner {
+            background-color: $gray-900;
+            outline: 0;
             cursor: pointer;
+
+            .runnable-title {
+              color: $indigo-300;
+            }
+          }
+
+          .header-collapsible-indicator {
+            path {
+              stroke: $indigo-300;
+            }
+          }
+
+          .launch-studio-button {
+            border-color: $gray-900;
+            background-color: $gray-900;
           }
         }
 
         .collapsible-header-inner {
-          &:hover {
-            background-color: #f7f8f9;
-            cursor: pointer;
-          }
+          display: inline-flex;
+          align-items: center;
+          height: 100%;
+          width: 100%;
 
           &:focus {
             outline: 0;
           }
-
-          height: 100%;
-          padding: 5px 15px 5px 5px;
-          width: 100%;
         }
       }
+      .runnable-controls-studio {
+        opacity: 1;
+      }
 
-      &:hover {
-        .runnable-controls-studio {
-          opacity: 0.5;
-
-          &:hover {
-            opacity: 1;
-          }
-        }
+      .header-collapsible-indicator {
+        display: none;
       }
     }
 
-    .attempt-item:hover {
-      > .runnable-wrapper .runnable-controls i.fa-redo {
-        visibility: visible !important;
-      }
-
-      .hooks-container, .runnable-err-wrapper {
-        border-color: #828282;
-      }
-    }
-
-    &.runnable-active {
-      .runnable-state {
-        @include runnable-state-active;
-      }
-    }
-
-    .runnable-state,.attempt-state {
+    .runnable-state,
+    .attempt-state {
       display: inline-block;
       line-height: 18px;
       margin-right: 5px;
       min-width: 12px;
-      height: 18px;
       text-align: center;
-      font-size: 11px;
+      font-size: 12px;
     }
 
-    &.suite .collapsible-indicator  {
-      padding-left: 2px;
-      font-size: 14px;
-      color: #bbbcbd;
+    &.suite .collapsible-indicator {
+      flex-shrink: 0;
     }
 
+    &.test.runnable-pending,
+    &.test.runnable-processing {
+      pointer-events: none;
+    }
 
-    &.test.runnable-processing  {
-      .runnable-state {
-        @include runnable-state-processing;
-      }
+    &.runnable-processing > div > .runnable-wrapper,
+    &.runnable-processing > div > .runnable-instruments {
+      border-left: $status-border-width solid $gray-700;
     }
 
     &.runnable-failed > div > .runnable-wrapper,
     &.runnable-failed > div > .runnable-instruments {
-      border-left: 5px solid $fail;
-
-      .fa-exclamation-triangle.has-command-failures {
-        visibility: visible;
-      }
+      border-left: $status-border-width solid $fail;
     }
 
     &.runnable-pending > div > .runnable-wrapper,
     &.runnable-pending > div > .runnable-instruments {
-      border-left: 5px solid lighten($pending, 25%);
+      border-left: $status-border-width solid $pending;
       padding-bottom: 0;
     }
 
     &.runnable-passed > div > .runnable-wrapper,
     &.runnable-passed > div > .runnable-instruments {
-      border-left: 5px solid $pass;
+      border-left: $status-border-width solid $pass;
     }
 
     .runnable-retried > div > .runnable-wrapper,
     .runnable-retried > div > .runnable-instruments {
-      border-left: 5px solid $retried;
-    }
-
-    &.runnable-studio.runnable-passed > div > .runnable-wrapper,
-    &.runnable-studio.runnable-passed > div > .runnable-instruments {
-      border-left: 5px solid #3386d4;
+      border-left: $status-border-width solid $retried;
     }
 
     &.runnable-skipped > .runnable-wrapper {
-      .runnable-state {
-        @include runnable-state-skipped;
-      }
-
       .runnable-title {
-        color: #aaa;
+        color: $gray-600;
       }
     }
 
     &.runnable-skipped > div > .runnable-wrapper,
     &.runnable-skipped > div > .runnable-instruments {
-      border-left: 5px solid #9a9aaa;
+      border: 1px solid $gray-950;
+      border-left: $status-border-width solid $gray-500;
     }
 
-    &.test.runnable-failed {
-      .runnable-state {
-        @include runnable-state-failed;
+    &.suite > .collapsible {
+      > .runnable-wrapper {
+        border: 0;
+        margin: 0;
+        border-radius: 0;
+        background-color: $gray-1100;
+
+        .collapsible-header-inner {
+          padding: 9px 11px;
+          background-color: $gray-1100;
+        }
+
+        .runnable-title {
+          color: $gray-400;
+          font-weight: 500;
+        }
+
+        .runnable-and-suite-header-icon {
+          position: relative;
+          display: flex;
+          justify-content: center;
+        }
+
+        .icon-dark-secondary-red-400 {
+          :nth-child(4) {
+            stroke: $red-400;
+          }
+        }
+
+        .collapsible-header-inner {
+          .launch-studio-button {
+            @include new-test-button;
+          }
+        }
+      }
+
+      &.is-open > .runnable-wrapper {
+        position: relative;
+
+        &::before {
+          @include dotted-line;
+        }
       }
     }
 
-    &.suite > div > .runnable-wrapper {
-      .runnable-title {
-        color: #111;
-        font-size: 13px;
-      }
-    }
+    &.test {
+      padding: $open-test-border-padding;
 
-    &.test.runnable-passed {
-      .runnable-state {
-        @include runnable-state-passed;
-      }
-    }
-
-    &.test.runnable-passed.runnable-studio {
-      .runnable-state {
-        @include studio-state-passed;
-      }
-
-      .studio-controls {
+      > .collapsible {
         display: flex;
+        flex-direction: column;
 
-        .studio-save, .studio-copy {
-          display: block;
+        .runnable-wrapper {
+          background-color: $gray-1000;
+
+          &:hover {
+            .collapsible-header {
+              border-top: 1px solid $gray-900;
+              border-bottom: 1px solid $gray-900;
+              border-right: 1px solid $gray-900;
+            }
+
+            .collapsible-header-inner {
+              background-color: $gray-1100;
+            }
+          }
+
+          .collapsible-header {
+            border: 1px solid $gray-950;
+            border-radius: 4px;
+            border-bottom-left-radius: 0;
+            border-top-left-radius: 0;
+
+            &:focus-visible {
+              border-top: 1px solid $gray-800;
+              border-bottom: 1px solid $gray-800;
+              border-right: 1px solid $gray-800;
+
+              .collapsible-header-inner {
+                background-color: $gray-900;
+              }
+            }
+          }
+
+          .collapsible-header-inner {
+            background-color: $gray-1000;
+            width: 100%;
+          }
+        }
+
+        &.is-open {
+          border-radius: 4px;
+          box-shadow: 0 0 0 3px #43486159;
+          background-color: $reporter-section-background;
+
+          .runnable-wrapper {
+            border-bottom-left-radius: 0;
+
+            .collapsible-header {
+              border: 1px solid $gray-800;
+              border-left: 1px solid transparent;
+              border-radius: 0 4px 0 0;
+            }
+
+            .collapsible-header-inner {
+              background-color: $reporter-section-background;
+            }
+          }
+        }
+
+        .collapsible-header-inner {
+          padding: 8px 8px 8px 6px;
+        }
+      }
+
+      .runnable-commands-region {
+        .hooks-container {
+          display: flex;
+          gap: 4px;
+          flex-direction: column;
+          width: 100%;
+        }
+      }
+
+      &.runnable-active > .collapsible {
+        > .runnable-wrapper,
+        > .runnable-instruments {
+          border-left: $status-border-width solid $indigo-400;
         }
       }
     }
 
     &.test.runnable-pending {
-      .runnable-state {
-        @include runnable-state-pending;
-      }
       .runnable-title {
-        color: lighten($pending, 25%);
+        color: $gray-500;
       }
 
       .runnable-commands-region {
         display: none;
       }
-
-      .studio-controls {
-        display: flex;
-      }
     }
 
-    &.test.runnable-failed {
-      .studio-controls {
-        display: flex;
-      }
+    .runnable-state-icon {
+      flex-shrink: 0;
+      margin-top: 1px;
     }
+  }
+
+  .runnable-dotted-line {
+    height: 6px;
+    border-left: 1px dotted #434861;
+    margin: (-$open-test-border-padding) 0 (-$open-test-border-padding) 19px;
+    z-index: 1;
   }
 
   .runnable-instruments {
-    border-left: 5px solid transparent;
-    padding-bottom: 5px;
+    border-left: $status-border-width solid transparent;
+    border-radius: 0 4px;
+  }
+
+  @mixin dotted-line {
+    content: "";
+    position: absolute;
+    left: $dotted-line-left-padding;
+    bottom: -3px;
+    height: calc(100% - 23px);
+    border-left: 1px dotted $gray-800;
+    z-index: 1;
   }
 
   .runnable-title {
-    font-size: 12.5px;
-    min-width: $reporter-contents-min-width;
-    white-space: pre-line;
-
-    &:focus {
-      outline: 1px dotted #6c6c6c;
-    }
+    color: $white;
+    font-family: $font-system;
+    font-size: 14px;
+    display: flex;
+    flex-grow: 1;
   }
 
   .runnable-wrapper > .collapsible-header {
@@ -287,38 +433,38 @@
     position: relative;
     display: inline-flex;
     width: 100%;
-
-    &:focus {
-      outline: 1px dotted #6c6c6c;
-      outline-offset: 3px;
-    }
   }
 
-  .suite > div .runnable-wrapper,
-  .test .runnable-wrapper > .collapsible-header {
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    overflow: hidden;
+  .wrap > .runnables {
+    padding: 0 (8px - $open-test-border-padding);
   }
 
   .runnable-controls {
-    float: right;
-
     label {
       padding: 2px 4px;
     }
 
     .runnable-controls-status {
       margin: 0 2px;
-      color: #999;
+      color: $gray-500;
       visibility: hidden;
       font-size: 15px;
     }
 
     .runnable-controls-studio {
-      color: #3386d4;
+      display: flex;
+      height: 20px;
+      width: 20px;
+      color: $gray-500;
+      border: 1px solid $gray-900;
+      border-radius: 4px;
       opacity: 0;
-      display: none;
+      padding-top: 2px;
+      padding-left: 1px;
+
+      svg {
+        flex: auto;
+      }
     }
   }
 
@@ -326,141 +472,25 @@
     visibility: visible;
   }
 
-  &.experimental-studio-enabled .runnable-controls .runnable-controls-studio {
-    display: inline;
-  }
-
-  &.studio-active .runnable-controls .runnable-controls-studio {
-    display: none;
-  }
-
-  .test .collapsible {
-    display: flex;
-    flex-direction: column;
-
-    .runnable-wrapper .collapsible-header-inner {
-      width: 100%;
-
-      .collapsible-header-text {
-        display: flex;
-
-        .runnable-title {
-          flex-grow: 1;
-          padding-right: 10px;
-        }
-      }
-    }
-  }
-
   .collapsible-header {
     display: flex;
   }
 
-  .test > .collapsible > .runnable-wrapper > .collapsible-header > .collapsible-header-inner > .collapsible-indicator {
-    display: none;
-  }
-
-  .runnable-header {
-    background: #f2f2f2;
-    box-shadow: 0 2px 7px rgba(0, 0, 0, 0.25);
-    display: block;
-    font-size: 13px;
-    line-height: 24px;
-    overflow-wrap: break-word;
-    padding: 5px 10px;
-    position: sticky;
-    top: 0;
+  .collapsible-header-text {
+    display: flex;
     width: 100%;
-    z-index: 1;
+    gap: 8px;
+    position: relative;
+    background: inherit;
 
-    span > span > a:before,
-    span > span > span:before {
-      @extend .#{$fa-css-prefix};
-      @extend .#{$fa-css-prefix}-file;
-      color: #bdbdbd;
-      display: inline;
-      margin-right: 5px;
-    }
-  }
-
-  .studio-controls {
-    display: none;
-    margin: 10px 20px 10px 0;
-
-    button {
-      border-radius: 5px;
-      font-family: $font-sans;
-      font-size: 12px;
-      padding: 6px 20px;
-
-      &:focus {
-        outline: none;
-      }
-
-      &:not(.studio-copy):active {
-        box-shadow: inset 0 3px 5px rgba(0, 0, 0, 0.125);
-      }
-    }
-
-    .studio-cancel {
-      background-color: #e8e8ec;
-      color: #777;
-
-      &:hover {
-        background-color: darken(#e8e8ec, 5%);
-      }
-    }
-
-    .studio-copy-wrapper {
-      margin-left: auto;
-
-      .studio-copy {
-        color: #3386d4;
-        display: none;
-        font-size: 16px;
-        padding: 3px 10px;
-
-        i {
-          width: 15px;
-        }
-
-        &:hover, &:focus {
-          color: darken(#3386d4, 5%);
-        }
-
-        &.studio-copy-success {
-          color: $pass;
-        }
-
-        &[disabled],
-        &[disabled]:hover,
-        &[disabled]:active {
-          color: #3386d4;
-          opacity: 0.5;
-        }
-      }
-    }
-
-    .studio-save {
-      background-color: #3386d4;
-      color: #fff;
-      display: none;
-      margin-left: 4px;
-
-      &:hover {
-        background-color: darken(#3386d4, 10%);
-      }
-
-      &[disabled],
-      &[disabled]:hover,
-      &[disabled]:active {
-        background-color: #3386d4;
-        opacity: 0.5;
-      }
+    svg {
+      flex-shrink: 0;
     }
   }
 
   .runnable-loading {
+    font-family: $font-system;
+
     .runnable-loading-animation {
       display: flex;
       margin: 3.5rem auto 1.5rem;
@@ -477,32 +507,35 @@
       }
 
       div:nth-child(1) {
-        animation-delay:0.1s;
-        background: #56b790;
+        animation-delay: 0.1s;
+        background: $jade-400;
       }
 
       div:nth-child(2) {
-        animation-delay:0.2s;
-        background: #4a88cc;
+        animation-delay: 0.2s;
+        background: $indigo-400;
       }
 
       div:nth-child(3) {
-        animation-delay:0.3s;
-        background: #b96162;
+        animation-delay: 0.3s;
+        background: $red-400;
       }
 
       div:nth-child(4) {
-        animation-delay:0.4s;
-        background: #e3b065;
+        animation-delay: 0.4s;
+        background: $orange-400;
       }
 
       div:nth-child(5) {
-        animation-delay:0.5s;
-        background: #a9abad;
+        animation-delay: 0.5s;
+        background: $gray-400;
       }
 
       @keyframes scaling {
-        0%, 20%, 80%, 100% {
+        0%,
+        20%,
+        80%,
+        100% {
           opacity: 100%;
           transform: scale(0.5);
         }
@@ -531,6 +564,119 @@
 
     .wrap {
       margin-bottom: 0;
+    }
+  }
+}
+
+.runnable-popover-container {
+  position: relative;
+  display: inline-block;
+
+  .runnable-options-button {
+    padding: 0;
+    width: 32px;
+    justify-content: center;
+    color: $gray-500;
+  }
+  
+  .runnable-options-button-border {
+    border-color: rgb(255 255 255 / 0.2);
+  }
+
+  .runnable-options-button-icon {
+   rotate: 90deg;
+  }
+}
+
+.runnable-popover {
+  position: fixed;
+  z-index: 9999;
+  background: white;
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  width: 250px;
+  // the popover renders in the reporter iframe and cannot overflow it, so
+  // shrink to the iframe's viewport when the panel is narrower than 250px
+  max-width: calc(100vw - 16px);
+  padding: 8px;
+  font-family: $font-system;
+  
+  .runnable-popover-section {
+    &:not(:last-child) {
+      border-bottom: 1px solid $gray-50;
+    }
+
+    .runnable-popover-section-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: $gray-600;
+      padding: 8px 6px 6px 6px;
+    }
+  }
+
+  .runnable-popover-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 6px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 400;
+    color: $gray-900;
+    text-align: left;
+
+    &:hover {
+      background-color: $gray-100;
+    }
+
+    svg {
+      flex-shrink: 0;
+      width: 16px;
+      height: 16px;
+    }
+
+    span {
+      flex: 1;
+    }
+  }
+
+  .runnable-popover-item-with-toggle {
+    .runnable-popover-item-with-toggle-content {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      color: $gray-900;
+      padding: 8px 6px;
+
+      .runnable-popover-item-text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        flex: 1;
+  
+        .runnable-popover-item-label {
+          font-size: 14px;
+          font-weight: 400;
+        }
+      }
+    }
+
+    .runnable-popover-item-description {
+      font-size: 14px;
+      color: $gray-700;
+      line-height: 20px;
+      font-weight: 400;
+      padding: 0 6px;
+      display: block;
+    }
+
+    .switch {
+      flex-shrink: 0;
+      margin-top: 2px;
     }
   }
 }

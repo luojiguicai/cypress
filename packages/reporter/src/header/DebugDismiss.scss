@@ -1,0 +1,16 @@
+.debug-dismiss {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  color: $indigo-300;
+  border: solid 1px $indigo-300;
+  border-radius: 16px;
+  gap: 4px;
+  padding: 4px 8px;
+
+  .delete-icon path {
+    fill: $indigo-300;
+  }
+}

@@ -1,0 +1,595 @@
+import base64url from 'base64url'
+import Database from 'better-sqlite3'
+import fetch from 'cross-fetch'
+import crypto from 'crypto'
+import Debug from 'debug'
+import fs from 'fs-extra'
+import os from 'os'
+import path from 'path'
+import { strictAgent } from '@packages/network'
+import pkg from '@packages/root'
+import * as env from '../util/env'
+import { putProtocolArtifact } from './api/put_protocol_artifact'
+import { requireScript } from './require_script'
+import * as routes from './routes'
+
+import type { Readable } from 'stream'
+import type { ProtocolManagerShape, AppCaptureProtocolInterface, CDPClient, ProtocolError, CaptureArtifact, ProtocolErrorReport, ProtocolCaptureMethod, ProtocolManagerOptions, ResponseStreamOptions, ResponseEndedWithEmptyBodyOptions, ResponseStreamTimedOutOptions, AfterSpecDurations, FoundSpec } from '@packages/types'
+
+const debug = Debug('cypress:server:protocol')
+const debugVerbose = Debug('cypress-verbose:server:protocol')
+
+const CAPTURE_ERRORS = !process.env.CYPRESS_LOCAL_PROTOCOL_PATH && !process.env.CYPRESS_LOCAL_STUDIO_PATH
+const DELETE_DB = !process.env.CYPRESS_LOCAL_PROTOCOL_PATH
+
+export const DB_SIZE_LIMIT = 5000000000
+
+export const DEFAULT_STREAM_SAMPLING_INTERVAL = 10000
+
+const dbSizeLimit = () => {
+  return env.get('CYPRESS_INTERNAL_SYSTEM_TESTS') === '1' ?
+    200 : DB_SIZE_LIMIT
+}
+
+type AppCaptureProtocolConstructor = new (options: ProtocolManagerOptions) => AppCaptureProtocolInterface
+
+export class ProtocolManager implements ProtocolManagerShape {
+  private _runId?: string
+  private _instanceId?: string
+  private _specName?: string
+  private _db?: Database.Database
+  private _dbPath?: string
+  private _archivePath?: string
+  private _errors: ProtocolError[] = []
+  private _protocol: AppCaptureProtocolInterface | undefined
+  private _runnableId: string | undefined
+  private _captureHash: string | undefined
+  private _afterSpecDurations: AfterSpecDurations & {
+    afterSpecTotal: number
+  } | undefined
+
+  private AppCaptureProtocol: AppCaptureProtocolConstructor | undefined
+  private options: ProtocolManagerOptions | undefined
+
+  get isProtocolEnabled (): boolean {
+    return !!this._protocol
+  }
+
+  get networkEnableOptions () {
+    return this.isProtocolEnabled ? {
+      maxTotalBufferSize: 0,
+      maxResourceBufferSize: 0,
+      maxPostDataSize: 64 * 1024,
+    } : undefined
+  }
+
+  get dbPath () {
+    return this._dbPath
+  }
+
+  async prepareProtocol (script: string, options: ProtocolManagerOptions) {
+    this._captureHash = base64url.fromBase64(crypto.createHash('SHA256').update(script).digest('base64'))
+
+    debug('preparing protocol via script')
+
+    try {
+      this.options = options
+      this._runId = options.runId
+      if (script) {
+        const cypressProtocolDirectory = path.join(os.tmpdir(), 'cypress', 'protocol')
+
+        await fs.ensureDir(cypressProtocolDirectory)
+
+        const { AppCaptureProtocol } = requireScript<{ AppCaptureProtocol: AppCaptureProtocolConstructor }>(script)
+
+        this.AppCaptureProtocol = AppCaptureProtocol
+      }
+    } catch (error) {
+      if (CAPTURE_ERRORS) {
+        this.captureError({
+          error,
+          args: [script],
+          captureMethod: 'prepareProtocol',
+          fatal: true,
+        })
+      } else {
+        throw error
+      }
+    }
+  }
+
+  setupProtocol () {
+    debug('setting up protocol')
+
+    try {
+      // Cleanup the previous protocol
+      this.cleanup()
+
+      if (!this.AppCaptureProtocol || !this.options) {
+        throw new Error('Cannot setup protocol without a prepared protocol')
+      }
+
+      this._protocol = new this.AppCaptureProtocol(this.options)
+    } catch (error) {
+      if (CAPTURE_ERRORS) {
+        this.captureError({
+          error,
+          captureMethod: 'setupProtocol',
+          fatal: true,
+        })
+      } else {
+        throw error
+      }
+    }
+  }
+
+  async prepareAndSetupProtocol (script: string, options: ProtocolManagerOptions) {
+    await this.prepareProtocol(script, options)
+    this.setupProtocol()
+  }
+
+  async connectToBrowser (cdpClient: CDPClient) {
+    // Keyed by event name then by original listener so that the same function
+    // registered for multiple events doesn't collide and leak wrappers.
+    const listenerMap = new Map<string, Map<(event: any) => void, (event: any) => Promise<void>>>()
+
+    const newCdpClient: CDPClient = {
+      ...cdpClient,
+      on: (event, listener) => {
+        // Wrap the cdp client listeners so that we can be notified of any errors that may occur
+        const wrapper = async (message) => {
+          try {
+            await listener(message)
+          } catch (error) {
+            if (CAPTURE_ERRORS) {
+              this.captureError({ captureMethod: 'cdpClient.on', fatal: false, error, args: [event, message] })
+            } else {
+              debug('error in cdpClient.on %o', { error, event, message })
+              throw error
+            }
+          }
+        }
+
+        if (!listenerMap.has(event)) {
+          listenerMap.set(event, new Map())
+        }
+
+        listenerMap.get(event)!.set(listener, wrapper)
+        cdpClient.on(event, wrapper)
+      },
+      off: (event, listener) => {
+        const eventListeners = listenerMap.get(event)
+        const wrapper = eventListeners?.get(listener)
+
+        if (wrapper) {
+          cdpClient.off(event, wrapper)
+          eventListeners!.delete(listener)
+          if (eventListeners!.size === 0) {
+            listenerMap.delete(event)
+          }
+        }
+      },
+    }
+
+    await this.invokeAsync('connectToBrowser', { isEssential: true }, newCdpClient)
+  }
+
+  addRunnables (runnables) {
+    this.invokeSync('addRunnables', { isEssential: true }, runnables)
+  }
+
+  beforeSpec (spec: FoundSpec & { instanceId: string }) {
+    this._afterSpecDurations = undefined
+
+    if (!this._protocol) {
+      return
+    }
+
+    // Reset the errors here so that we are tracking on them per-spec
+    this._errors = []
+
+    try {
+      const beforeSpecStartedAt = performance.now() + performance.timeOrigin
+
+      this._beforeSpec(spec)
+
+      debug('beforeSpec for %s completed in %dms', spec.name, (performance.now() + performance.timeOrigin) - beforeSpecStartedAt)
+    } catch (error) {
+      // Clear out protocol since we will not have a valid state when spec has failed
+      this.cleanup()
+
+      if (CAPTURE_ERRORS) {
+        this.captureError({ captureMethod: 'beforeSpec', fatal: true, error, args: [spec], runnableId: this._runnableId })
+      } else {
+        throw error
+      }
+    }
+  }
+
+  private _beforeSpec (spec: FoundSpec & { instanceId: string }) {
+    this._instanceId = spec.instanceId
+    this._specName = spec.name
+    const cypressProtocolDirectory = path.join(os.tmpdir(), 'cypress', 'protocol')
+    const archivePath = path.join(cypressProtocolDirectory, `${spec.instanceId}.tar`)
+    const dbPath = path.join(cypressProtocolDirectory, `${spec.instanceId}.db`)
+
+    debug('connecting to database at %s', dbPath)
+
+    const db = Database(dbPath, {
+      nativeBinding: path.join(path.dirname(require.resolve('better-sqlite3/package.json')), 'build', 'Release', 'better_sqlite3.node'),
+      verbose: debugVerbose,
+    })
+
+    this._db = db
+    this._dbPath = dbPath
+    this._archivePath = archivePath
+    this.invokeSync('beforeSpec', { isEssential: true }, { workingDirectory: cypressProtocolDirectory, archivePath, dbPath, db, spec })
+  }
+
+  async afterSpec () {
+    const startTime = performance.now() + performance.timeOrigin
+
+    try {
+      const ret = await this.invokeAsync('afterSpec', { isEssential: true })
+      const durations = ret?.durations
+
+      const afterSpecTotal = (performance.now() + performance.timeOrigin) - startTime
+
+      this._afterSpecDurations = {
+        afterSpecTotal,
+        ...(durations ? durations : {}),
+      }
+
+      debug('Persisting after spec durations in state: %o', this._afterSpecDurations)
+
+      return undefined
+    } catch (e) {
+      // rethrow; this is try/catch so we can 'finally' ascertain duration
+      this._afterSpecDurations = {
+        afterSpecTotal: (performance.now() + performance.timeOrigin - startTime),
+      }
+
+      throw e
+    }
+  }
+
+  async beforeTest (test: { id: string } & Record<string, any>) {
+    if (!test.id) {
+      debug('protocolManager beforeTest was invoked with test without id %o', test)
+    }
+
+    this._runnableId = test.id
+    await this.invokeAsync('beforeTest', { isEssential: true }, test)
+  }
+
+  async preAfterTest (test: Record<string, any>, options: Record<string, any>): Promise<void> {
+    await this.invokeAsync('preAfterTest', { isEssential: false }, test, options)
+  }
+
+  async afterTest (test: Record<string, any>) {
+    await this.invokeAsync('afterTest', { isEssential: true }, test)
+    this._runnableId = undefined
+  }
+
+  commandLogAdded (log: any) {
+    this.invokeSync('commandLogAdded', { isEssential: false }, log)
+  }
+
+  commandLogChanged (log: any): void {
+    this.invokeSync('commandLogChanged', { isEssential: false }, log)
+  }
+
+  viewportChanged (input: any): void {
+    this.invokeSync('viewportChanged', { isEssential: false }, input)
+  }
+
+  urlChanged (input: any): void {
+    this.invokeSync('urlChanged', { isEssential: false }, input)
+  }
+
+  pageLoading (input: any): void {
+    this.invokeSync('pageLoading', { isEssential: false }, input)
+  }
+
+  resetTest (testId: string, currentRetry?: number): void {
+    this.invokeSync('resetTest', { isEssential: false }, testId, currentRetry)
+  }
+
+  responseEndedWithEmptyBody (options: ResponseEndedWithEmptyBodyOptions): void {
+    this.invokeSync('responseEndedWithEmptyBody', { isEssential: false }, options)
+  }
+
+  responseStreamReceived (options: ResponseStreamOptions): Readable | undefined {
+    return this.invokeSync('responseStreamReceived', { isEssential: false }, options)
+  }
+
+  responseStreamTimedOut (options: ResponseStreamTimedOutOptions): void {
+    this.invokeSync('responseStreamTimedOut', { isEssential: false }, options)
+  }
+
+  canUpload (): boolean {
+    return !!this._protocol && !!this._archivePath && !!this._db
+  }
+
+  hasErrors (): boolean {
+    return !!this._errors.length
+  }
+
+  addFatalError (captureMethod: ProtocolCaptureMethod, error: Error, args?: any) {
+    this.captureError({
+      fatal: true,
+      error,
+      captureMethod,
+      runnableId: this._runnableId || undefined,
+      args,
+    })
+  }
+
+  hasFatalError (): boolean {
+    debug(this._errors)
+
+    return !!this._errors.filter((e) => e.fatal).length
+  }
+
+  getFatalError (): ProtocolError | undefined {
+    return this._errors.find((e) => e.fatal)
+  }
+
+  getNonFatalErrors (): ProtocolError[] {
+    return this._errors.filter((e) => !e.fatal)
+  }
+
+  getArchivePath (): string | undefined {
+    return this._archivePath
+  }
+
+  async getArchiveInfo (): Promise<{ filePath: string, fileSize: number } | void> {
+    const archivePath = this._archivePath
+
+    debug('reading archive from', archivePath)
+    if (!archivePath) {
+      return
+    }
+
+    return {
+      filePath: archivePath,
+      fileSize: (await fs.stat(archivePath)).size,
+    }
+  }
+
+  async uploadCaptureArtifact ({ uploadUrl, fileSize, filePath }: CaptureArtifact) {
+    if (!this._protocol || !filePath || !this._db) {
+      debug('not uploading due to one of the following being falsy: %o', {
+        _protocol: !!this._protocol,
+        archivePath: !!filePath,
+        _db: !!this._db,
+      })
+
+      return
+    }
+
+    const captureErrors = !process.env.CYPRESS_LOCAL_PROTOCOL_PATH
+
+    debug(`uploading %s to %s with a file size of %s`, filePath, uploadUrl, fileSize)
+
+    try {
+      const environmentSuppliedInterval = parseInt(process.env.CYPRESS_TEST_REPLAY_UPLOAD_SAMPLING_INTERVAL || '', 10)
+      const samplingInterval = !Number.isNaN(environmentSuppliedInterval) ?
+        environmentSuppliedInterval :
+        this._protocol.uploadStallSamplingInterval ? this._protocol.uploadStallSamplingInterval() : DEFAULT_STREAM_SAMPLING_INTERVAL
+
+      await putProtocolArtifact(filePath, dbSizeLimit(), uploadUrl, samplingInterval)
+
+      return {
+        fileSize,
+        success: true,
+        specAccess: this._protocol.getDbMetadata(),
+        ...(this._afterSpecDurations ? {
+          afterSpecDurations: this._afterSpecDurations,
+        } : {}),
+      }
+    } catch (e) {
+      if (captureErrors) {
+        this.captureError({
+          error: e,
+          captureMethod: 'uploadCaptureArtifact',
+          fatal: true,
+          isUploadError: true,
+        })
+
+        throw e
+      }
+
+      return
+    } finally {
+      if (DELETE_DB) {
+        await fs.unlink(filePath).catch((e) => {
+          debug('Error unlinking db %o', e)
+        })
+      }
+    }
+  }
+
+  async cdpReconnect () {
+    await this.invokeAsync('cdpReconnect', { isEssential: true })
+  }
+
+  /**
+   * Central handling for errors - if we're in studio mode it will
+   * immediately be dispatched to the cloud for recording, otherwise
+   * it will be stored and the batch will be dispatched when protocol assets
+   * are uploaded.
+   *
+   * @param error
+   */
+  private captureError (error: ProtocolError) {
+    if (this.options?.mode === 'studio') {
+      void this.dispatchErrors([error], {
+        osName: os.platform(),
+        projectSlug: this.options?.projectId,
+        specName: this._specName,
+        mode: this.options?.mode,
+      })
+    } else {
+      this._errors.push(error)
+    }
+  }
+
+  async reportNonFatalErrors (context?: {
+    osName: string
+    projectSlug?: string
+    specName?: string
+    mode?: 'record' | 'studio'
+  }) {
+    const errors = this._errors.filter(({ fatal }) => !fatal)
+
+    await this.dispatchErrors(errors, context)
+
+    this._errors = []
+  }
+
+  /**
+   * Transmit errors to the cloud.
+   *
+   * @param errors
+   * @param context
+   * @returns
+   */
+  private async dispatchErrors (errors: ProtocolError[], context?: {
+    osName: string
+    projectSlug?: string
+    specName?: string
+    mode?: 'record' | 'studio'
+  }) {
+    if (errors.length === 0) {
+      return
+    }
+
+    try {
+      const payload: ProtocolErrorReport = {
+        runId: this._runId,
+        instanceId: this._instanceId,
+        captureHash: this._captureHash,
+        errors: errors.map((e) => {
+          return {
+            name: e.error.name ?? `Unknown name`,
+            stack: e.error.stack ?? `Unknown stack`,
+            message: e.error.message ?? `Unknown message`,
+            captureMethod: e.captureMethod,
+            args: e.args ? this.stringify(e.args) : undefined,
+            runnableId: e.runnableId,
+          }
+        }),
+        context,
+      }
+
+      const body = JSON.stringify(payload)
+
+      await fetch(routes.apiRoutes.captureProtocolErrors() as string, {
+        // @ts-expect-error - this is supported
+        agent: strictAgent,
+        method: 'POST',
+        body,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-cypress-version': pkg.version,
+          'x-os-name': os.platform(),
+          'x-arch': os.arch(),
+        },
+      })
+    } catch (e) {
+      debug(`Error calling ProtocolManager.sendErrors: %o, original errors %o`, e, errors)
+    }
+  }
+
+  close (): void {
+    this._db?.close()
+    this._db = undefined
+
+    if (this._dbPath) {
+      fs.unlink(this._dbPath).catch(() => {})
+    }
+
+    this._dbPath = undefined
+
+    if (this._archivePath) {
+      fs.unlink(this._archivePath).catch(() => {})
+    }
+
+    this._archivePath = undefined
+    this._instanceId = undefined
+    this._specName = undefined
+    this._runId = undefined
+    this._errors = []
+    this.cleanup()
+  }
+
+  cleanup (): void {
+    this.invokeSync('cleanup', { isEssential: false })
+    this._protocol = undefined
+  }
+
+  /**
+   * Abstracts invoking a synchronous method on the AppCaptureProtocol instance, so we can handle
+   * errors in a uniform way
+   */
+  private invokeSync<K extends ProtocolSyncMethods> (method: K, { isEssential }: { isEssential: boolean }, ...args: Parameters<AppCaptureProtocolInterface[K]>): any | void {
+    if (!this._protocol) {
+      return
+    }
+
+    try {
+      // @ts-expect-error - TS not associating the method & args properly, even though we know it's correct
+      return this._protocol[method](...args)
+    } catch (error) {
+      if (CAPTURE_ERRORS) {
+        this.captureError({ captureMethod: method, fatal: isEssential, error, args, runnableId: this._runnableId })
+      } else {
+        throw error
+      }
+    }
+  }
+
+  /**
+   * Abstracts invoking a synchronous method on the AppCaptureProtocol instance, so we can handle
+   * errors in a uniform way
+   */
+  private async invokeAsync <K extends ProtocolAsyncMethods> (method: K, { isEssential }: { isEssential: boolean }, ...args: Parameters<AppCaptureProtocolInterface[K]>): Promise<ReturnType<AppCaptureProtocolInterface[K]> | undefined> {
+    if (!this._protocol) {
+      return undefined
+    }
+
+    try {
+      // @ts-expect-error - TS not associating the method & args properly, even though we know it's correct
+      return await this._protocol[method](...args)
+    } catch (error) {
+      if (CAPTURE_ERRORS) {
+        this.captureError({ captureMethod: method, fatal: isEssential, error, args, runnableId: this._runnableId })
+      } else {
+        throw error
+      }
+
+      return undefined
+    }
+  }
+
+  private stringify (val: any) {
+    try {
+      return JSON.stringify(val)
+    } catch (e) {
+      return `Unserializable ${typeof val}`
+    }
+  }
+}
+
+// Helper types for invokeSync / invokeAsync
+type ProtocolSyncMethods = {
+  [K in keyof AppCaptureProtocolInterface]: ReturnType<AppCaptureProtocolInterface[K]> extends Promise<any> ? never : K
+}[keyof AppCaptureProtocolInterface]
+
+type ProtocolAsyncMethods = {
+  [K in keyof AppCaptureProtocolInterface]: ReturnType<AppCaptureProtocolInterface[K]> extends Promise<any> ? K : never
+}[keyof AppCaptureProtocolInterface]
+
+/** @alias */
+export default ProtocolManager

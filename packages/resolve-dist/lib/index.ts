@@ -1,25 +1,28 @@
 import path from 'path'
+import fs from 'fs-extra'
 
-let fs: typeof import('fs-extra')
+type FoldersWithDist = 'static' | 'driver' | 'app' | 'runner' | 'launchpad'
 
-export type RunnerPkg = 'runner' | 'runner-ct'
+export const resolveFromPackages = (...args: string[]) => {
+  return path.join(...[__dirname, '..', '..', ...args])
+}
 
-type FoldersWithDist = 'static' | 'driver' | RunnerPkg
+const getRunnerContents = (filename: string) => {
+  return fs.readFile(getPathToDist('runner', filename))
+}
 
 export const getPathToDist = (folder: FoldersWithDist, ...args: string[]) => {
   return path.join(...[__dirname, '..', '..', folder, 'dist', ...args])
 }
 
 export const getRunnerInjectionContents = () => {
-  fs ??= require('fs-extra') as typeof import('fs-extra')
-
-  return fs.readFile(getPathToDist('runner', 'injection.js'))
+  return getRunnerContents('injection.js')
 }
 
-export const getPathToIndex = (pkg: RunnerPkg) => {
-  return getPathToDist(pkg, 'index.html')
+export const getRunnerCrossOriginInjectionContents = () => {
+  return getRunnerContents('injection_cross_origin.js')
 }
 
-export const getPathToDesktopIndex = () => {
-  return `file://${path.join(__dirname, '..', '..', 'desktop-gui', 'dist', 'index.html')}`
+export const getPathToDesktopIndex = (graphqlPort: number) => {
+  return `http://localhost:${graphqlPort}/__launchpad/index.html`
 }

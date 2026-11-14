@@ -1,0 +1,13 @@
+{
+  "name": "ct-webpack-test",
+  "version": "1.0.0",
+  "description": "",
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^8.0.9"
+  },
+  "license": "ISC",
+  "author": ""
+}

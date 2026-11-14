@@ -1,5 +1,11 @@
-const linuxEditors = [
+import type { Editor } from '@packages/types'
+
+export const linuxEditors = [
   {
+    id: 'cursor',
+    binary: 'cursor',
+    name: 'Cursor',
+  }, {
     id: 'atom',
     binary: 'atom',
     name: 'Atom',
@@ -43,11 +49,19 @@ const linuxEditors = [
     id: 'webstorm',
     binary: 'webstorm',
     name: 'WebStorm',
+  }, {
+    id: 'webstorm64',
+    binary: 'webstorm64.exe',
+    name: 'WebStorm 64-bit',
   },
-]
+] as const
 
-const osxEditors = [
+export const macOSEditors = [
   {
+    id: 'cursor',
+    binary: '/Applications/Cursor.app/Contents/MacOS/Cursor',
+    name: 'Cursor',
+  }, {
     id: 'atom',
     binary: 'atom',
     name: 'Atom',
@@ -78,7 +92,7 @@ const osxEditors = [
   }, {
     id: 'insiders',
     binary: 'code-insiders',
-    name: 'Visual Studio Vode Insiders',
+    name: 'Visual Studio Code Insiders',
   }, {
     id: 'emacs',
     binary: 'emacs',
@@ -120,10 +134,14 @@ const osxEditors = [
     binary: 'vim',
     name: 'Vim',
   },
-]
+] as const
 
-const windowsEditors = [
+export const windowsEditors = [
   {
+    id: 'cursor',
+    binary: 'Cursor.exe',
+    name: 'Cursor',
+  }, {
     id: 'brackets',
     binary: 'Brackets.exe',
     name: 'Brackets',
@@ -187,23 +205,13 @@ const windowsEditors = [
     id: 'webstorm',
     binary: 'webstorm.exe',
     name: 'WebStorm',
-  }, {
-    id: 'webstorm64',
-    binary: 'webstorm64.exe',
-    name: 'WebStorm (64-bit)',
   },
-]
+] as const
 
-export interface Editor {
-  id: string
-  binary: string
-  name: string
-}
-
-export const getEnvEditors = (): Editor[] => {
+export const getEnvEditors = (): readonly Editor[] => {
   switch (process.platform) {
     case 'darwin':
-      return osxEditors
+      return macOSEditors
     case 'win32':
       return windowsEditors
     default:

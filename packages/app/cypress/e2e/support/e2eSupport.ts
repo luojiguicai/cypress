@@ -1,0 +1,50 @@
+import '@packages/frontend-shared/cypress/support/e2e'
+import 'cypress-real-events/support'
+import './execute-spec'
+import './reporter'
+
+beforeEach(() => {
+  // this is always 0, since we only destroy the AUT when using
+  // `experimentalSingleTabRunMode, which is not a valid experiment for for e2e testing.
+  // @ts-expect-error - autDestroyedCount is not declared on the EventManager type
+  expect(window.top?.getEventManager().autDestroyedCount).to.be.undefined
+
+  // Mock out all studio telemetry requests so that our tests don't pollute Honeycomb data
+  cy.mockNodeCloudRequest({ url: '/studio/telemetry', method: 'post', body: {}, persist: true })
+  cy.mockNodeCloudRequest({ url: '/studio/metrics', method: 'post', body: {}, persist: true })
+})
+
+afterEach(() => {
+  const specPath = Cypress.spec.relative.replace(/\\/g, '/')
+
+  if (!specPath.includes('e2e/studio/')) {
+    return
+  }
+
+  // reset studio after each test to avoid triggering the browser's unsaved changes dialog in between tests
+  cy.get('body').then(($body) => {
+    const $btn = $body.find('[data-cy="studio-reset-button"]')
+
+    if ($btn.length) {
+      cy.wrap($btn).click({ force: true })
+    }
+  })
+})
+
+function e2eTestingTypeIsSelected () {
+  cy.findByTestId('specs-testing-type-header').within(() => {
+    cy.findByTestId('testing-type-switch').contains('button', 'E2E').should('have.attr', 'aria-selected', 'true')
+    cy.findByTestId('testing-type-switch').contains('button', 'Component').should('have.attr', 'aria-selected', 'false')
+  })
+}
+
+Cypress.Commands.add('verifyE2ESelected', e2eTestingTypeIsSelected)
+
+function ctTestingTypeIsSelected () {
+  cy.findByTestId('specs-testing-type-header').within(() => {
+    cy.findByTestId('testing-type-switch').contains('button', 'E2E').should('have.attr', 'aria-selected', 'false')
+    cy.findByTestId('testing-type-switch').contains('button', 'Component').should('have.attr', 'aria-selected', 'true')
+  })
+}
+
+Cypress.Commands.add('verifyCtSelected', ctTestingTypeIsSelected)

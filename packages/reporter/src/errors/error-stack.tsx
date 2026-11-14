@@ -1,9 +1,11 @@
 import _ from 'lodash'
 import { observer } from 'mobx-react'
-import React, { ReactElement } from 'react'
+import type { ReactElement } from 'react'
+import React from 'react'
 
 import FileNameOpener from '../lib/file-name-opener'
-import Err, { ParsedStackFileLine, ParsedStackMessageLine } from './err-model'
+import type Err from './err-model'
+import type { ParsedStackFileLine, ParsedStackMessageLine } from './err-model'
 
 const cypressLineRegex = /(cypress:\/\/|cypress_runner\.js)/
 
@@ -76,7 +78,9 @@ const ErrorStack = observer(({ err }: Props) => {
     )
 
     if (dontLink) {
-      return makeLine(key, [whitespace, `at ${fn} (${originalFile}:${line}:${column})`])
+      const lineAndColumn = (Number.isInteger(line) || Number.isInteger(column)) ? `:${line}:${column}` : ''
+
+      return makeLine(key, [whitespace, `at ${fn} (${originalFile}${lineAndColumn})`])
     }
 
     const link = (

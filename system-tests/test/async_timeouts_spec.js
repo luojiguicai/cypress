@@ -4,8 +4,9 @@ describe('e2e async timeouts', () => {
   systemTests.setup()
 
   systemTests.it('failing1', {
-    spec: 'async_timeouts_spec.js',
+    spec: 'async_timeouts.cy.js',
     snapshot: true,
     expectedExitCode: 2,
+    config: { screenshotOnRunFailure: false },
   })
 })

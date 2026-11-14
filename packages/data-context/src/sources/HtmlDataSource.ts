@@ -1,0 +1,175 @@
+/**
+ * Forms the HTML pages rendered to the client for Component / E2E testing,
+ * including the pre-hydration we use to bootstrap the script data for fast
+ * initial loading
+ */
+import type { DataContext } from '../DataContext'
+import { getPathToDist, resolveFromPackages } from '@packages/resolve-dist'
+import _ from 'lodash'
+import { telemetry } from '@packages/telemetry'
+
+const PATH_TO_NON_PROXIED_ERROR = resolveFromPackages('server', 'lib', 'html', 'non_proxied_error.html')
+const MAX_APP_HTML_READ_ATTEMPTS = 5
+
+export class HtmlDataSource {
+  constructor (private ctx: DataContext) {}
+
+  async fetchAppHtml () {
+    if (process.env.CYPRESS_INTERNAL_VITE_DEV) {
+      const response = await this.ctx.util.fetch(`http://localhost:${process.env.CYPRESS_INTERNAL_VITE_APP_PORT}/`, { method: 'GET' })
+      const html = await response.text()
+
+      return html
+    }
+
+    // Check if the file exists. If it doesn't, it probably means that Vite is re-building
+    // and we should retry a few times until the file exists
+    let retryCount = 0
+    let err
+
+    while (retryCount < MAX_APP_HTML_READ_ATTEMPTS) {
+      try {
+        const html = await this.ctx.fs.readFile(getPathToDist('app', 'index.html'), 'utf8')
+        const title = _.escape(this.ctx.project.projectTitle(this.ctx.currentProject || ''))
+
+        // Pass a function, not a string, so `$&` and friends in the title are inserted literally
+        return html.replace('<title>Cypress</title>', () => `<title>${title}</title>`)
+      } catch (e) {
+        if (e.code !== 'ENOENT') {
+          throw e
+        }
+
+        err = e
+        retryCount++
+
+        if (retryCount < MAX_APP_HTML_READ_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+        }
+      }
+    }
+
+    throw err
+  }
+
+  getPropertiesFromServerConfig (cfg: any = {}) {
+    const keys = [
+      'baseUrl',
+      'browserUrl',
+      'port',
+      'proxyServer',
+      'proxyUrl',
+      'remote',
+      'testingType',
+      'reporterUrl',
+      'namespace',
+      'socketIoRoute',
+      'isDefaultProtocolEnabled',
+      'isInteractive',
+      'hideCommandLog',
+      'hideRunnerUi',
+    ]
+
+    return _.pick(cfg, keys)
+  }
+
+  async makeServeConfig () {
+    const propertiesFromServerConfig = this.getPropertiesFromServerConfig(this.ctx._apis.projectApi.getConfig())
+
+    let cfg = { ...propertiesFromServerConfig }
+
+    try {
+      cfg = {
+        ...(await this.ctx.project.getConfig()),
+        ...cfg,
+      }
+    } catch {
+      // Error getting config, we will show an error screen when we render the page
+    }
+
+    // Environment variables are only available to the spec via cy.env() on the server.
+    // `rawJson` and `resolved` also carry them, and nothing in the browser reads either.
+    delete cfg.env
+    delete cfg.rawJson
+    delete cfg.resolved
+
+    // for project-base config, the remote state we wish to convey should be whatever top is set to, also known as the primary domain
+    // whenever the app is served/re-served
+    if (this.ctx.coreData.currentTestingType === 'e2e') {
+      const remoteStates = this.ctx._apis.projectApi.getRemoteStates()
+
+      if (remoteStates) {
+        cfg.remote = remoteStates.getPrimary()
+      }
+    }
+
+    cfg.browser = this.ctx._apis.projectApi.getCurrentBrowser()
+
+    return {
+      projectName: this.ctx.lifecycleManager.projectTitle,
+      namespace: cfg.namespace || '__cypress-string',
+      base64Config: Buffer.from(JSON.stringify(cfg)).toString('base64'),
+      hideCommandLog: cfg.hideCommandLog,
+      hideRunnerUi: cfg.hideRunnerUi,
+    }
+  }
+
+  /**
+   * The app html includes the SSR'ed data to bootstrap the page for the app
+   */
+  async appHtml (nonProxied: boolean, isBrowserNetworkMode: boolean) {
+    if (nonProxied) {
+      return this.ctx.fs.readFile(PATH_TO_NON_PROXIED_ERROR, 'utf-8')
+    }
+
+    const [appHtml, serveConfig] = await Promise.all([
+      this.fetchAppHtml(),
+      this.makeServeConfig(),
+    ])
+
+    return this.replaceBody(appHtml, serveConfig, isBrowserNetworkMode)
+  }
+
+  /**
+   * The launchpad is otherwise served as static files, so this is only used to
+   * bootstrap browser telemetry when it is enabled
+   */
+  async launchpadHtml () {
+    const html = process.env.CYPRESS_INTERNAL_VITE_DEV
+      ? await (await this.ctx.util.fetch(`http://localhost:${process.env.CYPRESS_INTERNAL_VITE_LAUNCHPAD_PORT}/__launchpad/index.html`, { method: 'GET' })).text()
+      : await this.ctx.fs.readFile(getPathToDist('launchpad', 'index.html'), 'utf8')
+
+    return html.replace('<body>', () => {
+      return `
+      <body>
+        <script>
+          ${this.telemetryBootstrap()}
+        </script>
+    `
+    })
+  }
+
+  private telemetryBootstrap () {
+    if (!telemetry.isEnabled()) {
+      return ''
+    }
+
+    return `window.__CYPRESS_TELEMETRY__ = ${JSON.stringify({ context: telemetry.getActiveContextObject(), resources: telemetry.getResources(), isVerbose: telemetry.isVerbose() })}`
+  }
+
+  private replaceBody (html: string, serveConfig: object, isBrowserNetworkMode: boolean) {
+    return html.replace('<body>', `
+      <body>
+        <script>
+          window.__RUN_MODE_SPECS__ = ${JSON.stringify(this.ctx.project.specs)}
+          // __RUN_ALL_SPECS__ is only set if experimentalRunAllSpecs is set to true
+          window.__RUN_ALL_SPECS__ = ${JSON.stringify(this.ctx.project.runAllSpecs)}
+          window.__CYPRESS_MODE__ = ${JSON.stringify(this.ctx.isRunMode && !process.env.CYPRESS_INTERNAL_SIMULATE_OPEN_MODE ? 'run' : 'open')};
+          window.__CYPRESS_CONFIG__ = ${JSON.stringify(serveConfig)};
+          window.__CYPRESS_TESTING_TYPE__ = '${this.ctx.coreData.currentTestingType}'
+          window.__CYPRESS_BROWSER__ = ${JSON.stringify(this.ctx.coreData.activeBrowser)}
+          ${this.telemetryBootstrap()}
+          ${isBrowserNetworkMode ? `window.__CYPRESS_BROWSER_NETWORK_MODE__ = true;` : ''}
+        </script>
+    `)
+  }
+}

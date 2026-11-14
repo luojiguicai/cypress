@@ -1,177 +1,162 @@
-/* global Cypress, JSX */
-import { action, runInAction } from 'mobx'
+/* global JSX */
+import { action } from 'mobx'
 import { observer } from 'mobx-react'
 import cs from 'classnames'
-import PropTypes from 'prop-types'
-import React, { Component } from 'react'
-import { render } from 'react-dom'
-// @ts-ignore
-import EQ from 'css-element-queries/src/ElementQueries'
+import React, { useEffect, useRef, useState } from 'react'
+import { createRoot } from 'react-dom/client'
 
-import { RunnablesErrorModel } from './runnables/runnable-error'
-import appState, { AppState } from './lib/app-state'
-import events, { Runner, Events } from './lib/events'
-import runnablesStore, { RunnablesStore } from './runnables/runnables-store'
-import scroller, { Scroller } from './lib/scroller'
-import statsStore, { StatsStore } from './header/stats-store'
+import type { RunnablesErrorModel } from './runnables/runnable-error'
+import type { AppState } from './lib/app-state'
+import appStateDefault from './lib/app-state'
+import type { Events, Runner } from './lib/events'
+import events from './lib/events'
+import type { RunnablesStore } from './runnables/runnables-store'
+import runnablesStore from './runnables/runnables-store'
+import type { Scroller } from './lib/scroller'
+import scroller from './lib/scroller'
+import type { StatsStore } from './header/stats-store'
+import statsStore from './header/stats-store'
 import shortcuts from './lib/shortcuts'
 
-import Header, { ReporterHeaderProps } from './header/header'
+import type { ReporterHeaderProps } from './header/header'
+import Header from './header/header'
 import Runnables from './runnables/runnables'
+import type { MobxRunnerStore } from '@packages/app/src/store/mobx-runner-store'
 
-interface BaseReporterProps {
+function usePrevious (value) {
+  const ref = useRef()
+
+  useEffect(() => {
+    ref.current = value
+  }, [])
+
+  return ref.current
+}
+
+export interface BaseReporterProps {
   appState: AppState
   className?: string
   runnablesStore: RunnablesStore
   runner: Runner
   scroller: Scroller
   statsStore: StatsStore
+  autoScrollingEnabled?: boolean
+  isSpecsListOpen?: boolean
+  showFetchRequests?: boolean
   events: Events
   error?: RunnablesErrorModel
   resetStatsOnSpecChange?: boolean
   renderReporterHeader?: (props: ReporterHeaderProps) => JSX.Element
-  spec: Cypress.Cypress['spec']
-  experimentalStudioEnabled: boolean
-  /** Used for component testing front-end */
-  specRunId?: string | null
+  studioEnabled: boolean
+  runnerStore: MobxRunnerStore
+  codeEditorLineWrap?: boolean
 }
 
-export interface SingleReporterProps extends BaseReporterProps{
-  runMode: 'single'
+export interface SingleReporterProps extends BaseReporterProps {
+  runMode?: 'single'
 }
 
-export interface MultiReporterProps extends BaseReporterProps{
-  runMode: 'multi'
-  allSpecs: Array<Cypress.Cypress['spec']>
-}
+// In React Class components (now deprecated), we used to use appState as a default prop. Now since defaultProps are not supported in functional components, we can use ES6 default params to accomplish the same thing
+const Reporter: React.FC<SingleReporterProps> = observer(({ appState = appStateDefault, runner, className, error, runMode = 'single', studioEnabled, autoScrollingEnabled, isSpecsListOpen, showFetchRequests, resetStatsOnSpecChange, renderReporterHeader = (props: ReporterHeaderProps) => <Header {...props} />, runnerStore, codeEditorLineWrap }) => {
+  const previousSpecRunId = usePrevious(runnerStore.specRunId)
+  const [isMounted, setIsMounted] = useState(false)
+  const [isInitialized, setIsInitialized] = useState(false)
 
-@observer
-class Reporter extends Component<SingleReporterProps | MultiReporterProps> {
-  static propTypes = {
-    error: PropTypes.shape({
-      title: PropTypes.string.isRequired,
-      link: PropTypes.string,
-      callout: PropTypes.string,
-      message: PropTypes.string.isRequired,
-    }),
-    runner: PropTypes.shape({
-      emit: PropTypes.func.isRequired,
-      on: PropTypes.func.isRequired,
-    }).isRequired,
-    spec: PropTypes.shape({
-      name: PropTypes.string.isRequired,
-      relative: PropTypes.string.isRequired,
-      absolute: PropTypes.string.isRequired,
-    }),
-    experimentalStudioEnabled: PropTypes.bool,
-  }
-
-  static defaultProps = {
-    runMode: 'single',
-    appState,
-    events,
-    runnablesStore,
-    scroller,
-    statsStore,
-  }
-
-  render () {
-    const {
-      appState,
-      className,
-      runMode,
-      runnablesStore,
-      scroller,
-      error,
-      statsStore,
-      experimentalStudioEnabled,
-      renderReporterHeader = (props: ReporterHeaderProps) => <Header {...props}/>,
-    } = this.props
-
-    return (
-      <div className={cs(className, 'reporter', {
-        multiSpecs: runMode === 'multi',
-        'experimental-studio-enabled': experimentalStudioEnabled,
-        'studio-active': appState.studioActive,
-      })}>
-        {renderReporterHeader({ appState, statsStore })}
-        {this.props.runMode === 'single' ? (
-          <Runnables
-            appState={appState}
-            error={error}
-            runnablesStore={runnablesStore}
-            scroller={scroller}
-            spec={this.props.spec}
-          />
-        ) : this.props.allSpecs.map((spec) => (
-          <Runnables
-            key={spec.relative}
-            appState={appState}
-            error={error}
-            runnablesStore={runnablesStore}
-            scroller={scroller}
-            spec={spec}
-          />
-        ))}
-      </div>
-    )
-  }
-
-  // this hook will only trigger if we switch spec file at runtime
-  // it never happens in normal e2e but can happen in component-testing mode
-  componentDidUpdate (newProps: BaseReporterProps) {
-    this.props.runnablesStore.setRunningSpec(this.props.spec.relative)
-
-    if (
-      this.props.resetStatsOnSpecChange &&
-      this.props.specRunId !== newProps.specRunId
-    ) {
-      runInAction('reporter:stats:reset', () => {
-        this.props.statsStore.reset()
-      })
-    }
-  }
-
-  componentDidMount () {
-    const { spec, appState, runnablesStore, runner, scroller, statsStore } = this.props
-
-    action('set:scrolling', () => {
-      appState.setAutoScrolling(appState.autoScrollingEnabled)
-    })()
-
-    this.props.events.init({
+  // this registration needs to happen synchronously and not async inside useEffect or else the events will not be registered and the reporter might hang inside cy-in-cy tests
+  if (!isInitialized) {
+    events.init({
       appState,
       runnablesStore,
       scroller,
       statsStore,
     })
 
-    this.props.events.listen(runner)
+    events.listen(runner)
+    setIsInitialized(true)
+  }
+
+  useEffect(() => {
+    if (!runnerStore.spec) {
+      throw Error(`Expected runnerStore.spec not to be null.`)
+    }
+
+    action('set:scrolling', () => {
+      // set the initial enablement of auto scroll configured inside the user preferences when the app is loaded
+      appState.setAutoScrollingUserPref(autoScrollingEnabled)
+    })()
+
+    action('set:specs:list', () => {
+      appState.setSpecsList(isSpecsListOpen ?? false)
+    })()
+
+    action('set:show:fetch:requests', () => {
+      appState.setShowFetchRequests(showFetchRequests ?? true)
+    })()
+
+    action('set:code:editor:line:wrap', () => {
+      appState.setCodeEditorLineWrap(codeEditorLineWrap ?? false)
+    })()
 
     shortcuts.start()
-    EQ.init()
-    this.props.runnablesStore.setRunningSpec(spec.relative)
-  }
+    runnablesStore.setRunningSpec(runnerStore.spec.relative)
+    // we need to know when the test is mounted for our reporter tests. see
+    setIsMounted(true)
 
-  componentWillUnmount () {
-    shortcuts.stop()
-  }
-}
+    return () => shortcuts.stop()
+  }, [])
 
+  useEffect(() => {
+    if (!runnerStore.spec) {
+      throw Error(`Expected runnerStore.spec not to be null.`)
+    }
+
+    runnablesStore.setRunningSpec(runnerStore.spec.relative)
+    if (
+      resetStatsOnSpecChange &&
+      runnerStore.specRunId !== previousSpecRunId
+    ) {
+      statsStore.reset()
+    }
+  }, [runnerStore.spec, runnerStore.specRunId, resetStatsOnSpecChange, previousSpecRunId])
+
+  return (
+    <div className={cs(className, 'reporter', {
+      'mounted': isMounted,
+    })}>
+      {renderReporterHeader({ appState, statsStore, runnablesStore, spec: runnerStore.spec })}
+      {
+        runnerStore.spec && <Runnables
+          appState={appState}
+          error={error}
+          runnablesStore={runnablesStore}
+          scroller={scroller}
+          spec={runnerStore.spec}
+          statsStore={statsStore}
+          studioEnabled={studioEnabled}
+        />
+      }
+    </div>
+  )
+})
+
+Reporter.displayName = 'Reporter'
 declare global {
   interface Window {
     Cypress: any
     state: AppState
     render: ((props: Partial<BaseReporterProps>) => void)
+    __CYPRESS_MODE__: 'run' | 'open'
   }
 }
 
 // NOTE: this is for testing Cypress-in-Cypress
 if (window.Cypress) {
-  window.state = appState
+  window.state = appStateDefault
   window.render = (props) => {
-    // @ts-ignore
-    render(<Reporter {...props as Required<ReporterProps>} />, document.getElementById('app'))
+    const container: HTMLElement = document.getElementById('app') as HTMLElement
+    const root = createRoot(container)
+
+    root.render(<Reporter {...props as Required<BaseReporterProps>} />)
   }
 }
 

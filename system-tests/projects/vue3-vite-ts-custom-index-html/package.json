@@ -1,0 +1,17 @@
+{
+  "name": "vue3-vite-ts-custom-index-html",
+  "version": "0.0.0-test",
+  "scripts": {
+    "dev": "vite",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.33"
+  },
+  "devDependencies": {
+    "@cypress/vite-dev-server": "file:../../../npm/vite-dev-server",
+    "@vitejs/plugin-vue": "^6.0.6",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.9"
+  }
+}
